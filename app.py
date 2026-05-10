@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-# MLB STRIKEOUT PROP ENGINE — ONE FILE — v10.2 RAILWAY UNDERDOG PRIMARY BOARD LINES
+# MLB STRIKEOUT PROP ENGINE — ONE FILE — v10.3 RAILWAY UNDERDOG DEBUG + PRIMARY BOARD LINES
 # Refresh first, then save official before-game snapshot
 # Real lines only. No fake prop lines.
 # Google Drive persistent logs + grading + learning.
@@ -18,6 +18,8 @@ import pandas as pd
 import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
+
+APP_VERSION = "v10.3 UNDERDOG DEBUG + PRIMARY BOARD LINES"
 
 try:
     import pytz
@@ -75,7 +77,7 @@ SPORTSBOOK_PITCHER_K_MARKETS = [
 LEAGUE_AVG_K = 0.225
 DEFAULT_BF = 22.0
 # =========================
-# v10.2 UNDERDOG PRIMARY BOARD LINE SETTINGS
+# v10.3 UNDERDOG DEBUG + PRIMARY BOARD LINE SETTINGS
 # =========================
 # Goal: fewer plays, fewer coin-flips, higher true hit quality.
 # These settings intentionally PASS on borderline props.
@@ -1544,7 +1546,6 @@ def extract_prop_rows_from_any_json(data, player_name, source_name):
         dedup[key] = r
     return list(dedup.values())
 
-@st.cache_data(ttl=90, show_spinner=False)
 def get_underdog_k_data(player_name):
     """Live Underdog parser for MLB pitcher strikeout props.
 
@@ -1666,19 +1667,18 @@ def get_underdog_k_data(player_name):
         return ""
 
     def line_from_obj(*objs):
-        # Use only known Underdog board-line fields first.
-        # Avoid generic keys like points/value/line because those can be projections, IDs, or alternate props.
-        primary_keys = ["stat_value", "line_score", "over_under_line", "target_value"]
+        # Do not use fantasy projection keys unless the object is already proven to be a pitcher-K prop.
+        safe_keys = ["stat_value", "line_score", "over_under_line", "target_value", "line", "points", "point"]
         for obj in objs:
             a = attrs(obj)
-            for k in primary_keys:
+            for k in safe_keys:
                 val = safe_float(a.get(k))
                 if is_valid_k_line(val, allow_integer=True) is not None:
-                    return float(val), f"PRIMARY:{k} from Underdog object"
+                    return float(val), f"{k} from Underdog object"
         text_lines = extract_half_lines_from_text(" | ".join(text_from(o) for o in objs))
         if text_lines:
-            return float(text_lines[0]), "PRIMARY:half-line from Underdog text"
-        return None, "no valid Underdog board line"
+            return float(text_lines[0]), "half-line from Underdog text"
+        return None, "no valid Underdog line"
 
     def blob_from(*objs):
         return " | ".join([text_from(o) for o in objs if isinstance(o, dict)]).lower()
@@ -1742,7 +1742,6 @@ def get_underdog_k_data(player_name):
             "Line Evidence": line_note,
             "Parser Mode": source_mode,
             "Underdog Path": path,
-            "Row Order": len(accepted_rows),
         })
 
     for url in UNDERDOG_URLS:
@@ -1824,37 +1823,35 @@ def get_underdog_k_data(player_name):
             add_row(chosen_line, score, actual_player, evidence, line_note, f"line:{obj_id(line_obj)} -> over_under:{ou_id} -> appearance:{app_id} -> player:{player_id}", "relationship")
 
         # Recursive fallback parser for new/changed Underdog JSON.
-        # IMPORTANT: only use fallback when relationship mode found ZERO rows.
-        # Relationship rows are tied to line -> over_under -> appearance -> player and should
-        # represent the main Underdog board better than random nested fallback objects.
-        if not accepted_rows:
-            for obj in objects:
-                if not isinstance(obj, dict):
-                    continue
-                blob_json = json.dumps(obj, default=str)
-                blob_low = blob_json.lower()
-                if is_bad_sport(blob_low):
-                    continue
-                if not is_pitcher_k_blob(blob_low):
-                    continue
-                # Try candidate fields and the full object blob so abbreviated Underdog names match daily.
-                cand = []
-                for k in ["player", "player_name", "participant", "participant_name", "name", "description", "display_name", "title", "short_name", "abbreviation", "abbr_name"]:
-                    v = attrs(obj).get(k)
-                    if isinstance(v, dict):
-                        v = v.get("name") or v.get("full_name") or v.get("display_name") or v.get("title") or v.get("short_name")
-                    if v:
-                        cand.append(str(v))
-                matched = " ".join(cand) or player_name
-                score = max(underdog_player_score(matched, blob_json), name_score(player_name, matched))
-                if score < 0.82:
-                    continue
-                line, line_note = line_from_obj(obj)
-                if line is None:
-                    continue
-                if not active_status_ok(obj):
-                    continue
-                add_row(line, score, matched, blob_json[:200], line_note, f"fallback:{obj_id(obj) or attrs(obj).get('id') or len(accepted_rows)}", "recursive fallback")
+        # This is intentionally looser than relationship mode, but still requires:
+        # target player name + strikeout market + sane K line + no bad sport/market words.
+        for obj in objects:
+            if not isinstance(obj, dict):
+                continue
+            blob_json = json.dumps(obj, default=str)
+            blob_low = blob_json.lower()
+            if is_bad_sport(blob_low):
+                continue
+            if not is_pitcher_k_blob(blob_low):
+                continue
+            # Try candidate fields and the full object blob so abbreviated Underdog names match daily.
+            cand = []
+            for k in ["player", "player_name", "participant", "participant_name", "name", "description", "display_name", "title", "short_name", "abbreviation", "abbr_name"]:
+                v = attrs(obj).get(k)
+                if isinstance(v, dict):
+                    v = v.get("name") or v.get("full_name") or v.get("display_name") or v.get("title") or v.get("short_name")
+                if v:
+                    cand.append(str(v))
+            matched = " ".join(cand) or player_name
+            score = max(underdog_player_score(matched, blob_json), name_score(player_name, matched))
+            if score < 0.82:
+                continue
+            line, line_note = line_from_obj(obj)
+            if line is None:
+                continue
+            if not active_status_ok(obj):
+                continue
+            add_row(line, score, matched, blob_json[:200], line_note, f"fallback:{obj_id(obj) or attrs(obj).get('id') or len(accepted_rows)}", "recursive fallback")
 
         if accepted_rows:
             break
@@ -1869,19 +1866,20 @@ def get_underdog_k_data(player_name):
             dedup[key] = r
     accepted_rows = list(dedup.values())
 
-    # Pick the row that best matches the actual pitcher, not the most repeated number.
-    # This prevents alternates or duplicated nested objects from overriding the active Underdog board line.
-    def row_rank(r):
-        # Prefer exact relationship rows and true Underdog board-line fields.
-        # Do NOT rank by lower line; that caused alternate/lower props to beat the live board line.
-        mode_bonus = 1.00 if r.get("Parser Mode") == "relationship" else 0.0
-        primary_bonus = 0.25 if str(r.get("Line Evidence", "")).startswith("PRIMARY:") else 0.0
-        half_bonus = 0.10 if is_half_point_line(r.get("Line")) else 0.0
-        score = safe_float(r.get("Match Score"), 0) or 0
-        row_order = safe_int(r.get("Row Order"), 9999) or 9999
-        return (mode_bonus, primary_bonus, score, half_bonus, -row_order)
+    # Pick the live Underdog board line.
+    # Important: alternate/fallback nested rows can produce lower lines.
+    # So we prefer relationship rows, then half-point rows, then highest line among similarly matched rows.
+    primary_rows = [r for r in accepted_rows if r.get("Parser Mode") == "relationship"] or accepted_rows
+    half_rows = [r for r in primary_rows if is_half_point_line(r.get("Line"))] or primary_rows
 
-    best_row = sorted(accepted_rows, key=row_rank, reverse=True)[0]
+    def row_rank(r):
+        rel_bonus = 1 if r.get("Parser Mode") == "relationship" else 0
+        half_bonus = 1 if is_half_point_line(r.get("Line")) else 0
+        score = safe_float(r.get("Match Score"), 0) or 0
+        line = safe_float(r.get("Line"), -999) or -999
+        return (rel_bonus, half_bonus, round(score, 2), line)
+
+    best_row = sorted(half_rows, key=row_rank, reverse=True)[0]
     active = safe_float(best_row.get("Line"))
 
     return source_result(
@@ -2392,6 +2390,9 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "learning_scale": round(learn_scale, 3),
         "line": active_line,
         "line_source": active_source,
+        "underdog_status": ud_data.get("status"),
+        "underdog_line": ud_data.get("line"),
+        "underdog_message": ud_data.get("message"),
         "line_delta": line_delta,
         "true_line_delta": true_line_delta,
         "consensus_count": consensus.get("count"),
@@ -2658,7 +2659,7 @@ def render_pick_card(p):
 # =========================
 st.markdown("""
 <div class="hero-panel">
-  <div class="big-title">🔥 MLB STRIKEOUT PROP ENGINE v10.1 UNDERDOG EXACT LIVE LINES</div>
+  <div class="big-title">🔥 MLB STRIKEOUT PROP ENGINE v10.3 UNDERDOG DEBUG + PRIMARY BOARD LINES</div>
   <div class="sub-title">Strict Win Filter: fewer picks, stronger edge, harsher leash penalties, real lines only → Refresh → Save → Grade</div>
 </div>
 """, unsafe_allow_html=True)
@@ -2677,6 +2678,11 @@ with st.sidebar:
     use_calibration = st.checkbox("Use historical calibration", value=True)
     use_sgo = st.checkbox("Optional: SportsGameOdds API", value=False)
     use_optic = st.checkbox("Optional: OpticOdds API", value=False)
+    if st.button("🧹 Clear Streamlit Cache + Reload Live Lines", use_container_width=True):
+        st.cache_data.clear()
+        st.session_state.loaded_picks = []
+        st.session_state.last_refresh_time = None
+        st.success("Cache cleared. Now click REFRESH LIVE BOARD again.")
     st.caption("Refresh does not save official picks. Save only when the board looks right. Optional paid APIs stay OFF unless you have keys.")
 
 dates = target_dates(day_mode)
@@ -2751,7 +2757,7 @@ if hide_no_line:
 if only_strong:
     board = [p for p in board if p.get("signal_type") == "good"]
 
-st.info(f"{board_status} | Last refresh: {st.session_state.get('last_refresh_time') or 'Not refreshed this session'} | Last save added: {st.session_state.get('last_saved_count', 0)}")
+st.info(f"{APP_VERSION} | {board_status} | Last refresh: {st.session_state.get('last_refresh_time') or 'Not refreshed this session'} | Last save added: {st.session_state.get('last_saved_count', 0)}")
 
 render_kpis(board, bankroll)
 
@@ -2788,7 +2794,7 @@ with tab2:
         cols = [
             "date", "pitcher", "matchup", "hand", "projection", "line", "pick_side",
             "fair_probability", "edge_ks", "ev", "signal", "risk_label",
-            "line_source", "data_score", "lineup_locked", "pitcher_confirmed",
+            "line_source", "underdog_line", "underdog_status", "underdog_message", "data_score", "lineup_locked", "pitcher_confirmed",
             "statcast_available", "pitch_type_matchup_available", "pitch_type_factor", "bettable", "leash_risk"
         ]
         cols = [c for c in cols if c in show.columns]
@@ -2797,7 +2803,7 @@ with tab2:
         st.info("No players loaded.")
 
 with tab3:
-    st.markdown('<div class="section-title-pro">Real Prop Rows From Sources</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title-pro">Real Prop Rows + Underdog Debug</div>', unsafe_allow_html=True)
     rows = []
     for p in board:
         for r in p.get("prop_rows", []):
@@ -2807,7 +2813,10 @@ with tab3:
             rr["Data Score"] = p.get("data_score")
             rows.append(rr)
     if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        df_rows = pd.DataFrame(rows)
+        preferred = [c for c in ["Pitcher", "Source", "Parser Mode", "Matched Name", "Line", "Market", "Line Evidence", "Underdog Path", "Match Score", "Reject Reason", "Projection", "Model Lean", "Model Prob %"] if c in df_rows.columns]
+        other = [c for c in df_rows.columns if c not in preferred]
+        st.dataframe(df_rows[preferred + other], use_container_width=True, hide_index=True)
     else:
         st.warning("No real prop rows found from connected sources yet. No fake line is created.")
 
