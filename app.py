@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-# MLB STRIKEOUT PROP ENGINE — ONE FILE — v10.3 RAILWAY UNDERDOG DEBUG + PRIMARY BOARD LINES
+# MLB STRIKEOUT PROP ENGINE — ONE FILE — v10.4 MLB-ONLY UNDERDOG LINE LOCK
 # Refresh first, then save official before-game snapshot
 # Real lines only. No fake prop lines.
 # Google Drive persistent logs + grading + learning.
@@ -19,7 +19,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v10.3 UNDERDOG DEBUG + PRIMARY BOARD LINES"
+APP_VERSION = "v10.4 MLB-ONLY UNDERDOG LINE LOCK"
 
 try:
     import pytz
@@ -57,6 +57,7 @@ MLB_LIVE = "https://statsapi.mlb.com/api/v1.1"
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 PRIZEPICKS_URL = "https://api.prizepicks.com/projections"
 UNDERDOG_URLS = [
+    "https://api.underdogfantasy.com/beta/v6/over_under_lines",
     "https://api.underdogfantasy.com/beta/v5/over_under_lines",
     "https://api.underdogfantasy.com/beta/v4/over_under_lines",
     "https://api.underdogfantasy.com/beta/v3/over_under_lines",
@@ -321,6 +322,27 @@ def is_pitcher_k_text(text):
         or "pitcher k" in t
         or t in ["ks", "k", "pitcher strikeouts"]
     ) and not any(bad in t for bad in ["batter", "hitter"])
+
+def is_bad_sport_text(text):
+    """Hard block non-MLB/basketball contamination from prop feeds."""
+    t = f" {str(text or '').lower()} "
+    bad_terms = [
+        " nba", " nba_", "basketball", "wnba", "nfl", "football", "nhl",
+        "soccer", "tennis", "golf", "college basketball", "ncaab"
+    ]
+    return any(x in t for x in bad_terms)
+
+def is_bad_k_market_text(text):
+    """Reject non-pitcher-K or alternate/novelty markets that can carry misleading values."""
+    t = str(text or "").lower()
+    bad_terms = [
+        "batter", "hitter", "team strikeouts", "fantasy points", "fantasy score",
+        "runs+rbi", "hits+runs+rbi", "total bases", "stolen base", "walks allowed",
+        "earned runs", "outs recorded", "pitching outs", "hits allowed", "runs allowed",
+        "single", "double", "home run", "rbi", "runs scored", "combo", "rival",
+        "special", "discount", "alternative", "alt "
+    ]
+    return any(x in t for x in bad_terms)
 
 @st.cache_data(ttl=300, show_spinner=False)
 def safe_get_json(url, params=None, timeout=14, headers=None):
@@ -1499,6 +1521,9 @@ def get_prizepicks_k_data(player_name):
         pid = str(pdata.get("id", ""))
         info = players.get(pid, {})
         pp_name = info.get("name") or attrs.get("player_name") or attrs.get("description") or ""
+        league_blob = f"{info.get('league','')} {attrs.get('league','')} {attrs.get('league_name','')} {attrs.get('sport','')}".lower()
+        if league_blob.strip() and not any(x in league_blob for x in ["mlb", "baseball"]):
+            continue
         score = name_score(player_name, pp_name)
         if score >= 0.80:
             rows.append({"Source": "PrizePicks", "Provider": "PrizePicks", "Player": player_name, "Matched Name": pp_name, "Team": info.get("team", ""), "League": info.get("league", ""), "Market": stat_type, "Line": line_score, "Side": "OVER/UNDER", "Price": None, "Match Score": round(score, 3), "Start Time": attrs.get("start_time"), "Projection ID": item.get("id")})
@@ -1516,7 +1541,9 @@ def extract_prop_rows_from_any_json(data, player_name, source_name):
         if not isinstance(obj, dict):
             continue
         blob = json.dumps(obj, default=str).lower()
-        if not ("strikeout" in blob or "strike out" in blob or "pitcher k" in blob or "pitcher_k" in blob):
+        if is_bad_sport_text(blob) or is_bad_k_market_text(blob):
+            continue
+        if not ("pitcher strikeout" in blob or "pitcher strikeouts" in blob or "pitcher k" in blob or "pitcher_k" in blob or "strikeouts" in blob):
             continue
         candidate_bits = []
         for key in ["player", "player_name", "participant", "participant_name", "name", "description", "display_name", "market_name", "selection", "title"]:
@@ -1531,7 +1558,8 @@ def extract_prop_rows_from_any_json(data, player_name, source_name):
             score = 0.82
         if score < 0.80:
             continue
-        line = safe_float(first_value(obj, ["line", "point", "points", "total", "handicap", "stat_value", "target_value", "over_under_line", "line_score", "value"]))
+        line = safe_float(first_value(obj, ["stat_value", "target_value", "over_under_line", "line_score", "line", "point", "handicap"]))
+        line = is_valid_k_line(line, allow_integer=True)
         if line is None:
             continue
         side = first_value(obj, ["side", "label", "name", "selection", "outcome", "bet_type"]) or "Over/Under"
@@ -1667,35 +1695,31 @@ def get_underdog_k_data(player_name):
         return ""
 
     def line_from_obj(*objs):
-        # Do not use fantasy projection keys unless the object is already proven to be a pitcher-K prop.
-        safe_keys = ["stat_value", "line_score", "over_under_line", "target_value", "line", "points", "point"]
+        # Underdog displayed K lines should come from real line fields only.
+        # Do NOT use generic points/point/value/total fields; those caused wrong lines.
+        safe_keys = ["stat_value", "line_score", "over_under_line", "target_value"]
         for obj in objs:
             a = attrs(obj)
             for k in safe_keys:
                 val = safe_float(a.get(k))
-                if is_valid_k_line(val, allow_integer=True) is not None:
-                    return float(val), f"{k} from Underdog object"
+                if is_valid_k_line(val, allow_integer=False) is not None:
+                    return float(val), f"{k} half-line from Underdog object"
         text_lines = extract_half_lines_from_text(" | ".join(text_from(o) for o in objs))
         if text_lines:
             return float(text_lines[0]), "half-line from Underdog text"
-        return None, "no valid Underdog line"
+        return None, "no valid Underdog half-line"
 
     def blob_from(*objs):
         return " | ".join([text_from(o) for o in objs if isinstance(o, dict)]).lower()
 
     def is_bad_sport(blob):
-        return any(x in blob for x in ["wnba", " nba", "basketball", "football", "nfl", "nhl", "soccer", "tennis", "golf"])
+        return is_bad_sport_text(blob)
 
     def is_pitcher_k_blob(blob):
         blob = blob.lower()
         if not any(x in blob for x in ["pitcher strikeout", "pitcher strikeouts", "pitcher_k", "pitcher k", "strikeouts", "strike outs"]):
             return False
-        bad = [
-            "batter", "hitter", "team strikeouts", "fantasy points", "fantasy score", "runs+rbi", "hits+runs+rbi",
-            "total bases", "stolen base", "walks allowed", "earned runs", "outs recorded", "pitching outs",
-            "hits allowed", "runs allowed", "single", "double", "home run", "rbi", "runs scored"
-        ]
-        return not any(x in blob for x in bad)
+        return not is_bad_k_market_text(blob)
 
     def active_status_ok(*objs):
         status_blob = " ".join(
@@ -1886,8 +1910,8 @@ def get_underdog_k_data(player_name):
         "Underdog",
         "FOUND",
         line=float(active),
-        rows=sorted(accepted_rows + rejected_rows[:12], key=lambda r: (str(r.get("Reject Reason", "")) != "", -safe_float(r.get("Match Score"), 0), safe_float(r.get("Line"), 99))),
-        message=f"Live Underdog line matched: {float(active):.1f} via {best_row.get('Matched Name')} ({best_row.get('Parser Mode')})"
+        rows=sorted(accepted_rows, key=lambda r: (-safe_float(r.get("Match Score"), 0), safe_float(r.get("Line"), 99))),
+        message=f"Live Underdog line matched: {float(active):.1f} via {best_row.get('Matched Name')} ({best_row.get('Parser Mode')}); rejected debug rows hidden to prevent wrong-sport noise"
     )
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -1943,7 +1967,7 @@ def choose_active_line(sportsbook_data, pp_data, ud_data, sgo_data, optic_data):
             candidates.append({"Source": source, "Line": val, "Weight": float(weight)})
 
     # Underdog first: user is comparing the app to live Underdog props.
-    ud_line = is_valid_k_line(ud_data.get("line"), allow_integer=True)
+    ud_line = is_valid_k_line(ud_data.get("line"), allow_integer=False)
     if ud_data.get("status") == "FOUND" and ud_line is not None:
         # Still collect other rows for diagnostics, but do not let consensus round/shift Underdog.
         add("Sportsbook", sportsbook_data.get("line"), 3.0, allow_integer=True)
@@ -2659,8 +2683,8 @@ def render_pick_card(p):
 # =========================
 st.markdown("""
 <div class="hero-panel">
-  <div class="big-title">🔥 MLB STRIKEOUT PROP ENGINE v10.3 UNDERDOG DEBUG + PRIMARY BOARD LINES</div>
-  <div class="sub-title">Strict Win Filter: fewer picks, stronger edge, harsher leash penalties, real lines only → Refresh → Save → Grade</div>
+  <div class="big-title">🔥 MLB STRIKEOUT PROP ENGINE v10.4 MLB-ONLY UNDERDOG LINE LOCK</div>
+  <div class="sub-title">Strict Win Filter + MLB-only Underdog line lock → Refresh → Save → Grade</div>
 </div>
 """, unsafe_allow_html=True)
 
