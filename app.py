@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-# MLB STRIKEOUT PROP ENGINE — ONE FILE — v10.4 MLB-ONLY UNDERDOG LINE LOCK
+# MLB STRIKEOUT PROP ENGINE — ONE FILE — v10.5 CLEAN MLB DEBUG ROWS
 # Refresh first, then save official before-game snapshot
 # Real lines only. No fake prop lines.
 # Google Drive persistent logs + grading + learning.
@@ -19,7 +19,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v10.4 MLB-ONLY UNDERDOG LINE LOCK"
+APP_VERSION = "v10.5 CLEAN MLB DEBUG ROWS"
 
 try:
     import pytz
@@ -1395,6 +1395,49 @@ def calculate_pick_metrics(sims, line):
 # =========================
 def source_result(source, status, line=None, rows=None, message=""):
     return {"source": source, "status": status, "line": safe_float(line), "rows": rows or [], "message": message}
+
+
+def clean_real_prop_debug_rows(rows):
+    """Show only usable MLB pitcher strikeout rows in the Real Prop Board debug table.
+
+    This is display-only protection. It does not change the projection model.
+    It removes rejected NBA/WNBA/basketball rows that have Line=None/Market=None.
+    """
+    cleaned = []
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+
+        line = safe_float(
+            r.get("Line", r.get("line", r.get("Prop Line", r.get("line_display"))))
+        )
+        market = str(r.get("Market", r.get("market", "")) or "")
+        matched = str(r.get("Matched Name", r.get("matched_name", r.get("Player", ""))) or "")
+        blob = " ".join(str(v) for v in r.values())[:3000]
+
+        # Hard reject NBA/basketball contamination.
+        if is_bad_sport_text(blob):
+            continue
+
+        # Must have a real validated K line.
+        if is_valid_k_line(line, allow_integer=False) is None:
+            continue
+
+        # Must be pitcher strikeouts or equivalent K market text.
+        if market and not is_pitcher_k_text(market):
+            if not is_pitcher_k_text(blob):
+                continue
+        elif not is_pitcher_k_text(blob):
+            continue
+
+        # Must not be a bad/non-pitcher-K market.
+        if is_bad_k_market_text(blob):
+            continue
+
+        cleaned.append(r)
+
+    return cleaned
+
 
 
 def is_half_point_line(line):
@@ -2785,7 +2828,16 @@ st.info(f"{APP_VERSION} | {board_status} | Last refresh: {st.session_state.get('
 
 render_kpis(board, bankroll)
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = 
+def display_clean_real_prop_rows(rows, **kwargs):
+    cleaned = clean_real_prop_debug_rows(rows)
+    if cleaned:
+        st.dataframe(pd.DataFrame(cleaned), use_container_width=True, hide_index=True)
+    else:
+        st.info("No rejected/NBA debug rows shown. Only valid MLB pitcher strikeout lines will appear here.")
+
+
+st.tabs([
     "TOP PLAYS",
     "ALL PLAYERS",
     "REAL PROP BOARD",
