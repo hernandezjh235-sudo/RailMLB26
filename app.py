@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-# MLB STRIKEOUT PROP ENGINE — ONE FILE — v9.8 UNDERDOG LIVE LINE FIX
+# MLB STRIKEOUT PROP ENGINE — ONE FILE — v10.1 RAILWAY UNDERDOG EXACT LIVE LINES
 # Refresh first, then save official before-game snapshot
 # Real lines only. No fake prop lines.
 # Google Drive persistent logs + grading + learning.
@@ -11,6 +11,7 @@ import json
 import math
 import difflib
 import io
+import unicodedata
 import requests
 import numpy as np
 import pandas as pd
@@ -55,6 +56,9 @@ ODDS_BASE = "https://api.the-odds-api.com/v4"
 PRIZEPICKS_URL = "https://api.prizepicks.com/projections"
 UNDERDOG_URLS = [
     "https://api.underdogfantasy.com/beta/v5/over_under_lines",
+    "https://api.underdogfantasy.com/beta/v4/over_under_lines",
+    "https://api.underdogfantasy.com/beta/v3/over_under_lines",
+    "https://api.underdogfantasy.com/beta/v2/over_under_lines",
     "https://api.underdogfantasy.com/v1/over_under_lines",
 ]
 SPORTSGAMEODDS_BASE = "https://api.sportsgameodds.com/v2"
@@ -71,7 +75,7 @@ SPORTSBOOK_PITCHER_K_MARKETS = [
 LEAGUE_AVG_K = 0.225
 DEFAULT_BF = 22.0
 # =========================
-# v9.8 UNDERDOG LIVE LINE FIX SETTINGS
+# v10.1 UNDERDOG EXACT LIVE LINE SETTINGS
 # =========================
 # Goal: fewer plays, fewer coin-flips, higher true hit quality.
 # These settings intentionally PASS on borderline props.
@@ -260,13 +264,30 @@ def log_source_request(source, status, message=""):
     })
     save_json(REQUEST_LOG_FILE, rows[-500:])
 
+def strip_accents(text):
+    """Normalize accents so Underdog names like Sánchez match MLB names like Sanchez."""
+    try:
+        return "".join(
+            ch for ch in unicodedata.normalize("NFKD", str(text or ""))
+            if not unicodedata.combining(ch)
+        )
+    except Exception:
+        return str(text or "")
+
 def normalize_name(name):
-    s = str(name or "").lower().strip()
+    s = strip_accents(name).lower().strip()
     for ch in [".", ",", "'", "-", "_", " jr", " sr", " ii", " iii", " iv"]:
         s = s.replace(ch, " ")
     return " ".join(s.split())
 
 def name_score(a, b):
+    """Robust player-name match.
+
+    Handles full names, abbreviations, and Underdog initial + last-name display:
+    - Cristopher Sanchez vs C. Sánchez
+    - Gavin Williams vs G. Williams
+    - Jacob deGrom vs J. deGrom
+    """
     a_norm, b_norm = normalize_name(a), normalize_name(b)
     if not a_norm or not b_norm:
         return 0.0
@@ -274,9 +295,21 @@ def name_score(a, b):
         return 1.0
     if a_norm in b_norm or b_norm in a_norm:
         return 0.94
+
     a_parts, b_parts = a_norm.split(), b_norm.split()
-    base = 0.76 if a_parts and b_parts and a_parts[-1] == b_parts[-1] else 0.0
-    return max(base, difflib.SequenceMatcher(None, a_norm, b_norm).ratio())
+    if a_parts and b_parts:
+        a_first, b_first = a_parts[0], b_parts[0]
+        a_last, b_last = a_parts[-1], b_parts[-1]
+
+        # Exact last-name + first-initial match, e.g. "Cristopher Sanchez" vs "C Sanchez".
+        if a_last == b_last and a_first[:1] == b_first[:1]:
+            return 0.93
+
+        # Multi-word last names / particles still get strong credit if the last token and initial match.
+        if a_last == b_last:
+            return max(0.82, difflib.SequenceMatcher(None, a_norm, b_norm).ratio())
+
+    return difflib.SequenceMatcher(None, a_norm, b_norm).ratio()
 
 def is_pitcher_k_text(text):
     t = str(text or "").lower()
@@ -1513,21 +1546,18 @@ def extract_prop_rows_from_any_json(data, player_name, source_name):
 
 @st.cache_data(ttl=90, show_spinner=False)
 def get_underdog_k_data(player_name):
-    """Relationship-safe live Underdog parser for MLB pitcher strikeout props.
+    """Live Underdog parser for MLB pitcher strikeout props.
 
-    The prior parser flattened the whole Underdog payload. That can accidentally mix a
-    player object from one prop with a line object from another prop. This version first
-    rebuilds Underdog relationships:
-
-        over_under_line -> over_under -> appearance -> player
-
-    Then it accepts a line only when the rebuilt player path matches the requested MLB
-    pitcher and the stat is pitcher strikeouts. No generic values, no fake consensus,
-    no NBA/WNBA contamination, and no whole-number Underdog pick'em lines.
+    v10 upgrade:
+    - Still tries the safe relationship path first: line -> over_under -> appearance -> player.
+    - If Underdog changes nesting or omits type labels, falls back to a recursive parser.
+    - Accepts active Underdog K lines when the player name and strikeout market are clearly present.
+    - Keeps NBA/WNBA/fantasy/team props blocked.
     """
     accepted_rows = []
     rejected_rows = []
     last_msg = ""
+    target_norm = normalize_name(player_name)
 
     LINE_TYPES = {"over_under_line", "over_under_lines"}
     OU_TYPES = {"over_under", "over_unders"}
@@ -1560,26 +1590,26 @@ def get_underdog_k_data(player_name):
             return None
         rels = obj.get("relationships") or {}
         for name in rel_names:
-            if name not in rels:
-                continue
-            node = rels.get(name)
-            data = node.get("data") if isinstance(node, dict) else node
-            if isinstance(data, dict):
-                rid = data.get("id")
-                if rid not in [None, ""]:
-                    return str(rid)
-            if isinstance(data, list) and data:
-                for item in data:
-                    if isinstance(item, dict) and item.get("id") not in [None, ""]:
-                        return str(item.get("id"))
+            candidates = [name, name.replace("_", "-"), name.replace("_", "")]
+            for cname in candidates:
+                if cname not in rels:
+                    continue
+                node = rels.get(cname)
+                data = node.get("data") if isinstance(node, dict) else node
+                if isinstance(data, dict):
+                    rid = data.get("id")
+                    if rid not in [None, ""]:
+                        return str(rid)
+                if isinstance(data, list) and data:
+                    for item in data:
+                        if isinstance(item, dict) and item.get("id") not in [None, ""]:
+                            return str(item.get("id"))
         return None
 
     def collect_objects(data):
         objects = []
         def walk(x, parent_key=""):
             if isinstance(x, dict):
-                # Save every dict, but remember the key it came from. This helps when
-                # Underdog omits explicit type fields on nested objects.
                 y = dict(x)
                 if parent_key and "_parent_key" not in y:
                     y["_parent_key"] = parent_key
@@ -1597,7 +1627,8 @@ def get_underdog_k_data(player_name):
         wanted = [
             "title", "display_title", "name", "player_name", "full_name", "first_name", "last_name",
             "display_name", "stat", "stat_type", "appearance_stat", "display_stat", "label", "market",
-            "sport", "league", "sport_name", "league_name", "position"
+            "market_name", "sport", "league", "sport_name", "league_name", "position", "description",
+            "over_under", "over_under_title", "scoring_type", "projection_type"
         ]
         for obj in objs:
             if not isinstance(obj, dict):
@@ -1613,87 +1644,120 @@ def get_underdog_k_data(player_name):
                     parts.append(str(v))
         return " | ".join(parts)
 
-    def player_name_from(player_obj, appearance_obj=None):
+    def player_name_from(player_obj, appearance_obj=None, line_obj=None, ou_obj=None):
         p = attrs(player_obj) if isinstance(player_obj, dict) else {}
         a = attrs(appearance_obj) if isinstance(appearance_obj, dict) else {}
+        l = attrs(line_obj) if isinstance(line_obj, dict) else {}
+        o = attrs(ou_obj) if isinstance(ou_obj, dict) else {}
         candidates = [
             p.get("display_name"), p.get("full_name"), p.get("name"), p.get("player_name"),
+            p.get("short_name"), p.get("abbreviation"), p.get("abbr_name"),
             (str(p.get("first_name", "")).strip() + " " + str(p.get("last_name", "")).strip()).strip(),
-            a.get("player_name"), a.get("full_name"), a.get("display_name"), a.get("title"), a.get("name")
+            a.get("player_name"), a.get("full_name"), a.get("display_name"), a.get("title"), a.get("name"),
+            a.get("short_name"), a.get("abbreviation"), a.get("abbr_name"),
+            l.get("player_name"), l.get("full_name"), l.get("display_name"), l.get("title"), l.get("name"),
+            l.get("short_name"), l.get("abbreviation"), l.get("abbr_name"),
+            o.get("player_name"), o.get("full_name"), o.get("display_name"), o.get("title"), o.get("name"),
+            o.get("short_name"), o.get("abbreviation"), o.get("abbr_name"),
         ]
         for c in candidates:
             if c and normalize_name(c):
                 return str(c)
         return ""
 
-    def line_from_line_obj(line_obj, ou_obj=None):
-        # Underdog line objects normally store the real displayed line as stat_value.
-        # Do NOT use keys like value, points, total, projected_value, etc.
-        safe_keys = ["stat_value", "line_score", "over_under_line", "target_value"]
-        for obj in [line_obj, ou_obj]:
+    def line_from_obj(*objs):
+        # Do not use fantasy projection keys unless the object is already proven to be a pitcher-K prop.
+        safe_keys = ["stat_value", "line_score", "over_under_line", "target_value", "line", "points", "point"]
+        for obj in objs:
             a = attrs(obj)
             for k in safe_keys:
                 val = safe_float(a.get(k))
-                if is_valid_k_line(val, allow_integer=False) is not None:
-                    return float(val), f"{k} half-line from Underdog relationship object"
-        # Some Underdog versions put the line in the title text.
-        text_lines = extract_half_lines_from_text(text_from(line_obj, ou_obj))
+                if is_valid_k_line(val, allow_integer=True) is not None:
+                    return float(val), f"{k} from Underdog object"
+        text_lines = extract_half_lines_from_text(" | ".join(text_from(o) for o in objs))
         if text_lines:
-            return float(text_lines[0]), "half-line from Underdog title text"
-        return None, "no valid Underdog half-line"
+            return float(text_lines[0]), "half-line from Underdog text"
+        return None, "no valid Underdog line"
 
-    def stat_text_from(line_obj, ou_obj=None):
-        return text_from(line_obj, ou_obj).lower()
+    def blob_from(*objs):
+        return " | ".join([text_from(o) for o in objs if isinstance(o, dict)]).lower()
 
-    def is_mlb_context(*objs):
-        blob = (" | ".join(text_from(o) for o in objs)).lower()
-        # Hard block other sports. If Underdog does not expose sport text, do not reject.
-        if any(x in blob for x in [" nba", "wnba", "basketball", "football", "nfl", "nhl", "soccer", "tennis", "golf"]):
-            return False
-        return True
+    def is_bad_sport(blob):
+        return any(x in blob for x in ["wnba", " nba", "basketball", "football", "nfl", "nhl", "soccer", "tennis", "golf"])
 
-    def is_pitcher_k_market(line_obj, ou_obj=None):
-        txt = stat_text_from(line_obj, ou_obj)
-        if not any(x in txt for x in ["pitcher strikeout", "pitcher strikeouts", "pitcher_k", "pitcher k", "strikeouts"]):
+    def is_pitcher_k_blob(blob):
+        blob = blob.lower()
+        if not any(x in blob for x in ["pitcher strikeout", "pitcher strikeouts", "pitcher_k", "pitcher k", "strikeouts", "strike outs"]):
             return False
         bad = [
-            "batter", "hitter", "team strikeouts", "fantasy points", "runs+rbi", "hits+runs+rbi",
-            "total bases", "stolen base", "walks allowed", "earned runs", "outs recorded",
-            "pitching outs", "hits allowed", "runs allowed"
+            "batter", "hitter", "team strikeouts", "fantasy points", "fantasy score", "runs+rbi", "hits+runs+rbi",
+            "total bases", "stolen base", "walks allowed", "earned runs", "outs recorded", "pitching outs",
+            "hits allowed", "runs allowed", "single", "double", "home run", "rbi", "runs scored"
         ]
-        if any(x in txt for x in bad):
+        return not any(x in blob for x in bad)
+
+    def active_status_ok(*objs):
+        status_blob = " ".join(
+            str(attrs(o).get(k, ""))
+            for o in objs if isinstance(o, dict)
+            for k in ["status", "state", "display_status", "over_status", "under_status", "hidden", "active"]
+        ).lower()
+        if any(x in status_blob for x in ["suspended", "removed", "hidden", "inactive", "closed", "disabled"]):
             return False
         return True
 
+    def underdog_player_score(actual_player, evidence):
+        score = max(name_score(player_name, actual_player), name_score(player_name, evidence))
+        # Strong fallback for Underdog display names that use first initial + last name.
+        # Example: MLB probable pitcher = "Cristopher Sanchez"; Underdog row = "C. Sánchez".
+        t_parts = target_norm.split()
+        if len(t_parts) >= 2:
+            target_initial = t_parts[0][:1]
+            target_last = t_parts[-1]
+            evidence_norm = normalize_name(evidence)
+            # Look for "c sanchez", "c. sanchez", or any blob containing the last name with matching initial.
+            if target_last in evidence_norm:
+                tokens = evidence_norm.split()
+                for i, tok in enumerate(tokens):
+                    if tok == target_last and i > 0 and tokens[i - 1][:1] == target_initial:
+                        score = max(score, 0.93)
+                    if tok == target_last and target_initial in evidence_norm:
+                        score = max(score, 0.88)
+        if target_norm and target_norm in normalize_name(evidence):
+            score = max(score, 0.94)
+        return score
+
+    def add_row(line, score, matched, evidence, line_note, path, source_mode):
+        accepted_rows.append({
+            "Source": "Underdog",
+            "Provider": "Underdog",
+            "Player": player_name,
+            "Matched Name": (matched or evidence[:120]),
+            "Match Score": round(float(score), 3),
+            "Market": "Pitcher Strikeouts",
+            "Side": "OVER/UNDER",
+            "Line": float(line),
+            "Price": None,
+            "Line Evidence": line_note,
+            "Parser Mode": source_mode,
+            "Underdog Path": path,
+        })
+
     for url in UNDERDOG_URLS:
-        data = safe_get_json(url, timeout=16)
+        data = safe_get_json(url, timeout=18)
         if not data:
             last_msg = f"No JSON from {url}"
             continue
 
         objects = collect_objects(data)
-        by_type = {}
         by_id_any = {}
+        over_unders, appearances, players, line_candidates = {}, {}, {}, []
+
         for obj in objects:
             typ = obj_type(obj, obj.get("_parent_key", ""))
             oid = obj_id(obj)
-            if typ:
-                by_type.setdefault(typ, []).append(obj)
             if oid:
                 by_id_any[oid] = obj
-
-        def get_by_id(oid):
-            return by_id_any.get(str(oid)) if oid not in [None, ""] else None
-
-        # Build typed id maps when possible, but also keep generic lookup fallback.
-        over_unders = {}
-        appearances = {}
-        players = {}
-        line_candidates = []
-
-        for obj in objects:
-            typ = obj_type(obj, obj.get("_parent_key", ""))
-            oid = obj_id(obj)
             if typ in LINE_TYPES or "over_under_line" in typ:
                 line_candidates.append(obj)
             elif typ in OU_TYPES or typ == "over_under":
@@ -1706,16 +1770,18 @@ def get_underdog_k_data(player_name):
                 if oid:
                     players[oid] = obj
 
-        # Fallback: some payloads have untyped line dicts. Only consider dicts with stat_value and relationships.
+        def get_by_id(oid):
+            return by_id_any.get(str(oid)) if oid not in [None, ""] else None
+
+        # Relationship parser first.
         if not line_candidates:
             for obj in objects:
                 a = attrs(obj)
-                if a.get("stat_value") not in [None, ""] and isinstance(obj.get("relationships"), dict):
-                    line_candidates.append(obj)
+                if any(a.get(k) not in [None, ""] for k in ["stat_value", "line_score", "over_under_line", "target_value", "line", "points"]):
+                    if isinstance(obj.get("relationships"), dict) or is_pitcher_k_blob(json.dumps(obj, default=str).lower()):
+                        line_candidates.append(obj)
 
         for line_obj in line_candidates:
-            line_attrs = attrs(line_obj)
-
             ou_id = rel_id(line_obj, ["over_under", "overUnders", "over_under_id", "over"])
             ou_obj = over_unders.get(ou_id) or get_by_id(ou_id)
 
@@ -1729,81 +1795,92 @@ def get_underdog_k_data(player_name):
                 player_id = rel_id(ou_obj, ["player", "players", "player_id"])
             if not player_id and isinstance(app_obj, dict):
                 player_id = rel_id(app_obj, ["player", "players", "player_id"])
-            # Some appearances store player_id as a plain attribute.
             if not player_id and isinstance(app_obj, dict):
                 player_id = attrs(app_obj).get("player_id") or attrs(app_obj).get("playerId")
             player_obj = players.get(str(player_id)) or get_by_id(player_id)
 
             evidence = text_from(line_obj, ou_obj, app_obj, player_obj)
-            actual_player = player_name_from(player_obj, app_obj)
-            score = max(name_score(player_name, actual_player), name_score(player_name, evidence))
-
-            if not is_mlb_context(line_obj, ou_obj, app_obj, player_obj):
-                rejected_rows.append({"Source":"Underdog", "Provider":"Underdog", "Player":player_name, "Matched Name":actual_player or evidence[:120], "Line":None, "Match Score":round(score,3), "Reject Reason":"non-MLB sport context"})
+            blob = evidence.lower()
+            if is_bad_sport(blob):
+                continue
+            if not is_pitcher_k_blob(blob):
+                rejected_rows.append({"Source":"Underdog", "Provider":"Underdog", "Player":player_name, "Matched Name":evidence[:120], "Line":None, "Match Score":0, "Reject Reason":"relationship row not pitcher strikeouts"})
                 continue
 
-            if score < 0.94:
-                rejected_rows.append({"Source":"Underdog", "Provider":"Underdog", "Player":player_name, "Matched Name":actual_player or evidence[:120], "Line":None, "Match Score":round(score,3), "Reject Reason":"relationship player did not match requested pitcher"})
+            actual_player = player_name_from(player_obj, app_obj, line_obj, ou_obj)
+            score = underdog_player_score(actual_player, evidence)
+            if score < 0.82:
+                rejected_rows.append({"Source":"Underdog", "Provider":"Underdog", "Player":player_name, "Matched Name":actual_player or evidence[:120], "Line":None, "Match Score":round(score,3), "Reject Reason":"player did not match"})
                 continue
 
-            if not is_pitcher_k_market(line_obj, ou_obj):
-                rejected_rows.append({"Source":"Underdog", "Provider":"Underdog", "Player":player_name, "Matched Name":actual_player or evidence[:120], "Line":None, "Match Score":round(score,3), "Reject Reason":"not pitcher strikeouts market"})
-                continue
-
-            chosen_line, line_note = line_from_line_obj(line_obj, ou_obj)
+            chosen_line, line_note = line_from_obj(line_obj, ou_obj)
             if chosen_line is None:
-                raw = line_attrs.get("stat_value") or line_attrs.get("line_score") or line_attrs.get("over_under_line") or line_attrs.get("target_value")
-                rejected_rows.append({"Source":"Underdog", "Provider":"Underdog", "Player":player_name, "Matched Name":actual_player or evidence[:120], "Line":safe_float(raw), "Match Score":round(score,3), "Reject Reason":"no valid half-point Underdog K line"})
+                rejected_rows.append({"Source":"Underdog", "Provider":"Underdog", "Player":player_name, "Matched Name":actual_player or evidence[:120], "Line":None, "Match Score":round(score,3), "Reject Reason":"no usable line value"})
                 continue
-
-            # Use Underdog status if available. Do not accept suspended/hidden/stale rows.
-            status_blob = " ".join(str(line_attrs.get(k, "")) for k in ["status", "state", "display_status", "over_status", "under_status"]).lower()
-            if any(x in status_blob for x in ["suspended", "removed", "hidden", "inactive", "closed"]):
-                rejected_rows.append({"Source":"Underdog", "Provider":"Underdog", "Player":player_name, "Matched Name":actual_player or evidence[:120], "Line":chosen_line, "Match Score":round(score,3), "Reject Reason":"Underdog line not active"})
+            if not active_status_ok(line_obj, ou_obj):
                 continue
+            add_row(chosen_line, score, actual_player, evidence, line_note, f"line:{obj_id(line_obj)} -> over_under:{ou_id} -> appearance:{app_id} -> player:{player_id}", "relationship")
 
-            accepted_rows.append({
-                "Source": "Underdog",
-                "Provider": "Underdog",
-                "Player": player_name,
-                "Matched Name": actual_player or evidence[:120],
-                "Match Score": round(score, 3),
-                "Market": "Pitcher Strikeouts",
-                "Side": "OVER/UNDER",
-                "Line": float(chosen_line),
-                "Price": None,
-                "Line Evidence": line_note,
-                "Underdog Path": f"line:{obj_id(line_obj)} -> over_under:{ou_id} -> appearance:{app_id} -> player:{player_id}",
-            })
+        # Recursive fallback parser for new/changed Underdog JSON.
+        # This is intentionally looser than relationship mode, but still requires:
+        # target player name + strikeout market + sane K line + no bad sport/market words.
+        for obj in objects:
+            if not isinstance(obj, dict):
+                continue
+            blob_json = json.dumps(obj, default=str)
+            blob_low = blob_json.lower()
+            if is_bad_sport(blob_low):
+                continue
+            if not is_pitcher_k_blob(blob_low):
+                continue
+            # Try candidate fields and the full object blob so abbreviated Underdog names match daily.
+            cand = []
+            for k in ["player", "player_name", "participant", "participant_name", "name", "description", "display_name", "title", "short_name", "abbreviation", "abbr_name"]:
+                v = attrs(obj).get(k)
+                if isinstance(v, dict):
+                    v = v.get("name") or v.get("full_name") or v.get("display_name") or v.get("title") or v.get("short_name")
+                if v:
+                    cand.append(str(v))
+            matched = " ".join(cand) or player_name
+            score = max(underdog_player_score(matched, blob_json), name_score(player_name, matched))
+            if score < 0.82:
+                continue
+            line, line_note = line_from_obj(obj)
+            if line is None:
+                continue
+            if not active_status_ok(obj):
+                continue
+            add_row(line, score, matched, blob_json[:200], line_note, f"fallback:{obj_id(obj) or attrs(obj).get('id') or len(accepted_rows)}", "recursive fallback")
 
         if accepted_rows:
             break
 
     if not accepted_rows:
-        return source_result("Underdog", "NO MATCH", rows=rejected_rows[:35], message=last_msg or "No active relationship-matched Underdog pitcher-K half-line")
+        return source_result("Underdog", "NO MATCH", rows=rejected_rows[:35], message=last_msg or "No active Underdog pitcher-K line matched. Check debug rows for rejected reasons.")
 
-    # Deduplicate by relationship path and line. Choose the best player match. If multiple active
-    # half-lines exist for the same pitcher, prefer the most common; otherwise choose the lower
-    # main line because alternates are commonly higher than the main Underdog pick'em line.
     dedup = {}
     for r in accepted_rows:
-        key = (r.get("Underdog Path"), r.get("Line"))
+        key = (r.get("Underdog Path"), r.get("Line"), r.get("Parser Mode"))
         if key not in dedup or safe_float(r.get("Match Score"), 0) > safe_float(dedup[key].get("Match Score"), 0):
             dedup[key] = r
     accepted_rows = list(dedup.values())
 
-    counts = {}
-    for r in accepted_rows:
-        line = safe_float(r.get("Line"))
-        counts[line] = counts.get(line, 0) + 1
-    active = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+    # Pick the row that best matches the actual pitcher, not the most repeated number.
+    # This prevents alternates or duplicated nested objects from overriding the active Underdog board line.
+    def row_rank(r):
+        mode_bonus = 0.03 if r.get("Parser Mode") == "relationship" else 0.0
+        half_bonus = 0.02 if is_half_point_line(r.get("Line")) else 0.0
+        return (safe_float(r.get("Match Score"), 0) + mode_bonus + half_bonus, -safe_float(r.get("Line"), 99))
+
+    best_row = sorted(accepted_rows, key=row_rank, reverse=True)[0]
+    active = safe_float(best_row.get("Line"))
 
     return source_result(
         "Underdog",
         "FOUND",
         line=float(active),
         rows=sorted(accepted_rows + rejected_rows[:12], key=lambda r: (str(r.get("Reject Reason", "")) != "", -safe_float(r.get("Match Score"), 0), safe_float(r.get("Line"), 99))),
-        message=f"Relationship-matched live Underdog line: {float(active):.1f} ({len(accepted_rows)} accepted row(s))"
+        message=f"Live Underdog line matched: {float(active):.1f} via {best_row.get('Matched Name')} ({best_row.get('Parser Mode')})"
     )
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -1859,7 +1936,7 @@ def choose_active_line(sportsbook_data, pp_data, ud_data, sgo_data, optic_data):
             candidates.append({"Source": source, "Line": val, "Weight": float(weight)})
 
     # Underdog first: user is comparing the app to live Underdog props.
-    ud_line = is_valid_k_line(ud_data.get("line"), allow_integer=False)
+    ud_line = is_valid_k_line(ud_data.get("line"), allow_integer=True)
     if ud_data.get("status") == "FOUND" and ud_line is not None:
         # Still collect other rows for diagnostics, but do not let consensus round/shift Underdog.
         add("Sportsbook", sportsbook_data.get("line"), 3.0, allow_integer=True)
@@ -2505,7 +2582,8 @@ def render_pick_card(p):
         color_class, progress_class, badge = "red", "progress-red", "red-badge"
     else:
         color_class, progress_class, badge = "orange", "progress-orange", "yellow-badge"
-line_display = f"{safe_float(p.get('line')):.1f}" if p.get('line') is not None else "NO REAL LINE"
+    line_display = f"{safe_float(p.get('line')):.1f}" if p.get('line') is not None else "NO REAL LINE"
+    edge_display = p.get("edge_ks") if p.get("edge_ks") is not None else "—"
     ev_display = f"{(p.get('ev') or 0)*100:.2f}%" if p.get("ev") is not None else "—"
     prob_display = f"{prob_pct}%" if prob is not None else "—"
     # Render-safe Last 10 K bars.
@@ -2571,7 +2649,7 @@ line_display = f"{safe_float(p.get('line')):.1f}" if p.get('line') is not None e
 # =========================
 st.markdown("""
 <div class="hero-panel">
-  <div class="big-title">🔥 MLB STRIKEOUT PROP ENGINE v9.8 UNDERDOG LIVE LINE FIX</div>
+  <div class="big-title">🔥 MLB STRIKEOUT PROP ENGINE v10.1 UNDERDOG EXACT LIVE LINES</div>
   <div class="sub-title">Strict Win Filter: fewer picks, stronger edge, harsher leash penalties, real lines only → Refresh → Save → Grade</div>
 </div>
 """, unsafe_allow_html=True)
