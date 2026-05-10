@@ -2828,7 +2828,6 @@ st.info(f"{APP_VERSION} | {board_status} | Last refresh: {st.session_state.get('
 
 render_kpis(board, bankroll)
 
-tab1, tab2, tab3, tab4, tab5, tab6 = 
 def display_clean_real_prop_rows(rows, **kwargs):
     cleaned = clean_real_prop_debug_rows(rows)
     if cleaned:
@@ -2836,8 +2835,7 @@ def display_clean_real_prop_rows(rows, **kwargs):
     else:
         st.info("No rejected/NBA debug rows shown. Only valid MLB pitcher strikeout lines will appear here.")
 
-
-st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "TOP PLAYS",
     "ALL PLAYERS",
     "REAL PROP BOARD",
