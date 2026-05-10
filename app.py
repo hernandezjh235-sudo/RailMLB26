@@ -2505,8 +2505,7 @@ def render_pick_card(p):
         color_class, progress_class, badge = "red", "progress-red", "red-badge"
     else:
         color_class, progress_class, badge = "orange", "progress-orange", "yellow-badge"
-    line_display = f"{safe_float(p.get("line")):.1f}" if p.get("line") is not None else "NO REAL LINE"
-    edge_display = p.get("edge_ks") if p.get("edge_ks") is not None else "—"
+line_display = f"{safe_float(p.get('line')):.1f}" if p.get('line') is not None else "NO REAL LINE"
     ev_display = f"{(p.get('ev') or 0)*100:.2f}%" if p.get("ev") is not None else "—"
     prob_display = f"{prob_pct}%" if prob is not None else "—"
     # Render-safe Last 10 K bars.
