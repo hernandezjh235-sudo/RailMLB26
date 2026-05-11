@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-# MLB STRIKEOUT PROP ENGINE — ONE FILE — v10.7 BAYESIAN MARKOV + XGB ASSIST
+# MLB STRIKEOUT PROP ENGINE — ONE FILE — v10.8 BAYESIAN MARKOV + XGB ASSIST
 # Refresh first, then save official before-game snapshot
 # Real lines only. No fake prop lines.
 # Google Drive persistent logs + grading + learning.
@@ -19,7 +19,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v10.7 BAYESIAN MARKOV + XGB ASSIST"
+APP_VERSION = "v10.8 WEATHER + UMPIRE CAPS"
 
 try:
     import pytz
@@ -77,6 +77,15 @@ SPORTSBOOK_PITCHER_K_MARKETS = [
 
 LEAGUE_AVG_K = 0.225
 DEFAULT_BF = 22.0
+
+# =========================
+# v10.8 WEATHER + UMPIRE CAPS
+# =========================
+# These are deliberately small nudges. They cannot override lines or no-bet gates.
+WEATHER_FACTOR_MIN = 0.975
+WEATHER_FACTOR_MAX = 1.025
+UMPIRE_FACTOR_MIN = 0.975
+UMPIRE_FACTOR_MAX = 1.025
 # =========================
 # v10.3 UNDERDOG DEBUG + PRIMARY BOARD LINE SETTINGS
 # =========================
@@ -1359,20 +1368,159 @@ def park_k_factor(venue_name):
             return factor
     return 1.00
 
-def umpire_factor(game_pk):
+# MLB venue coordinates for live weather. Indoor/retractable parks default neutral.
+VENUE_WEATHER_META = {
+    "angel stadium": (33.8003, -117.8827, False),
+    "busch stadium": (38.6226, -90.1928, False),
+    "camden yards": (39.2839, -76.6217, False),
+    "citizens bank park": (39.9061, -75.1665, False),
+    "coors field": (39.7559, -104.9942, False),
+    "dodger stadium": (34.0739, -118.2400, False),
+    "fenway park": (42.3467, -71.0972, False),
+    "great american ball park": (39.0979, -84.5066, False),
+    "guaranteed rate field": (41.8300, -87.6339, False),
+    "kauffman stadium": (39.0517, -94.4803, False),
+    "loan depot park": (25.7781, -80.2197, True),
+    "minute maid park": (29.7572, -95.3555, True),
+    "nationals park": (38.8730, -77.0074, False),
+    "oracle park": (37.7786, -122.3893, False),
+    "petco park": (32.7073, -117.1573, False),
+    "pnc park": (40.4469, -80.0057, False),
+    "progressive field": (41.4962, -81.6852, False),
+    "rogers centre": (43.6414, -79.3894, True),
+    "sutter health park": (38.5803, -121.5139, False),
+    "target field": (44.9817, -93.2776, False),
+    "t mobile park": (47.5914, -122.3325, True),
+    "tropicana field": (27.7682, -82.6534, True),
+    "truist park": (33.8908, -84.4678, False),
+    "wrigley field": (41.9484, -87.6553, False),
+    "yankee stadium": (40.8296, -73.9262, False),
+    "american family field": (43.0280, -87.9712, True),
+    "chase field": (33.4455, -112.0667, True),
+    "citi field": (40.7571, -73.8458, False),
+    "comerica park": (42.3390, -83.0485, False),
+    "globe life field": (32.7473, -97.0842, True),
+}
+
+def venue_weather_meta(venue_name):
+    v = normalize_name(venue_name)
+    for name, meta in VENUE_WEATHER_META.items():
+        if name in v:
+            return meta
+    return None
+
+def parse_game_hour_pt(game_time):
+    try:
+        s = str(game_time or "").replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if pytz and dt.tzinfo is not None:
+            dt = dt.astimezone(pytz.timezone("America/Los_Angeles"))
+        return dt.strftime("%Y-%m-%dT%H:00")
+    except Exception:
+        return None
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_open_meteo_hourly(lat, lon, date_str):
+    try:
+        params = {
+            "latitude": lat,
+            "longitude": lon,
+            "hourly": "temperature_2m,relative_humidity_2m,precipitation_probability,wind_speed_10m",
+            "temperature_unit": "fahrenheit",
+            "wind_speed_unit": "mph",
+            "timezone": "America/Los_Angeles",
+            "start_date": date_str,
+            "end_date": date_str,
+        }
+        return safe_get_json("https://api.open-meteo.com/v1/forecast", params=params, timeout=12) or {}
+    except Exception as e:
+        log_source_request("OpenMeteo", "ERROR", str(e))
+        return {}
+
+def weather_k_factor(venue_name, game_time, enabled=True):
+    """Conservative live weather K factor.
+
+    Weather only nudges K probability slightly and defaults neutral when unavailable.
+    Indoor/retractable parks are neutral because roof status is often unknown.
+    """
+    if not enabled:
+        return 1.0, "Weather adjustment off", {}
+    meta = venue_weather_meta(venue_name)
+    if not meta:
+        return 1.0, "Weather unavailable for venue; neutral", {}
+    lat, lon, indoor = meta
+    if indoor:
+        return 1.0, "Indoor/retractable venue; weather neutral", {"indoor": True}
+    try:
+        date_str = str(game_time or "")[:10]
+        hour_key = parse_game_hour_pt(game_time)
+        data = get_open_meteo_hourly(lat, lon, date_str)
+        hourly = data.get("hourly") or {}
+        times = hourly.get("time") or []
+        if not times:
+            return 1.0, "Weather feed empty; neutral", {}
+        idx = 0
+        if hour_key in times:
+            idx = times.index(hour_key)
+        else:
+            # nearest available hour by string distance fallback
+            idx = min(range(len(times)), key=lambda i: abs(i - len(times)//2))
+        temp = safe_float((hourly.get("temperature_2m") or [None])[idx])
+        wind = safe_float((hourly.get("wind_speed_10m") or [None])[idx])
+        humidity = safe_float((hourly.get("relative_humidity_2m") or [None])[idx])
+        precip = safe_float((hourly.get("precipitation_probability") or [None])[idx])
+
+        factor = 1.0
+        # Cold air can help pitchers slightly; extreme heat can reduce stamina/command slightly.
+        if temp is not None:
+            if temp <= 55:
+                factor += 0.006
+            elif temp >= 88:
+                factor -= 0.008
+        # Strong wind can increase run environment/long innings; tiny K haircut.
+        if wind is not None and wind >= 15:
+            factor -= 0.006
+        # Very high humidity/precip risk can affect grip/command; tiny K haircut.
+        if humidity is not None and humidity >= 80:
+            factor -= 0.004
+        if precip is not None and precip >= 35:
+            factor -= 0.006
+
+        factor = float(clamp(factor, WEATHER_FACTOR_MIN, WEATHER_FACTOR_MAX))
+        details = {"temp_f": temp, "wind_mph": wind, "humidity": humidity, "precip_prob": precip, "indoor": False}
+        note = f"Weather x{factor:.3f}: {temp if temp is not None else 'NA'}F, wind {wind if wind is not None else 'NA'} mph, humidity {humidity if humidity is not None else 'NA'}%, precip {precip if precip is not None else 'NA'}%"
+        return factor, note, details
+    except Exception as e:
+        return 1.0, f"Weather error; neutral: {e}", {}
+
+# Conservative umpire K tendency table. Missing/unknown umps stay neutral.
+UMPIRE_K_TENDENCY = {
+    "Lance Barrett": 1.020,
+    "Mark Wegner": 1.018,
+    "Pat Hoberg": 1.015,
+    "Adam Hamari": 1.012,
+    "Ryan Blakney": 1.010,
+    "Bill Miller": 0.982,
+    "Chris Segal": 0.985,
+    "Angel Hernandez": 0.990,
+    "Laz Diaz": 0.990,
+    "CB Bucknor": 0.992,
+}
+
+def umpire_factor(game_pk, enabled=True):
+    if not enabled:
+        return 1.00, "Umpire adjustment off", "Umpire adjustment off"
     data = safe_get_json(f"{MLB_LIVE}/game/{game_pk}/feed/live")
     try:
         officials = data["liveData"]["boxscore"].get("officials", [])
         name = officials[0]["official"]["fullName"] if officials else "Unknown"
-        high_k = ["Lance Barrett", "Mark Wegner"]
-        low_k = ["Bill Miller", "Chris Segal"]
-        if name in high_k:
-            return 1.06, name
-        if name in low_k:
-            return 0.97, name
-        return 1.00, name
+        raw = safe_float(UMPIRE_K_TENDENCY.get(name), 1.0) or 1.0
+        factor = float(clamp(raw, UMPIRE_FACTOR_MIN, UMPIRE_FACTOR_MAX))
+        if name == "Unknown":
+            return 1.00, name, "Umpire unknown; neutral"
+        return factor, name, f"Umpire K tendency x{factor:.3f} ({name})"
     except Exception:
-        return 1.00, "Unknown"
+        return 1.00, "Unknown", "Umpire unavailable; neutral"
 
 def build_pa_sequence(lineup_rows, bf, fallback_k):
     bf = int(round(bf))
@@ -2439,7 +2587,7 @@ def bullpen_workload_bf_factor(team_id):
 # =========================
 # PROJECTION ENGINE
 # =========================
-def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, use_calibration, use_bayesian_markov=True, use_xgboost_assist=False, use_sgo=False, use_optic=False):
+def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, use_calibration, use_bayesian_markov=True, use_weather=True, use_umpire=True, use_xgboost_assist=False, use_sgo=False, use_optic=False):
     pid = row["pitcher_id"]
     pitcher_name = row["pitcher"]
     hand = row["hand"]
@@ -2483,8 +2631,10 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
     pitcher_k, calibration_note = apply_calibration_adjustment(pitcher_k, calibration_profile, enabled=use_calibration)
 
     matchup_k = calculate_log5_k_rate(pitcher_k, lineup_k)
-    ump_mult, ump_name = umpire_factor(row["game_pk"])
+    ump_mult, ump_name, umpire_note = umpire_factor(row["game_pk"], enabled=use_umpire)
     park = park_k_factor(row.get("venue"))
+    weather_mult, weather_note, weather_details = weather_k_factor(row.get("venue"), row.get("game_time"), enabled=use_weather)
+    env_mult = float(clamp(park * ump_mult * weather_mult, 0.94, 1.06))
 
     bf = leash["expected_bf"]
     bullpen_factor, bullpen_note = bullpen_workload_bf_factor(row.get("team_id"))
@@ -2506,8 +2656,8 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
             matchup_k,
             batter_rates,
             expected_bf=bf,
-            park=park,
-            ump=ump_mult,
+            park=env_mult,
+            ump=1.0,
             data_score=preliminary_score,
             lineup_locked=lineup_locked,
             pitcher_confirmed=row.get("pitcher_confirmed"),
@@ -2516,7 +2666,7 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         )
         simulation_source = simulation_source + " + Bayesian Markov MC"
     else:
-        sims, pa_probs = simulate_matchup(matchup_k, batter_rates, park=park, ump=ump_mult, sims=12000)
+        sims, pa_probs = simulate_matchup(matchup_k, batter_rates, park=env_mult, ump=1.0, sims=12000)
         bayesian_markov_note = "Standard Monte Carlo"
 
     mean = float(np.mean(sims))
@@ -2703,6 +2853,15 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "xgboost_note": xgb_info.get("message"),
         "umpire": ump_name,
         "ump_factor": round(ump_mult, 3),
+        "umpire_note": umpire_note,
+        "weather_enabled": bool(use_weather),
+        "weather_factor": round(weather_mult, 3),
+        "weather_note": weather_note,
+        "weather_temp_f": weather_details.get("temp_f") if isinstance(weather_details, dict) else None,
+        "weather_wind_mph": weather_details.get("wind_mph") if isinstance(weather_details, dict) else None,
+        "weather_humidity": weather_details.get("humidity") if isinstance(weather_details, dict) else None,
+        "weather_precip_prob": weather_details.get("precip_prob") if isinstance(weather_details, dict) else None,
+        "environment_factor": round(env_mult, 3),
         "expected_bf": round(bf, 1),
         "ppb": round(leash["ppb"], 2),
         "leash_risk": leash.get("leash_risk"),
@@ -2978,6 +3137,7 @@ def render_pick_card(p):
       </div>
       <div class="small-muted" style="margin-top:12px;">Risk Notes: {p.get('risk_notes')}</div>
       <div class="small-muted">Statcast: {p.get('statcast_note')} | Pitch Type: {p.get('pitch_type_note')} | Calibration: {p.get('calibration_note')}</div>
+      <div class="small-muted">Weather: {p.get('weather_note')} | Umpire: {p.get('umpire_note')}</div>
       <div class="small-muted">Advanced Sim: {p.get('bayesian_markov_note')} | XGBoost: {p.get('xgboost_note')}</div>
     </div>
     """, unsafe_allow_html=True)
@@ -2987,7 +3147,7 @@ def render_pick_card(p):
 # =========================
 st.markdown("""
 <div class="hero-panel">
-  <div class="big-title">🔥 MLB STRIKEOUT PROP ENGINE v10.7 BAYESIAN MARKOV + XGB ASSIST</div>
+  <div class="big-title">🔥 MLB STRIKEOUT PROP ENGINE v10.8 WEATHER + UMPIRE CAPS</div>
   <div class="sub-title">Strict Win Filter + MLB-only Underdog line lock → Refresh → Save → Grade</div>
 </div>
 """, unsafe_allow_html=True)
@@ -3005,6 +3165,8 @@ with st.sidebar:
     use_pitch_type = st.checkbox("Use pitch-type whiff mix", value=True)
     use_calibration = st.checkbox("Use historical calibration", value=True)
     use_bayesian_markov = st.checkbox("Use Bayesian Markov Monte Carlo", value=True)
+    use_weather = st.checkbox("Use live weather adjustment", value=True)
+    use_umpire = st.checkbox("Use capped umpire tendency", value=True)
     use_xgboost_assist = st.checkbox("Experimental: capped XGBoost assist", value=False)
     use_sgo = st.checkbox("Optional: SportsGameOdds API", value=False)
     use_optic = st.checkbox("Optional: OpticOdds API", value=False)
@@ -3051,6 +3213,8 @@ if refresh_btn:
                     use_pitch_type=use_pitch_type,
                     use_calibration=use_calibration,
                     use_bayesian_markov=use_bayesian_markov,
+                    use_weather=use_weather,
+                    use_umpire=use_umpire,
                     use_xgboost_assist=use_xgboost_assist,
                     use_sgo=use_sgo,
                     use_optic=use_optic
@@ -3176,6 +3340,12 @@ with tab4:
                 "Pitch-Type Available": p.get("pitch_type_matchup_available"),
                 "Pitch-Type Factor": p.get("pitch_type_factor"),
                 "Pitch-Type Note": p.get("pitch_type_note"),
+                "Weather Factor": p.get("weather_factor"),
+                "Weather Note": p.get("weather_note"),
+                "Umpire": p.get("umpire"),
+                "Umpire Factor": p.get("ump_factor"),
+                "Umpire Note": p.get("umpire_note"),
+                "Environment Factor": p.get("environment_factor"),
             })
             for r in p.get("pitch_type_rows", []):
                 rr = dict(r)
