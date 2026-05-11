@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-# MLB STRIKEOUT PROP ENGINE — ONE FILE — v10.6 NO NBA DEBUG STORAGE
+# MLB STRIKEOUT PROP ENGINE — ONE FILE — v10.7 BAYESIAN MARKOV + XGB ASSIST
 # Refresh first, then save official before-game snapshot
 # Real lines only. No fake prop lines.
 # Google Drive persistent logs + grading + learning.
@@ -19,7 +19,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v10.6 NO NBA DEBUG STORAGE"
+APP_VERSION = "v10.7 BAYESIAN MARKOV + XGB ASSIST"
 
 try:
     import pytz
@@ -97,6 +97,19 @@ LEARNING_MIN_PRIOR_STARTS = 5
 LEARNING_RATE = 0.04
 LEARNING_SCALE_MIN = 0.92
 LEARNING_SCALE_MAX = 1.08
+
+# =========================
+# v10.7 ADVANCED SIM / AI ASSIST SETTINGS
+# =========================
+# Bayesian + Markov is safe and ON by default.
+# XGBoost is experimental and OFF by default until enough graded history exists.
+BAYESIAN_MARKOV_SIMS = 14000
+BAYESIAN_PROJECTION_STD_MIN = 0.45
+BAYESIAN_PROJECTION_STD_MAX = 1.85
+XGB_MIN_GRADED_SAMPLES = 100
+XGB_MAX_RESIDUAL_ADJ_KS = 0.35
+XGB_MAX_PERCENT_ADJ = 0.05
+XGB_RECENT_TRAIN_LIMIT = 700
 
 
 LEAGUE_AVG_WHIFF_BY_PITCH_TYPE = {
@@ -1378,6 +1391,184 @@ def simulate_matchup(pitcher_k, batter_rates, park=1.0, ump=1.0, sims=12000):
     out = np.random.binomial(1, np.array(rates), size=(sims, len(rates))).sum(axis=1)
     return out, rates
 
+
+def bayesian_projection_std(data_score, lineup_locked, pitcher_confirmed, leash):
+    """Dynamic uncertainty for K simulations.
+
+    Higher data quality = tighter distribution. Missing lineup, unconfirmed pitcher,
+    or leash risk = wider uncertainty. This does not create edge; it usually shrinks
+    extreme confidence back toward reality.
+    """
+    score = safe_float(data_score, 50) or 50
+    std = 1.25 - (score / 100.0) * 0.55
+    if not lineup_locked:
+        std += 0.28
+    if not pitcher_confirmed:
+        std += 0.32
+    if leash and leash.get("leash_risk") in ["HIGH_PITCH_COUNT", "SHORT_RECENT_STARTS", "HIGH_RECENT_WORKLOAD"]:
+        std += 0.25
+    ppb = safe_float((leash or {}).get("ppb"), 4.0) or 4.0
+    if ppb >= 4.15:
+        std += 0.15
+    return float(clamp(std, BAYESIAN_PROJECTION_STD_MIN, BAYESIAN_PROJECTION_STD_MAX))
+
+
+def simulate_bayesian_markov_matchup(pitcher_k, batter_rates, expected_bf, park=1.0, ump=1.0, data_score=50, lineup_locked=False, pitcher_confirmed=True, leash=None, sims=BAYESIAN_MARKOV_SIMS):
+    """MLB-specific Bayesian + Markov Monte Carlo.
+
+    This keeps our current batter-by-batter K probabilities, but adds realistic uncertainty:
+    - starter volume uncertainty around expected BF
+    - pitcher K-rate uncertainty based on data quality/leash
+    - PA-by-PA Markov flow instead of fixed 27 outs
+    """
+    base_rates = []
+    for br in batter_rates:
+        k = calculate_log5_k_rate(pitcher_k, br)
+        base_rates.append(clamp(k * park * ump, 0.03, 0.60))
+
+    if not base_rates:
+        base_rates = [clamp(pitcher_k * park * ump, 0.03, 0.60)] * int(max(1, round(expected_bf or DEFAULT_BF)))
+
+    data_score = safe_float(data_score, 50) or 50
+    proj_std = bayesian_projection_std(data_score, lineup_locked, pitcher_confirmed, leash)
+    expected_bf = safe_float(expected_bf, DEFAULT_BF) or DEFAULT_BF
+
+    # Better score -> tighter BF range. Risky leash -> wider BF range.
+    bf_sd = 1.25 + (1 - data_score / 100.0) * 2.0
+    if leash and leash.get("leash_risk") in ["HIGH_PITCH_COUNT", "SHORT_RECENT_STARTS", "HIGH_RECENT_WORKLOAD"]:
+        bf_sd += 1.2
+
+    # Convert projection-level uncertainty into a conservative multiplier on PA K probabilities.
+    baseline_projection = max(sum(base_rates[:int(round(expected_bf))]), 0.25)
+    mult_sd = clamp(proj_std / max(baseline_projection, 1.0), 0.04, 0.22)
+
+    results = np.zeros(int(sims), dtype=float)
+    rates_arr = np.array(base_rates, dtype=float)
+    n_rates = len(rates_arr)
+
+    for i in range(int(sims)):
+        sampled_bf = int(round(np.random.normal(expected_bf, bf_sd)))
+        sampled_bf = int(clamp(sampled_bf, 12, 34))
+        k_mult = float(np.random.normal(1.0, mult_sd))
+        k_mult = clamp(k_mult, 0.72, 1.28)
+        idx = np.arange(sampled_bf) % n_rates
+        probs = np.clip(rates_arr[idx] * k_mult, 0.02, 0.68)
+        results[i] = np.random.binomial(1, probs).sum()
+
+    note = f"Bayesian Markov MC: sims={int(sims)}, BF μ={expected_bf:.1f}, BF σ={bf_sd:.2f}, K σ={proj_std:.2f}"
+    return results, base_rates, note
+
+
+XGB_FEATURES = [
+    "projection", "pitcher_k", "opp_k", "expected_bf", "ppb", "recent_ip",
+    "data_score", "lineup_locked", "pitcher_confirmed", "statcast_available",
+    "statcast_csw", "statcast_whiff", "pitch_type_matchup_available", "pitch_type_factor",
+    "consensus_count", "consensus_spread"
+]
+
+
+def xgb_feature_row_from_picklike(d):
+    def b(v):
+        return 1.0 if bool(v) else 0.0
+    return {
+        "projection": safe_float(d.get("projection"), 0) or 0,
+        "pitcher_k": safe_float(d.get("pitcher_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K,
+        "opp_k": safe_float(d.get("opp_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K,
+        "expected_bf": safe_float(d.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF,
+        "ppb": safe_float(d.get("ppb"), 4.0) or 4.0,
+        "recent_ip": safe_float(d.get("recent_ip"), 5.5) or 5.5,
+        "data_score": safe_float(d.get("data_score"), 50) or 50,
+        "lineup_locked": b(d.get("lineup_locked")),
+        "pitcher_confirmed": b(d.get("pitcher_confirmed")),
+        "statcast_available": b(d.get("statcast_available")),
+        "statcast_csw": safe_float(d.get("statcast_csw"), 0) or 0,
+        "statcast_whiff": safe_float(d.get("statcast_whiff"), 0) or 0,
+        "pitch_type_matchup_available": b(d.get("pitch_type_matchup_available")),
+        "pitch_type_factor": safe_float(d.get("pitch_type_factor"), 1.0) or 1.0,
+        "consensus_count": safe_float(d.get("consensus_count"), 0) or 0,
+        "consensus_spread": safe_float(d.get("consensus_spread"), 0) or 0,
+    }
+
+
+def build_xgb_training_frame():
+    """Train on our own graded official snapshots only.
+
+    Target is residual actual Ks - existing projection, so XGBoost can only act
+    as a correction layer. It does not replace the core model.
+    """
+    results = load_json(RESULT_LOG, [])
+    rows = []
+    for r in results[-XGB_RECENT_TRAIN_LIMIT:]:
+        actual = safe_float(r.get("actual"))
+        proj = safe_float(r.get("projection"))
+        if actual is None or proj is None:
+            continue
+        if r.get("graded_result") not in ["WIN", "LOSS"]:
+            continue
+        feat = xgb_feature_row_from_picklike(r)
+        feat["target_residual"] = float(clamp(actual - proj, -4.0, 4.0))
+        rows.append(feat)
+    return pd.DataFrame(rows)
+
+
+def apply_xgboost_assist(current_features, current_projection, enabled=False):
+    """Optional capped XGBoost correction.
+
+    OFF by default. Activates only after enough graded picks and only changes
+    the projection by a small capped amount. It cannot affect line source,
+    Underdog lock, or strict no-bet gates.
+    """
+    info = {
+        "enabled": bool(enabled),
+        "active": False,
+        "samples": 0,
+        "adjustment": 0.0,
+        "message": "XGBoost assist off",
+    }
+    base = safe_float(current_projection, 0) or 0
+    if not enabled:
+        return base, info
+
+    df = build_xgb_training_frame()
+    info["samples"] = int(len(df))
+    if len(df) < XGB_MIN_GRADED_SAMPLES:
+        info["message"] = f"Need {XGB_MIN_GRADED_SAMPLES}+ graded picks; found {len(df)}"
+        return base, info
+
+    try:
+        from xgboost import XGBRegressor
+    except Exception as e:
+        info["message"] = f"xgboost not installed: {e}"
+        return base, info
+
+    try:
+        train_df = df.copy()
+        X = train_df[XGB_FEATURES].fillna(0.0)
+        y = train_df["target_residual"].astype(float)
+        model = XGBRegressor(
+            n_estimators=160,
+            max_depth=2,
+            learning_rate=0.035,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            objective="reg:squarederror",
+            random_state=42,
+        )
+        model.fit(X, y)
+        cur = pd.DataFrame([current_features])[XGB_FEATURES].fillna(0.0)
+        raw_adj = float(model.predict(cur)[0])
+        cap = min(XGB_MAX_RESIDUAL_ADJ_KS, abs(base) * XGB_MAX_PERCENT_ADJ)
+        adj = float(clamp(raw_adj, -cap, cap))
+        info.update({
+            "active": True,
+            "adjustment": round(adj, 3),
+            "message": f"XGBoost residual assist active: raw {raw_adj:+.2f}, capped {adj:+.2f} K from {len(df)} samples",
+        })
+        return float(clamp(base + adj, 0.0, 15.0)), info
+    except Exception as e:
+        info["message"] = f"XGBoost assist error: {e}"
+        return base, info
+
 def calculate_pick_metrics(sims, line):
     if line is None:
         return {"over_prob": None, "under_prob": None, "fair_prob": None, "pick_side": "NO LINE", "edge": None, "grade": "NO LINE", "ev": None}
@@ -2248,7 +2439,7 @@ def bullpen_workload_bf_factor(team_id):
 # =========================
 # PROJECTION ENGINE
 # =========================
-def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, use_calibration, use_sgo=False, use_optic=False):
+def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, use_calibration, use_bayesian_markov=True, use_xgboost_assist=False, use_sgo=False, use_optic=False):
     pid = row["pitcher_id"]
     pitcher_name = row["pitcher"]
     hand = row["hand"]
@@ -2299,9 +2490,62 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
     bullpen_factor, bullpen_note = bullpen_workload_bf_factor(row.get("team_id"))
     bf = float(clamp(bf * bullpen_factor, 14, 31))
     batter_rates, simulation_source = build_pa_sequence(lineup_rows if lineup_locked else [], bf, lineup_k)
-    sims, pa_probs = simulate_matchup(matchup_k, batter_rates, park=park, ump=ump_mult, sims=12000)
+
+    # v10.7: safer Bayesian + Markov Monte Carlo built around expected BF, not generic 27 outs.
+    preliminary_score = data_lock_score(
+        lineup_locked=lineup_locked,
+        pitcher_confirmed=row.get("pitcher_confirmed"),
+        active_line=None,
+        consensus_info={"count": 0, "spread": None},
+        ppb=leash["ppb"],
+        statcast_available=statcast_profile.get("available"),
+        pitch_type_available=pitch_type_available,
+    )
+    if use_bayesian_markov:
+        sims, pa_probs, bayesian_markov_note = simulate_bayesian_markov_matchup(
+            matchup_k,
+            batter_rates,
+            expected_bf=bf,
+            park=park,
+            ump=ump_mult,
+            data_score=preliminary_score,
+            lineup_locked=lineup_locked,
+            pitcher_confirmed=row.get("pitcher_confirmed"),
+            leash=leash,
+            sims=BAYESIAN_MARKOV_SIMS,
+        )
+        simulation_source = simulation_source + " + Bayesian Markov MC"
+    else:
+        sims, pa_probs = simulate_matchup(matchup_k, batter_rates, park=park, ump=ump_mult, sims=12000)
+        bayesian_markov_note = "Standard Monte Carlo"
 
     mean = float(np.mean(sims))
+
+    # v10.7 optional XGBoost residual assist. Capped and OFF by default.
+    xgb_current_features = xgb_feature_row_from_picklike({
+        "projection": mean,
+        "pitcher_k": pitcher_k,
+        "opp_k": lineup_k,
+        "expected_bf": bf,
+        "ppb": leash["ppb"],
+        "recent_ip": leash["recent_ip"],
+        "data_score": preliminary_score,
+        "lineup_locked": lineup_locked,
+        "pitcher_confirmed": row.get("pitcher_confirmed"),
+        "statcast_available": statcast_profile.get("available"),
+        "statcast_csw": None if statcast_profile.get("csw") is None else statcast_profile.get("csw") * 100,
+        "statcast_whiff": None if statcast_profile.get("whiff") is None else statcast_profile.get("whiff") * 100,
+        "pitch_type_matchup_available": pitch_type_available,
+        "pitch_type_factor": pitch_type_factor,
+        "consensus_count": 0,
+        "consensus_spread": 0,
+    })
+    adjusted_mean, xgb_info = apply_xgboost_assist(xgb_current_features, mean, enabled=use_xgboost_assist)
+    if xgb_info.get("active"):
+        delta = adjusted_mean - mean
+        sims = np.clip(sims + delta, 0, None)
+        mean = float(np.mean(sims))
+
     median = float(np.median(sims))
     p10 = float(np.percentile(sims, 10))
     p90 = float(np.percentile(sims, 90))
@@ -2450,6 +2694,13 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "pitcher_k_source": pitcher_k_source,
         "opp_k": round(lineup_k, 3),
         "simulation_source": simulation_source,
+        "bayesian_markov_enabled": bool(use_bayesian_markov),
+        "bayesian_markov_note": bayesian_markov_note,
+        "xgboost_enabled": bool(use_xgboost_assist),
+        "xgboost_active": bool(xgb_info.get("active")),
+        "xgboost_samples": int(xgb_info.get("samples", 0)),
+        "xgboost_adjustment": safe_float(xgb_info.get("adjustment"), 0.0),
+        "xgboost_note": xgb_info.get("message"),
         "umpire": ump_name,
         "ump_factor": round(ump_mult, 3),
         "expected_bf": round(bf, 1),
@@ -2727,6 +2978,7 @@ def render_pick_card(p):
       </div>
       <div class="small-muted" style="margin-top:12px;">Risk Notes: {p.get('risk_notes')}</div>
       <div class="small-muted">Statcast: {p.get('statcast_note')} | Pitch Type: {p.get('pitch_type_note')} | Calibration: {p.get('calibration_note')}</div>
+      <div class="small-muted">Advanced Sim: {p.get('bayesian_markov_note')} | XGBoost: {p.get('xgboost_note')}</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -2735,7 +2987,7 @@ def render_pick_card(p):
 # =========================
 st.markdown("""
 <div class="hero-panel">
-  <div class="big-title">🔥 MLB STRIKEOUT PROP ENGINE v10.4 MLB-ONLY UNDERDOG LINE LOCK</div>
+  <div class="big-title">🔥 MLB STRIKEOUT PROP ENGINE v10.7 BAYESIAN MARKOV + XGB ASSIST</div>
   <div class="sub-title">Strict Win Filter + MLB-only Underdog line lock → Refresh → Save → Grade</div>
 </div>
 """, unsafe_allow_html=True)
@@ -2752,6 +3004,8 @@ with st.sidebar:
     use_statcast = st.checkbox("Use Statcast pitcher CSW/whiff", value=True)
     use_pitch_type = st.checkbox("Use pitch-type whiff mix", value=True)
     use_calibration = st.checkbox("Use historical calibration", value=True)
+    use_bayesian_markov = st.checkbox("Use Bayesian Markov Monte Carlo", value=True)
+    use_xgboost_assist = st.checkbox("Experimental: capped XGBoost assist", value=False)
     use_sgo = st.checkbox("Optional: SportsGameOdds API", value=False)
     use_optic = st.checkbox("Optional: OpticOdds API", value=False)
     if st.button("🧹 Clear Streamlit Cache + Reload Live Lines", use_container_width=True):
@@ -2796,6 +3050,8 @@ if refresh_btn:
                     use_statcast=use_statcast,
                     use_pitch_type=use_pitch_type,
                     use_calibration=use_calibration,
+                    use_bayesian_markov=use_bayesian_markov,
+                    use_xgboost_assist=use_xgboost_assist,
                     use_sgo=use_sgo,
                     use_optic=use_optic
                 )
@@ -2878,7 +3134,7 @@ with tab2:
             "date", "pitcher", "matchup", "hand", "projection", "line", "pick_side",
             "fair_probability", "edge_ks", "ev", "signal", "risk_label",
             "line_source", "underdog_line", "underdog_status", "underdog_message", "data_score", "lineup_locked", "pitcher_confirmed",
-            "statcast_available", "pitch_type_matchup_available", "pitch_type_factor", "bettable", "leash_risk"
+            "statcast_available", "pitch_type_matchup_available", "pitch_type_factor", "bayesian_markov_enabled", "xgboost_active", "xgboost_samples", "xgboost_adjustment", "bettable", "leash_risk"
         ]
         cols = [c for c in cols if c in show.columns]
         st.dataframe(show[cols], use_container_width=True, hide_index=True)
@@ -2990,6 +3246,10 @@ with tab6:
     st.code(CLV_FILE)
     st.write("Long Backtest File:")
     st.code(LONG_BACKTEST_FILE)
+    st.subheader("Advanced Model Status")
+    xgb_train_df = build_xgb_training_frame()
+    st.write(f"XGBoost training samples available: {len(xgb_train_df)} / {XGB_MIN_GRADED_SAMPLES} needed")
+    st.caption("XGBoost is a capped residual assist only. It never overrides Underdog lines or no-bet gates.")
     st.subheader("Source Status")
     if board:
         src_rows = []
