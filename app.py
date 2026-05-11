@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-# MLB STRIKEOUT PROP ENGINE — ONE FILE — v10.5 CLEAN MLB DEBUG ROWS
+# MLB STRIKEOUT PROP ENGINE — ONE FILE — v10.6 NO NBA DEBUG STORAGE
 # Refresh first, then save official before-game snapshot
 # Real lines only. No fake prop lines.
 # Google Drive persistent logs + grading + learning.
@@ -19,7 +19,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v10.5 CLEAN MLB DEBUG ROWS"
+APP_VERSION = "v10.6 NO NBA DEBUG STORAGE"
 
 try:
     import pytz
@@ -688,6 +688,9 @@ def extract_probable_pitchers(date_str):
                     "matchup": f"{away.get('abbreviation', away.get('name'))} @ {home.get('abbreviation', home.get('name'))}",
                     "pitcher_confirmed": True
                 })
+    for _p in locals().get("board", locals().get("rows", locals().get("out", []))):
+        if isinstance(_p, dict) and "prop_rows" in _p:
+            _p["prop_rows"] = clean_real_prop_debug_rows(_p.get("prop_rows", []))
     return rows
 
 def get_pitcher_profile(pid):
@@ -1398,47 +1401,53 @@ def source_result(source, status, line=None, rows=None, message=""):
 
 
 def clean_real_prop_debug_rows(rows):
-    """Show only usable MLB pitcher strikeout rows in the Real Prop Board debug table.
+    """Display/storage filter: only valid MLB pitcher strikeout prop rows.
 
-    This is display-only protection. It does not change the projection model.
-    It removes rejected NBA/WNBA/basketball rows that have Line=None/Market=None.
+    Wrong-sport Underdog rows like LeBron/Shai NBA props are dropped here even
+    if they made it through another source's raw/debug output.
     """
     cleaned = []
+    nba_name_block = {
+        "lebron james", "shai gilgeous alexander", "james harden", "donovan mitchell",
+        "anthony edwards", "nikola jokic", "luka doncic", "jayson tatum",
+        "stephen curry", "kevin durant", "giannis antetokounmpo", "victor wembanyama"
+    }
+
     for r in rows or []:
         if not isinstance(r, dict):
+            continue
+
+        matched = str(r.get("Matched Name", r.get("matched_name", r.get("Player", ""))) or "")
+        matched_norm = normalize_name(matched)
+        if matched_norm in nba_name_block:
+            continue
+        if any(n in matched_norm for n in nba_name_block):
             continue
 
         line = safe_float(
             r.get("Line", r.get("line", r.get("Prop Line", r.get("line_display"))))
         )
         market = str(r.get("Market", r.get("market", "")) or "")
-        matched = str(r.get("Matched Name", r.get("matched_name", r.get("Player", ""))) or "")
-        blob = " ".join(str(v) for v in r.values())[:3000]
+        blob = " ".join(str(v) for v in r.values())[:4000]
 
-        # Hard reject NBA/basketball contamination.
         if is_bad_sport_text(blob):
             continue
-
-        # Must have a real validated K line.
         if is_valid_k_line(line, allow_integer=False) is None:
             continue
-
-        # Must be pitcher strikeouts or equivalent K market text.
-        if market and not is_pitcher_k_text(market):
-            if not is_pitcher_k_text(blob):
-                continue
-        elif not is_pitcher_k_text(blob):
+        if is_bad_k_market_text(blob):
             continue
 
-        # Must not be a bad/non-pitcher-K market.
-        if is_bad_k_market_text(blob):
+        # Accepted rows usually have Market = Pitcher Strikeouts. For raw rows,
+        # require strikeout text in the blob.
+        if market:
+            if not is_pitcher_k_text(market) and not is_pitcher_k_text(blob):
+                continue
+        elif not is_pitcher_k_text(blob):
             continue
 
         cleaned.append(r)
 
     return cleaned
-
-
 
 def is_half_point_line(line):
     """True for normal no-push prop lines like 4.5, 5.5, 6.5."""
@@ -1872,18 +1881,18 @@ def get_underdog_k_data(player_name):
             if is_bad_sport(blob):
                 continue
             if not is_pitcher_k_blob(blob):
-                rejected_rows.append({"Source":"Underdog", "Provider":"Underdog", "Player":player_name, "Matched Name":evidence[:120], "Line":None, "Match Score":0, "Reject Reason":"relationship row not pitcher strikeouts"})
+                # rejected row hidden intentionally
                 continue
 
             actual_player = player_name_from(player_obj, app_obj, line_obj, ou_obj)
             score = underdog_player_score(actual_player, evidence)
             if score < 0.82:
-                rejected_rows.append({"Source":"Underdog", "Provider":"Underdog", "Player":player_name, "Matched Name":actual_player or evidence[:120], "Line":None, "Match Score":round(score,3), "Reject Reason":"player did not match"})
+                # rejected row hidden intentionally
                 continue
 
             chosen_line, line_note = line_from_obj(line_obj, ou_obj)
             if chosen_line is None:
-                rejected_rows.append({"Source":"Underdog", "Provider":"Underdog", "Player":player_name, "Matched Name":actual_player or evidence[:120], "Line":None, "Match Score":round(score,3), "Reject Reason":"no usable line value"})
+                # rejected row hidden intentionally
                 continue
             if not active_status_ok(line_obj, ou_obj):
                 continue
@@ -1924,7 +1933,7 @@ def get_underdog_k_data(player_name):
             break
 
     if not accepted_rows:
-        return source_result("Underdog", "NO MATCH", rows=rejected_rows[:35], message=last_msg or "No active Underdog pitcher-K line matched. Check debug rows for rejected reasons.")
+        return source_result("Underdog", "NO MATCH", rows=[], message=last_msg or "No active Underdog pitcher-K line matched. Rejected wrong-sport rows are hidden.")
 
     dedup = {}
     for r in accepted_rows:
@@ -2886,13 +2895,14 @@ with tab3:
             rr["Projection"] = p.get("projection")
             rr["Data Score"] = p.get("data_score")
             rows.append(rr)
+    rows = clean_real_prop_debug_rows(rows)
     if rows:
         df_rows = pd.DataFrame(rows)
         preferred = [c for c in ["Pitcher", "Source", "Parser Mode", "Matched Name", "Line", "Market", "Line Evidence", "Underdog Path", "Match Score", "Reject Reason", "Projection", "Model Lean", "Model Prob %"] if c in df_rows.columns]
         other = [c for c in df_rows.columns if c not in preferred]
         st.dataframe(df_rows[preferred + other], use_container_width=True, hide_index=True)
     else:
-        st.warning("No real prop rows found from connected sources yet. No fake line is created.")
+        st.warning("No valid MLB pitcher strikeout prop rows found. Rejected NBA/basketball rows are hidden.")
 
 with tab4:
     st.markdown('<div class="section-title-pro">Statcast + Pitch-Type</div>', unsafe_allow_html=True)
