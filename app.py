@@ -19,7 +19,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.1 REAL 2-3 DAY BULLPEN FATIGUE"
+APP_VERSION = "v11.2 CONTEXT GUARDRAILS + REAL BULLPEN FATIGUE"
 
 try:
     import pytz
@@ -1324,6 +1324,192 @@ def bullpen_fatigue_bf_factor(team_id, as_of_date):
             note = "Neutral recent bullpen workload"
 
     return float(clamp(factor, 0.96, 1.04)), f"{note} ({usage.get('message')})", usage
+
+
+
+# =========================
+# v11.2 CONTEXT GUARDRAIL LAYER
+# =========================
+def opponent_k_rank_label_from_rate(opponent_k_rate):
+    """Convert real lineup/team K rate into a coarse rank-style label.
+
+    This is not a fake rank table. It is derived from the same real opponent K%
+    already used by the app. Lower rank number = more strikeout-friendly matchup.
+    """
+    ok = safe_float(opponent_k_rate, LEAGUE_AVG_K) or LEAGUE_AVG_K
+    if ok >= LEAGUE_AVG_K + 0.040:
+        return 1, "EXTREME_HIGH_K"
+    if ok >= LEAGUE_AVG_K + 0.030:
+        return 5, "HIGH_K"
+    if ok >= LEAGUE_AVG_K + 0.015:
+        return 10, "ABOVE_AVG_K"
+    if ok <= LEAGUE_AVG_K - 0.035:
+        return 30, "EXTREME_CONTACT"
+    if ok <= LEAGUE_AVG_K - 0.020:
+        return 25, "LOW_K"
+    return 15, "NEUTRAL_K"
+
+def vegas_total_leash_ks_adjustment(total):
+    """Small Ks projection nudge from run environment.
+
+    Lower totals usually help starters work deeper. Higher totals increase early-hook risk.
+    Kept very small so it cannot overpower real lineups, Statcast, or leash model.
+    """
+    t = safe_float(total)
+    if t is None:
+        return 0.0, "Vegas total unavailable; neutral"
+    if t <= 7.5:
+        return 0.18, "Low Vegas total; small Ks leash boost"
+    if t >= 9.5:
+        return -0.18, "High Vegas total; small Ks leash cut"
+    return 0.0, "Neutral Vegas total"
+
+def elite_pitcher_guard_ks_adjustment(k9, k_rate, opponent_k_rate):
+    """Protects elite K pitchers from being under-projected in strong K matchups.
+
+    This is capped and only adds a small amount. It does not auto-bet overs.
+    """
+    k9 = safe_float(k9)
+    kr = safe_float(k_rate)
+    opp_rank, opp_label = opponent_k_rank_label_from_rate(opponent_k_rate)
+
+    if k9 is None or kr is None:
+        return 0.0, "Elite pitcher guard unavailable"
+
+    if k9 >= 10.5 and kr >= 0.29:
+        if opp_rank <= 10:
+            return 0.35, f"Elite pitcher guard vs {opp_label}; capped boost"
+        return 0.22, "Elite pitcher guard; capped boost"
+    if k9 >= 9.8 and kr >= 0.27:
+        return 0.16, "High-K pitcher guard; capped boost"
+    return 0.0, "No elite pitcher guard"
+
+def pitch_mix_handedness_guard_ks_adjustment(pitch_type_rows, lineup_rows):
+    """Small boost when slider-heavy pitchers face many opposite/lefty bats.
+
+    Uses real pitch type rows and real lineup rows only. If either is unavailable, neutral.
+    """
+    try:
+        if not pitch_type_rows or not lineup_rows:
+            return 0.0, "Pitch-mix handedness guard unavailable"
+
+        slider_usage = 0.0
+        for r in pitch_type_rows:
+            pt = str(r.get("Pitch Type", "")).lower()
+            if pt in ["sl", "slider"]:
+                slider_usage = max(slider_usage, (safe_float(r.get("Usage %"), 0) or 0) / 100.0)
+
+        # The current MLB lineup payload in this app may not always include batter handedness.
+        # If handedness is absent, this stays neutral instead of guessing.
+        lefties = 0
+        for r in lineup_rows[:9]:
+            hand = str(r.get("Bat Side", r.get("Side", r.get("Bats", "")))).upper()
+            if hand.startswith("L"):
+                lefties += 1
+
+        if slider_usage > 0.32 and lefties >= 5:
+            return 0.16, f"Slider-heavy pitch mix vs {lefties} lefties; capped boost"
+        return 0.0, "Neutral pitch-mix handedness guard"
+    except Exception as e:
+        return 0.0, f"Pitch-mix handedness guard error: {e}"
+
+def apply_context_guardrail_projection(
+    projection,
+    line=None,
+    pitcher_profile=None,
+    pitcher_k_rate=None,
+    lineup_k=None,
+    recent_rows=None,
+    pitch_type_rows=None,
+    lineup_rows=None,
+    vegas_total=None,
+    roof_closed=False,
+    wind_in=False,
+    umpire_boost=0.0,
+):
+    """Final small, capped projection guardrail layer.
+
+    This layer is intentionally conservative:
+    - uses only already-real inputs when available
+    - never creates props or lines
+    - cannot move projection by more than +/- 0.65 Ks total
+    - cannot force a bet; EV/edge/no-bet filters still decide
+    """
+    base = safe_float(projection)
+    if base is None:
+        return projection, {
+            "Context Guardrail Adj": 0.0,
+            "Context Guardrail Notes": "Projection unavailable",
+            "Opponent K Rank Label": None,
+        }
+
+    notes = []
+    adj = 0.0
+
+    lineup_k_val = safe_float(lineup_k, LEAGUE_AVG_K) or LEAGUE_AVG_K
+    opp_rank, opp_label = opponent_k_rank_label_from_rate(lineup_k_val)
+    notes.append(f"Opponent K rank label: {opp_label}")
+
+    # Pull real K/9 if available
+    k9 = None
+    if isinstance(pitcher_profile, dict):
+        k9 = pitcher_profile.get("K/9")
+    kr = safe_float(pitcher_k_rate)
+
+    a, n = elite_pitcher_guard_ks_adjustment(k9, kr, lineup_k_val)
+    adj += a
+    notes.append(n)
+
+    # Real recent pitch count trend as a projection-level nudge, separate from BF factor
+    vals = []
+    for r in (recent_rows or [])[:3]:
+        p = safe_float(r.get("Pitches"))
+        if p is not None and p > 0:
+            vals.append(p)
+    if len(vals) >= 3:
+        avg = sum(vals) / len(vals)
+        if avg > 102:
+            adj += 0.16
+            notes.append(f"High L3 pitch-count trend ({avg:.0f}); small projection boost")
+        elif avg < 88:
+            adj -= 0.16
+            notes.append(f"Low L3 pitch-count trend ({avg:.0f}); small projection cut")
+        else:
+            notes.append(f"Neutral L3 pitch-count trend ({avg:.0f})")
+    else:
+        notes.append("Pitch-count trend thin; neutral")
+
+    a, n = vegas_total_leash_ks_adjustment(vegas_total)
+    adj += a
+    notes.append(n)
+
+    # Weather/roof is intentionally tiny because the app already has weather caps elsewhere
+    if bool(roof_closed):
+        adj += 0.05
+        notes.append("Roof closed; tiny environment stability boost")
+    elif bool(wind_in):
+        adj += 0.08
+        notes.append("Wind in; tiny Ks environment boost")
+
+    # Umpire boost must already be produced by a real umpire model. Manual boost defaults to 0.
+    ub = clamp(safe_float(umpire_boost, 0.0) or 0.0, -0.15, 0.15)
+    if abs(ub) > 0:
+        adj += ub
+        notes.append(f"Umpire guardrail adj {ub:+.2f}")
+
+    a, n = pitch_mix_handedness_guard_ks_adjustment(pitch_type_rows, lineup_rows)
+    adj += a
+    notes.append(n)
+
+    adj = float(clamp(adj, -0.65, 0.65))
+    final_projection = float(clamp(base + adj, 1.0, 14.0))
+
+    return final_projection, {
+        "Context Guardrail Adj": round(adj, 2),
+        "Context Guardrail Notes": " | ".join(notes),
+        "Opponent K Rank": opp_rank,
+        "Opponent K Rank Label": opp_label,
+    }
 
 # =========================
 # STATCAST
