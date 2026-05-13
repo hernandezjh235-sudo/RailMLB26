@@ -19,7 +19,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.2 CONTEXT GUARDRAILS + REAL BULLPEN FATIGUE"
+APP_VERSION = "v11.3 PER-BATTER PITCH-TYPE CONTACT + SLG"
 
 try:
     import pytz
@@ -1618,13 +1618,27 @@ def apply_pitch_type_matchup_adjustment(pitcher_k, pitcher_statcast, enabled=Tru
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def get_batter_statcast_pitch_type_profile(batter_id, days=365, pitcher_hand=None):
-    """Real batter whiff profile by pitch type from Baseball Savant.
+    """Real per-batter Statcast profile by pitch type.
 
-    This never estimates missing data. If Statcast is unavailable or too thin, no adjustment is applied.
+    Adds:
+    - per-batter whiff% by pitch type
+    - per-batter contact% by pitch type
+    - per-batter SLG vs pitch type from real batted-ball outcomes
+    - overall batter whiff/contact profile
+
+    Missing or thin data stays neutral. Nothing is guessed.
     """
-    empty = {"available": False, "message": "No batter id", "rows": 0, "pitch_type_profile": []}
+    empty = {
+        "available": False,
+        "message": "No batter id",
+        "rows": 0,
+        "overall_whiff": None,
+        "overall_contact": None,
+        "pitch_type_profile": []
+    }
     if not batter_id:
         return empty
+
     end = datetime.now()
     start = end - timedelta(days=int(days))
     url = "https://baseballsavant.mlb.com/statcast_search/csv"
@@ -1636,66 +1650,145 @@ def get_batter_statcast_pitch_type_profile(batter_id, days=365, pitcher_hand=Non
         "game_date_lt": end.strftime("%Y-%m-%d"),
         "type": "details",
     }
+
+    def _event_total_bases(ev):
+        ev = str(ev or "").lower()
+        if ev == "single":
+            return 1
+        if ev == "double":
+            return 2
+        if ev == "triple":
+            return 3
+        if ev == "home_run":
+            return 4
+        return 0
+
+    def _is_ab_event(ev):
+        ev = str(ev or "").lower()
+        if not ev or ev in ["nan", "none"]:
+            return False
+        non_ab = {
+            "walk", "intent_walk", "hit_by_pitch", "sac_bunt", "sac_fly",
+            "catcher_interf", "sac_fly_double_play", "sac_bunt_double_play"
+        }
+        return ev not in non_ab
+
     try:
         r = requests.get(url, params=params, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code != 200 or not r.text.strip():
             empty["message"] = f"Batter Statcast HTTP {r.status_code}"
             return empty
+
         df = pd.read_csv(io.StringIO(r.text), low_memory=False)
         if df.empty or "description" not in df.columns or "pitch_type" not in df.columns:
             empty["message"] = "Batter Statcast returned no pitch-type rows"
             return empty
-        # Use hand split only if the split sample is not tiny. Otherwise use all pitcher hands.
+
+        # Use pitcher-hand split only if enough real rows exist; otherwise keep full batter sample.
         if pitcher_hand in ["R", "L"] and "p_throws" in df.columns:
             hand_df = df[df["p_throws"].astype(str).str.upper() == pitcher_hand].copy()
             if len(hand_df) >= 25:
                 df = hand_df
+
         desc = df["description"].astype(str).str.lower()
         whiff_mask = desc.isin(["swinging_strike", "swinging_strike_blocked", "foul_tip"])
         swing_mask = desc.isin([
             "swinging_strike", "swinging_strike_blocked", "foul_tip", "foul", "foul_bunt",
             "missed_bunt", "hit_into_play", "hit_into_play_no_out", "hit_into_play_score"
         ])
+        contact_mask = swing_mask & (~whiff_mask)
+
         df2 = df.copy()
         df2["pitch_type"] = df2["pitch_type"].fillna("UNK").astype(str)
         df2["_whiff"] = whiff_mask.astype(int)
         df2["_swing"] = swing_mask.astype(int)
+        df2["_contact"] = contact_mask.astype(int)
+
+        if "events" in df2.columns:
+            df2["_ab_event"] = df2["events"].apply(_is_ab_event).astype(int)
+            df2["_total_bases"] = df2["events"].apply(_event_total_bases).astype(float)
+        else:
+            df2["_ab_event"] = 0
+            df2["_total_bases"] = 0.0
+
+        overall_swings = int(df2["_swing"].sum())
+        overall_whiffs = int(df2["_whiff"].sum())
+        overall_contacts = int(df2["_contact"].sum())
+        overall_whiff = overall_whiffs / overall_swings if overall_swings > 0 else None
+        overall_contact = overall_contacts / overall_swings if overall_swings > 0 else None
+
         grouped = df2.groupby("pitch_type").agg(
             Pitches=("pitch_type", "size"),
             Whiffs=("_whiff", "sum"),
             Swings=("_swing", "sum"),
+            Contacts=("_contact", "sum"),
+            ABEvents=("_ab_event", "sum"),
+            TotalBases=("_total_bases", "sum"),
         ).reset_index()
+
         grouped = grouped[grouped["Swings"] >= 5]
         if grouped.empty:
             empty["message"] = "Batter Statcast has too few swings by pitch type"
             return empty
+
         grouped["WhiffRate"] = grouped["Whiffs"] / grouped["Swings"].replace(0, np.nan)
+        grouped["ContactRate"] = grouped["Contacts"] / grouped["Swings"].replace(0, np.nan)
+        grouped["SLG"] = grouped["TotalBases"] / grouped["ABEvents"].replace(0, np.nan)
+
         profile = []
         for _, row in grouped.iterrows():
             wr = safe_float(row["WhiffRate"])
+            cr = safe_float(row["ContactRate"])
+            slg = safe_float(row["SLG"])
             if wr is None or pd.isna(wr):
                 continue
             profile.append({
                 "Pitch Type": str(row["pitch_type"]),
                 "Batter Whiff%": round(wr * 100, 1),
+                "Batter Contact%": None if cr is None or pd.isna(cr) else round(cr * 100, 1),
+                "Batter SLG vs Pitch": None if slg is None or pd.isna(slg) else round(slg, 3),
                 "Swings": int(row["Swings"]),
+                "Contacts": int(row["Contacts"]),
                 "Pitches Seen": int(row["Pitches"]),
+                "AB Events": int(row["ABEvents"]),
+                "Total Bases": int(row["TotalBases"]),
             })
+
         if not profile:
-            empty["message"] = "No batter pitch-type whiff rows passed sample filter"
+            empty["message"] = "No batter pitch-type rows passed sample filter"
             return empty
-        return {"available": True, "message": "Real batter Statcast pitch-type whiff loaded", "rows": int(len(df)), "pitch_type_profile": profile}
+
+        return {
+            "available": True,
+            "message": "Real batter Statcast pitch-type whiff/contact/SLG loaded",
+            "rows": int(len(df)),
+            "overall_whiff": None if overall_whiff is None else float(overall_whiff),
+            "overall_contact": None if overall_contact is None else float(overall_contact),
+            "pitch_type_profile": profile
+        }
     except Exception as e:
         empty["message"] = f"Batter Statcast unavailable: {e}"
         return empty
 
 
 def build_pitch_type_matchup_profile(pitcher_statcast, lineup_rows, enabled=True, min_batters=5, pitcher_hand=None):
-    """Compare real pitcher pitch mix to real batter whiff by pitch type.
+    """Compare real pitcher pitch mix to real batter pitch-type profiles.
 
-    Applies only when enough real batter Statcast profiles load. Missing pitch types are ignored, not guessed.
+    v11.3 adds per-batter:
+    - K% already supplied from lineup_rows
+    - SLG vs pitch type
+    - contact% / whiff% by pitch type
+
+    Missing pitch types are ignored, never guessed.
     """
-    result = {"available": False, "factor": 1.0, "message": "Pitch-type matchup disabled or unavailable", "rows": [], "batters_loaded": 0}
+    result = {
+        "available": False,
+        "factor": 1.0,
+        "message": "Pitch-type matchup disabled or unavailable",
+        "rows": [],
+        "batter_rows": [],
+        "batters_loaded": 0
+    }
     if not enabled:
         result["message"] = "Pitch-type matchup disabled"
         return result
@@ -1718,13 +1811,45 @@ def build_pitch_type_matchup_profile(pitcher_statcast, lineup_rows, enabled=True
     pitch_types = [pt for pt, use in pitcher_usage.items() if pt and use >= 0.03]
 
     batter_profiles = []
+    batter_detail_rows = []
+
     for r in lineup_rows[:9]:
         bid = r.get("Player ID")
+        batter_name = r.get("Batter")
         prof = get_batter_statcast_pitch_type_profile(bid, days=365, pitcher_hand=pitcher_hand)
         if prof.get("available"):
             by_pt = {x.get("Pitch Type"): x for x in prof.get("pitch_type_profile", [])}
-            batter_profiles.append({"Batter": r.get("Batter"), "by_pt": by_pt})
+            batter_profiles.append({
+                "Batter": batter_name,
+                "Order": r.get("Order"),
+                "Used K%": r.get("Used K%"),
+                "Raw_K_Rate": r.get("Raw_K_Rate"),
+                "Overall Contact%": None if prof.get("overall_contact") is None else round(prof.get("overall_contact") * 100, 1),
+                "Overall Whiff%": None if prof.get("overall_whiff") is None else round(prof.get("overall_whiff") * 100, 1),
+                "by_pt": by_pt
+            })
+
+            for pt, prow in by_pt.items():
+                if pt not in pitch_types:
+                    continue
+                batter_detail_rows.append({
+                    "Order": r.get("Order"),
+                    "Batter": batter_name,
+                    "Player ID": bid,
+                    "Pitch Type": pt,
+                    "Pitcher Usage %": round((pitcher_usage.get(pt, 0) or 0) * 100, 1),
+                    "Per-Batter K%": r.get("Used K%"),
+                    "Per-Batter Contact%": prow.get("Batter Contact%"),
+                    "Per-Batter Whiff%": prow.get("Batter Whiff%"),
+                    "Per-Batter SLG vs Pitch": prow.get("Batter SLG vs Pitch"),
+                    "Swings": prow.get("Swings"),
+                    "Pitches Seen": prow.get("Pitches Seen"),
+                    "AB Events": prow.get("AB Events"),
+                })
+
     result["batters_loaded"] = len(batter_profiles)
+    result["batter_rows"] = batter_detail_rows
+
     if len(batter_profiles) < min_batters:
         result["message"] = f"Only {len(batter_profiles)}/9 batter pitch-type profiles loaded; no adjustment applied"
         return result
@@ -1732,51 +1857,100 @@ def build_pitch_type_matchup_profile(pitcher_statcast, lineup_rows, enabled=True
     rows = []
     weighted_index = 0.0
     used_weight = 0.0
+
     for pt in pitch_types:
         use = pitcher_usage.get(pt, 0) or 0
-        batter_rates = []
+        batter_whiff_rates = []
+        batter_contact_rates = []
+        batter_slg_rates = []
         batter_swings = 0
+        slg_ab_events = 0
+
         for bp in batter_profiles:
             row = bp["by_pt"].get(pt)
             if not row:
                 continue
+
             wr = safe_float(row.get("Batter Whiff%"))
+            cr = safe_float(row.get("Batter Contact%"))
+            slg = safe_float(row.get("Batter SLG vs Pitch"))
             swings = safe_int(row.get("Swings"), 0) or 0
+            ab_events = safe_int(row.get("AB Events"), 0) or 0
+
             if wr is not None and swings >= 5:
-                batter_rates.append(wr / 100.0)
+                batter_whiff_rates.append(wr / 100.0)
                 batter_swings += swings
-        if len(batter_rates) < 3:
+            if cr is not None and swings >= 5:
+                batter_contact_rates.append(cr / 100.0)
+            if slg is not None and ab_events >= 2:
+                batter_slg_rates.append(slg)
+                slg_ab_events += ab_events
+
+        if len(batter_whiff_rates) < 3:
             continue
-        avg_batter_whiff = float(np.mean(batter_rates))
+
+        avg_batter_whiff = float(np.mean(batter_whiff_rates))
+        avg_batter_contact = float(np.mean(batter_contact_rates)) if batter_contact_rates else None
+        avg_batter_slg = float(np.mean(batter_slg_rates)) if batter_slg_rates else None
+
         league_ref = LEAGUE_AVG_WHIFF_BY_PITCH_TYPE.get(pt, 0.25)
         pitcher_wr = pitcher_whiff.get(pt)
+
         pitcher_bonus = 1.0
         if pitcher_wr is not None:
             pitcher_bonus = clamp(pitcher_wr / max(league_ref, 0.01), 0.85, 1.18)
-        batter_index = avg_batter_whiff / max(league_ref, 0.01)
-        combined_index = clamp((batter_index * 0.70) + (pitcher_bonus * 0.30), 0.82, 1.22)
+
+        batter_whiff_index = avg_batter_whiff / max(league_ref, 0.01)
+
+        # Contact and SLG protect against fake K boosts when hitters see a pitch well.
+        contact_guard = 1.0
+        if avg_batter_contact is not None:
+            if avg_batter_contact >= 0.78:
+                contact_guard = 0.96
+            elif avg_batter_contact <= 0.64:
+                contact_guard = 1.04
+
+        slg_guard = 1.0
+        if avg_batter_slg is not None:
+            if avg_batter_slg >= 0.520:
+                slg_guard = 0.97
+            elif avg_batter_slg <= 0.300:
+                slg_guard = 1.03
+
+        combined_index = (batter_whiff_index * 0.60) + (pitcher_bonus * 0.25) + (contact_guard * 0.10) + (slg_guard * 0.05)
+        combined_index = clamp(combined_index, 0.82, 1.22)
+
         weighted_index += use * combined_index
         used_weight += use
+
         rows.append({
             "Pitch Type": pt,
             "Pitcher Usage %": round(use * 100, 1),
             "Avg Batter Whiff%": round(avg_batter_whiff * 100, 1),
+            "Avg Batter Contact%": None if avg_batter_contact is None else round(avg_batter_contact * 100, 1),
+            "Avg Batter SLG vs Pitch": None if avg_batter_slg is None else round(avg_batter_slg, 3),
             "League Ref Whiff%": round(league_ref * 100, 1),
             "Pitcher Whiff%": None if pitcher_wr is None else round(pitcher_wr * 100, 1),
+            "Contact Guard": round(contact_guard, 3),
+            "SLG Guard": round(slg_guard, 3),
             "Index": round(combined_index, 3),
-            "Batter Profiles Used": len(batter_rates),
+            "Batter Profiles Used": len(batter_whiff_rates),
             "Batter Swings": batter_swings,
+            "SLG AB Events": slg_ab_events,
         })
+
     if used_weight <= 0 or not rows:
         result["message"] = "No overlapping pitcher/batter pitch-type rows passed sample filter"
         return result
+
     avg_index = weighted_index / used_weight
     factor = clamp(1 + ((avg_index - 1) * 0.10), 0.965, 1.035)
     result.update({
         "available": True,
         "factor": factor,
-        "message": f"Real batter-vs-pitch-type matchup x{factor:.3f} ({len(batter_profiles)}/9 batters loaded)",
+        "message": f"Real per-batter K/contact/whiff/SLG pitch-type matchup x{factor:.3f} ({len(batter_profiles)}/9 batters loaded)",
         "rows": rows,
+        "batter_rows": batter_detail_rows,
     })
     return result
 
@@ -3058,6 +3232,8 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         if not pitch_type_available:
             pitch_type_note = matchup_profile.get("message", pitch_type_note)
 
+    batter_pitch_profile_rows = matchup_profile.get("batter_rows", []) if isinstance(matchup_profile, dict) else []
+
     calibration_profile = build_model_calibration_profile(load_json(RESULT_LOG, []))
     pitcher_k, calibration_note = apply_calibration_adjustment(pitcher_k, calibration_profile, enabled=use_calibration)
 
@@ -3257,6 +3433,7 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
             rr["Bullpen IP"] = bullpen_usage.get("bullpen_ip") if isinstance(bullpen_usage, dict) else None
             rr["Bullpen Fatigue Factor"] = round(safe_float(bullpen_factor, 1.0), 3)
             rr["Bullpen Fatigue Note"] = bullpen_note
+            rr["Pitch-Type Batter Detail Rows"] = len(batter_pitch_profile_rows) if "batter_pitch_profile_rows" in locals() else 0
             prop_rows.append(rr)
 
     pick_id = f"{row['date']}_{row['game_pk']}_{pid}_{active_line}_{active_source}"
@@ -3368,6 +3545,7 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "prop_rows": prop_rows,
         "lineup_rows": lineup_rows,
         "pitch_type_rows": pitch_type_rows,
+        "batter_pitch_profile_rows": batter_pitch_profile_rows,
         "source_status": {
             "sportsbook": sportsbook_data.get("status"),
             "prizepicks": pp_data.get("status"),
@@ -3781,6 +3959,7 @@ with tab4:
     if board:
         stat_rows = []
         pitch_rows = []
+        batter_pitch_rows = []
         lineup_rows = []
         for p in board:
             stat_rows.append({
@@ -3803,6 +3982,11 @@ with tab4:
                 rr = dict(r)
                 rr["Pitcher"] = p.get("pitcher")
                 pitch_rows.append(rr)
+            for r in p.get("batter_pitch_profile_rows", []):
+                rr = dict(r)
+                rr["Pitcher"] = p.get("pitcher")
+                rr["Matchup"] = p.get("matchup")
+                batter_pitch_rows.append(rr)
             for r in p.get("lineup_rows", []):
                 rr = dict(r)
                 rr["Pitcher"] = p.get("pitcher")
@@ -3815,6 +3999,11 @@ with tab4:
             st.dataframe(pd.DataFrame(pitch_rows), use_container_width=True, hide_index=True)
         else:
             st.info("No pitch-type rows loaded yet.")
+        st.subheader("Per-Batter Pitch-Type Profile")
+        if batter_pitch_rows:
+            st.dataframe(pd.DataFrame(batter_pitch_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("No per-batter pitch-type rows loaded yet.")
         st.subheader("Lineup Batter K Inputs")
         if lineup_rows:
             st.dataframe(pd.DataFrame(lineup_rows), use_container_width=True, hide_index=True)
