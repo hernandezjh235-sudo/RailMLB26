@@ -19,7 +19,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.4 RUN-DAMAGE + GAME-SCRIPT RISK CONTROL"
+APP_VERSION = "v11.5 UI CLARITY + MATCHUP BREAKDOWN"
 
 try:
     import pytz
@@ -243,6 +243,45 @@ h1,h2,h3 {color:#fff;}
 .stTabs [data-baseweb="tab"] {color:#b8c3cf;font-weight:850;}
 .stTabs [aria-selected="true"] {color:#31e84f!important;border-bottom:3px solid #31e84f;}
 @media (max-width: 1100px) {.kpi-strip {grid-template-columns: repeat(2, minmax(0, 1fr));}}
+
+.conf-badge {
+    display:inline-block;
+    padding:8px 14px;
+    border-radius:999px;
+    font-weight:950;
+    letter-spacing:.02em;
+    margin:4px 6px 4px 0;
+}
+.conf-high {background:#00331b;border:1px solid #00ff87;color:#b8ffd9;}
+.conf-med {background:#332400;border:1px solid #ffc547;color:#ffe6aa;}
+.conf-low {background:#360000;border:1px solid #ff5f5f;color:#ffd0d0;}
+.comp-box {
+    background:rgba(255,255,255,.035);
+    border:1px solid rgba(255,255,255,.10);
+    border-radius:16px;
+    padding:12px;
+    margin:8px 0;
+}
+.comp-row {
+    display:flex;
+    justify-content:space-between;
+    border-bottom:1px solid rgba(255,255,255,.06);
+    padding:5px 0;
+    font-size:13px;
+}
+.comp-pos {color:#31e84f;font-weight:900;}
+.comp-neg {color:#ff5f5f;font-weight:900;}
+.comp-neu {color:#d8d8d8;font-weight:800;}
+.bf-pill {
+    display:inline-block;
+    padding:7px 12px;
+    border-radius:999px;
+    border:1px solid rgba(255,255,255,.14);
+    background:rgba(255,255,255,.045);
+    font-weight:900;
+    margin:3px 5px 3px 0;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -1732,6 +1771,167 @@ def stronger_over_gate(side, prob, edge, source_label, game_script_risk, market_
     if market_source_count is not None and safe_int(market_source_count, 0) <= 1:
         notes.append("market confirmation rule: only one market source")
     return "; ".join(notes) if notes else None
+
+
+# =========================
+# v11.5 UI CLARITY HELPERS
+# =========================
+def confidence_badge_class(score):
+    s = safe_float(score, 0) or 0
+    if s >= 90:
+        return "conf-high", "HIGH CONFIDENCE"
+    if s >= 82:
+        return "conf-med", "WATCH / VERIFY"
+    return "conf-low", "LOW / PASS"
+
+def risk_badge_class(label):
+    lab = str(label or "UNKNOWN").upper()
+    if lab in ["LOW", "FRESH", "CONFIRMED", "TRUE LINEUP"]:
+        return "conf-high"
+    if lab in ["MILD", "NEUTRAL", "CACHED", "UNKNOWN"]:
+        return "conf-med"
+    return "conf-low"
+
+def projection_component_breakdown(p):
+    """Human-readable projection component breakdown for UI only."""
+    rows = []
+    try:
+        rows.append(("Final Projection", safe_float(p.get("projection")), "Final adjusted K projection"))
+        rows.append(("Line", safe_float(p.get("line")), "Live prop line"))
+        rows.append(("Edge", safe_float(p.get("edge")), "Projection minus line"))
+        rows.append(("Expected BF", safe_float(p.get("expected_bf")), "Expected batters faced after leash/risk"))
+        rows.append(("PPB", safe_float(p.get("ppb")), "Pitches per batter"))
+        rows.append(("Pitcher K%", safe_float(p.get("pitcher_k")), "Pitcher K skill input"))
+        rows.append(("Opponent K%", safe_float(p.get("lineup_k")), "Lineup/team K input"))
+        rows.append(("Learning Scale", safe_float(p.get("learning_scale")), "Pitcher learning adjustment"))
+        rows.append(("Statcast Factor", safe_float(p.get("statcast_factor")), "CSW/whiff adjustment"))
+        rows.append(("Pitch-Type Factor", safe_float(p.get("pitch_type_factor")), "Pitch mix vs hitter profile"))
+        rows.append(("Weather Factor", safe_float(p.get("weather_factor")), "Weather adjustment"))
+        rows.append(("Umpire Factor", safe_float(p.get("umpire_factor")), "Umpire zone adjustment"))
+        rows.append(("Bullpen Factor", safe_float(p.get("bullpen_factor")), "Starter leash from bullpen usage"))
+        gs = p.get("game_script_risk") or {}
+        rows.append(("Game Script Factor", safe_float(gs.get("factor")), f"Run-damage risk: {gs.get('label','UNKNOWN')}"))
+    except Exception:
+        pass
+    return rows
+
+def render_confidence_badges(p):
+    score = safe_float(p.get("data_score"), 0) or 0
+    cls, label = confidence_badge_class(score)
+    source = p.get("projection_source", p.get("source_label", ""))
+    lineup_status = p.get("lineup_status", "")
+    gs = (p.get("game_script_risk") or {}).get("label", p.get("game_script_label", "UNKNOWN"))
+    bullpen = p.get("bullpen_label", "UNKNOWN")
+    html = f"""
+    <div>
+        <span class="conf-badge {cls}">{label} · {int(score)}/100</span>
+        <span class="conf-badge {risk_badge_class(source)}">{source or 'SOURCE UNKNOWN'}</span>
+        <span class="conf-badge {risk_badge_class(lineup_status)}">LINEUP {lineup_status or 'UNKNOWN'}</span>
+        <span class="conf-badge {risk_badge_class(gs)}">GAME SCRIPT {gs}</span>
+        <span class="conf-badge {risk_badge_class(bullpen)}">BULLPEN {bullpen}</span>
+    </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
+
+def render_bf_visual(p):
+    bf = safe_float(p.get("expected_bf"), 0) or 0
+    ppb = safe_float(p.get("ppb"), 0) or 0
+    recent_ip = safe_float(p.get("recent_ip"), 0) or 0
+    leash = p.get("leash_risk", "UNKNOWN")
+    pct = clamp((bf - 12) / (31 - 12), 0, 1) * 100
+    color = "progress-green" if bf >= 24 else "progress-orange" if bf >= 20 else "progress-red"
+    st.markdown(f"""
+    <div class="comp-box">
+      <div style="font-weight:950;margin-bottom:8px;">Expected Batters Faced / Leash</div>
+      <span class="bf-pill">BF {bf:.1f}</span>
+      <span class="bf-pill">PPB {ppb:.2f}</span>
+      <span class="bf-pill">Recent IP {recent_ip:.1f}</span>
+      <span class="bf-pill">Leash {leash}</span>
+      <div class="progress-wrap" style="margin-top:10px;"><div class="{color}" style="width:{pct:.0f}%"></div></div>
+    </div>
+    """, unsafe_allow_html=True)
+
+def render_projection_breakdown(p):
+    rows = projection_component_breakdown(p)
+    if not rows:
+        return
+    html = '<div class="comp-box"><div style="font-weight:950;margin-bottom:8px;">Projection Component Breakdown</div>'
+    for name, val, note in rows:
+        if val is None:
+            vtxt = "—"
+            cls = "comp-neu"
+        else:
+            if "Factor" in name or "Scale" in name:
+                vtxt = f"{val:.3f}"
+                cls = "comp-pos" if val > 1.005 else "comp-neg" if val < 0.995 else "comp-neu"
+            elif "%" in name:
+                vtxt = f"{val:.3f}" if val <= 1 else f"{val:.1f}"
+                cls = "comp-neu"
+            else:
+                vtxt = f"{val:.2f}"
+                cls = "comp-pos" if name == "Edge" and val > 0 else "comp-neg" if name == "Edge" and val < 0 else "comp-neu"
+        html += f'<div class="comp-row"><span>{name}<br><span class="small-muted">{note}</span></span><span class="{cls}">{vtxt}</span></div>'
+    html += "</div>"
+    st.markdown(html, unsafe_allow_html=True)
+
+def style_matchup_dataframe(df):
+    """Color-code matchup tables without changing data."""
+    try:
+        def color_k(v):
+            x = safe_float(str(v).replace("%",""))
+            if x is None:
+                return ""
+            if x >= 30:
+                return "color:#31e84f;font-weight:900;"
+            if x <= 15:
+                return "color:#ff5f5f;font-weight:900;"
+            return ""
+
+        def color_contact(v):
+            x = safe_float(str(v).replace("%",""))
+            if x is None:
+                return ""
+            if x >= 78:
+                return "color:#ff5f5f;font-weight:900;"
+            if x <= 64:
+                return "color:#31e84f;font-weight:900;"
+            return ""
+
+        def color_slg(v):
+            x = safe_float(v)
+            if x is None:
+                return ""
+            if x >= 0.520:
+                return "color:#ff5f5f;font-weight:900;"
+            if x <= 0.300:
+                return "color:#31e84f;font-weight:900;"
+            return ""
+
+        sty = df.style
+        for c in df.columns:
+            if "K%" in c or "Whiff%" in c:
+                sty = sty.map(color_k, subset=[c])
+            if "Contact%" in c:
+                sty = sty.map(color_contact, subset=[c])
+            if "SLG" in c:
+                sty = sty.map(color_slg, subset=[c])
+        return sty
+    except Exception:
+        return df
+
+def render_clean_batter_matchup_table(rows):
+    if not rows:
+        st.info("No per-batter pitch-type rows loaded yet.")
+        return
+    df = pd.DataFrame(rows)
+    preferred = [
+        "Order", "Batter", "Pitch Type", "Pitcher Usage %",
+        "Per-Batter K%", "Per-Batter Whiff%", "Per-Batter Contact%",
+        "Per-Batter SLG vs Pitch", "Swings", "Pitches Seen", "AB Events"
+    ]
+    cols = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
+    df = df[cols]
+    st.dataframe(style_matchup_dataframe(df), use_container_width=True, hide_index=True)
 
 # =========================
 # STATCAST
@@ -4244,7 +4444,7 @@ with tab4:
             st.info("No pitch-type rows loaded yet.")
         st.subheader("Per-Batter Pitch-Type Profile")
         if batter_pitch_rows:
-            st.dataframe(pd.DataFrame(batter_pitch_rows), use_container_width=True, hide_index=True)
+            render_clean_batter_matchup_table(batter_pitch_rows)
         else:
             st.info("No per-batter pitch-type rows loaded yet.")
         st.subheader("Lineup Batter K Inputs")
