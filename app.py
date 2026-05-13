@@ -19,7 +19,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.5 UI CLARITY + MATCHUP BREAKDOWN"
+APP_VERSION = "v11.6 REPEAT MATCHUP FAMILIARITY + UI CLARITY"
 
 try:
     import pytz
@@ -115,6 +115,18 @@ HIGH_RUN_DAMAGE_WHIP = 1.35
 HIGH_RUN_DAMAGE_RECENT_ER = 4.0
 HIGH_OPP_CONTACT_RATE = 0.78
 HIGH_OPP_SLG_VS_PITCH = 0.520
+
+# =========================
+# v11.6 REPEAT MATCHUP FAMILIARITY SETTINGS
+# =========================
+REPEAT_MATCHUP_LOOKBACK_DAYS = 21
+REPEAT_MATCHUP_FACTOR_MIN = 0.965
+REPEAT_MATCHUP_FACTOR_MAX = 1.000
+REPEAT_MATCHUP_SAME_7D_FACTOR = 0.970
+REPEAT_MATCHUP_SAME_14D_FACTOR = 0.982
+REPEAT_MATCHUP_SAME_21D_FACTOR = 0.990
+REPEAT_MATCHUP_MULTI_RECENT_FACTOR = 0.965
+
 
 LEARNING_MIN_PRIOR_STARTS = 5
 LEARNING_RATE = 0.04
@@ -243,45 +255,6 @@ h1,h2,h3 {color:#fff;}
 .stTabs [data-baseweb="tab"] {color:#b8c3cf;font-weight:850;}
 .stTabs [aria-selected="true"] {color:#31e84f!important;border-bottom:3px solid #31e84f;}
 @media (max-width: 1100px) {.kpi-strip {grid-template-columns: repeat(2, minmax(0, 1fr));}}
-
-.conf-badge {
-    display:inline-block;
-    padding:8px 14px;
-    border-radius:999px;
-    font-weight:950;
-    letter-spacing:.02em;
-    margin:4px 6px 4px 0;
-}
-.conf-high {background:#00331b;border:1px solid #00ff87;color:#b8ffd9;}
-.conf-med {background:#332400;border:1px solid #ffc547;color:#ffe6aa;}
-.conf-low {background:#360000;border:1px solid #ff5f5f;color:#ffd0d0;}
-.comp-box {
-    background:rgba(255,255,255,.035);
-    border:1px solid rgba(255,255,255,.10);
-    border-radius:16px;
-    padding:12px;
-    margin:8px 0;
-}
-.comp-row {
-    display:flex;
-    justify-content:space-between;
-    border-bottom:1px solid rgba(255,255,255,.06);
-    padding:5px 0;
-    font-size:13px;
-}
-.comp-pos {color:#31e84f;font-weight:900;}
-.comp-neg {color:#ff5f5f;font-weight:900;}
-.comp-neu {color:#d8d8d8;font-weight:800;}
-.bf-pill {
-    display:inline-block;
-    padding:7px 12px;
-    border-radius:999px;
-    border:1px solid rgba(255,255,255,.14);
-    background:rgba(255,255,255,.045);
-    font-weight:900;
-    margin:3px 5px 3px 0;
-}
-
 </style>
 """, unsafe_allow_html=True)
 
@@ -1774,164 +1747,110 @@ def stronger_over_gate(side, prob, edge, source_label, game_script_risk, market_
 
 
 # =========================
-# v11.5 UI CLARITY HELPERS
+# v11.6 REPEAT MATCHUP / FAMILIARITY LAYER
 # =========================
-def confidence_badge_class(score):
-    s = safe_float(score, 0) or 0
-    if s >= 90:
-        return "conf-high", "HIGH CONFIDENCE"
-    if s >= 82:
-        return "conf-med", "WATCH / VERIFY"
-    return "conf-low", "LOW / PASS"
+@st.cache_data(ttl=900, show_spinner=False)
+def pitcher_recent_opponent_familiarity(pitcher_id, opponent_team_name=None, opponent_abbrev=None, lookback_days=21):
+    """Small repeat-opponent familiarity factor.
 
-def risk_badge_class(label):
-    lab = str(label or "UNKNOWN").upper()
-    if lab in ["LOW", "FRESH", "CONFIRMED", "TRUE LINEUP"]:
-        return "conf-high"
-    if lab in ["MILD", "NEUTRAL", "CACHED", "UNKNOWN"]:
-        return "conf-med"
-    return "conf-low"
-
-def projection_component_breakdown(p):
-    """Human-readable projection component breakdown for UI only."""
-    rows = []
-    try:
-        rows.append(("Final Projection", safe_float(p.get("projection")), "Final adjusted K projection"))
-        rows.append(("Line", safe_float(p.get("line")), "Live prop line"))
-        rows.append(("Edge", safe_float(p.get("edge")), "Projection minus line"))
-        rows.append(("Expected BF", safe_float(p.get("expected_bf")), "Expected batters faced after leash/risk"))
-        rows.append(("PPB", safe_float(p.get("ppb")), "Pitches per batter"))
-        rows.append(("Pitcher K%", safe_float(p.get("pitcher_k")), "Pitcher K skill input"))
-        rows.append(("Opponent K%", safe_float(p.get("lineup_k")), "Lineup/team K input"))
-        rows.append(("Learning Scale", safe_float(p.get("learning_scale")), "Pitcher learning adjustment"))
-        rows.append(("Statcast Factor", safe_float(p.get("statcast_factor")), "CSW/whiff adjustment"))
-        rows.append(("Pitch-Type Factor", safe_float(p.get("pitch_type_factor")), "Pitch mix vs hitter profile"))
-        rows.append(("Weather Factor", safe_float(p.get("weather_factor")), "Weather adjustment"))
-        rows.append(("Umpire Factor", safe_float(p.get("umpire_factor")), "Umpire zone adjustment"))
-        rows.append(("Bullpen Factor", safe_float(p.get("bullpen_factor")), "Starter leash from bullpen usage"))
-        gs = p.get("game_script_risk") or {}
-        rows.append(("Game Script Factor", safe_float(gs.get("factor")), f"Run-damage risk: {gs.get('label','UNKNOWN')}"))
-    except Exception:
-        pass
-    return rows
-
-def render_confidence_badges(p):
-    score = safe_float(p.get("data_score"), 0) or 0
-    cls, label = confidence_badge_class(score)
-    source = p.get("projection_source", p.get("source_label", ""))
-    lineup_status = p.get("lineup_status", "")
-    gs = (p.get("game_script_risk") or {}).get("label", p.get("game_script_label", "UNKNOWN"))
-    bullpen = p.get("bullpen_label", "UNKNOWN")
-    html = f"""
-    <div>
-        <span class="conf-badge {cls}">{label} · {int(score)}/100</span>
-        <span class="conf-badge {risk_badge_class(source)}">{source or 'SOURCE UNKNOWN'}</span>
-        <span class="conf-badge {risk_badge_class(lineup_status)}">LINEUP {lineup_status or 'UNKNOWN'}</span>
-        <span class="conf-badge {risk_badge_class(gs)}">GAME SCRIPT {gs}</span>
-        <span class="conf-badge {risk_badge_class(bullpen)}">BULLPEN {bullpen}</span>
-    </div>
+    If a pitcher faced this same opponent recently, hitters may have a small timing/recognition edge.
+    This is intentionally capped and only cuts Ks slightly. Missing data stays neutral.
     """
-    st.markdown(html, unsafe_allow_html=True)
+    result = {
+        "available": False,
+        "factor": 1.0,
+        "recent_matchups": 0,
+        "last_days_ago": None,
+        "label": "NEUTRAL",
+        "note": "No recent same-opponent matchup found"
+    }
+    if not pitcher_id:
+        return result
 
-def render_bf_visual(p):
-    bf = safe_float(p.get("expected_bf"), 0) or 0
-    ppb = safe_float(p.get("ppb"), 0) or 0
-    recent_ip = safe_float(p.get("recent_ip"), 0) or 0
-    leash = p.get("leash_risk", "UNKNOWN")
-    pct = clamp((bf - 12) / (31 - 12), 0, 1) * 100
-    color = "progress-green" if bf >= 24 else "progress-orange" if bf >= 20 else "progress-red"
-    st.markdown(f"""
-    <div class="comp-box">
-      <div style="font-weight:950;margin-bottom:8px;">Expected Batters Faced / Leash</div>
-      <span class="bf-pill">BF {bf:.1f}</span>
-      <span class="bf-pill">PPB {ppb:.2f}</span>
-      <span class="bf-pill">Recent IP {recent_ip:.1f}</span>
-      <span class="bf-pill">Leash {leash}</span>
-      <div class="progress-wrap" style="margin-top:10px;"><div class="{color}" style="width:{pct:.0f}%"></div></div>
-    </div>
-    """, unsafe_allow_html=True)
+    data = safe_get_json(
+        f"{MLB_BASE}/people/{pitcher_id}/stats",
+        params={"stats": "gameLog", "group": "pitching"},
+        timeout=12,
+    )
+    if not isinstance(data, dict):
+        result["note"] = "Pitcher game log unavailable for repeat-matchup check"
+        return result
 
-def render_projection_breakdown(p):
-    rows = projection_component_breakdown(p)
-    if not rows:
-        return
-    html = '<div class="comp-box"><div style="font-weight:950;margin-bottom:8px;">Projection Component Breakdown</div>'
-    for name, val, note in rows:
-        if val is None:
-            vtxt = "—"
-            cls = "comp-neu"
-        else:
-            if "Factor" in name or "Scale" in name:
-                vtxt = f"{val:.3f}"
-                cls = "comp-pos" if val > 1.005 else "comp-neg" if val < 0.995 else "comp-neu"
-            elif "%" in name:
-                vtxt = f"{val:.3f}" if val <= 1 else f"{val:.1f}"
-                cls = "comp-neu"
-            else:
-                vtxt = f"{val:.2f}"
-                cls = "comp-pos" if name == "Edge" and val > 0 else "comp-neg" if name == "Edge" and val < 0 else "comp-neu"
-        html += f'<div class="comp-row"><span>{name}<br><span class="small-muted">{note}</span></span><span class="{cls}">{vtxt}</span></div>'
-    html += "</div>"
-    st.markdown(html, unsafe_allow_html=True)
-
-def style_matchup_dataframe(df):
-    """Color-code matchup tables without changing data."""
     try:
-        def color_k(v):
-            x = safe_float(str(v).replace("%",""))
-            if x is None:
-                return ""
-            if x >= 30:
-                return "color:#31e84f;font-weight:900;"
-            if x <= 15:
-                return "color:#ff5f5f;font-weight:900;"
-            return ""
-
-        def color_contact(v):
-            x = safe_float(str(v).replace("%",""))
-            if x is None:
-                return ""
-            if x >= 78:
-                return "color:#ff5f5f;font-weight:900;"
-            if x <= 64:
-                return "color:#31e84f;font-weight:900;"
-            return ""
-
-        def color_slg(v):
-            x = safe_float(v)
-            if x is None:
-                return ""
-            if x >= 0.520:
-                return "color:#ff5f5f;font-weight:900;"
-            if x <= 0.300:
-                return "color:#31e84f;font-weight:900;"
-            return ""
-
-        sty = df.style
-        for c in df.columns:
-            if "K%" in c or "Whiff%" in c:
-                sty = sty.map(color_k, subset=[c])
-            if "Contact%" in c:
-                sty = sty.map(color_contact, subset=[c])
-            if "SLG" in c:
-                sty = sty.map(color_slg, subset=[c])
-        return sty
+        splits = data["stats"][0]["splits"]
     except Exception:
-        return df
+        result["note"] = "Pitcher game log missing splits for repeat-matchup check"
+        return result
 
-def render_clean_batter_matchup_table(rows):
-    if not rows:
-        st.info("No per-batter pitch-type rows loaded yet.")
-        return
-    df = pd.DataFrame(rows)
-    preferred = [
-        "Order", "Batter", "Pitch Type", "Pitcher Usage %",
-        "Per-Batter K%", "Per-Batter Whiff%", "Per-Batter Contact%",
-        "Per-Batter SLG vs Pitch", "Swings", "Pitches Seen", "AB Events"
-    ]
-    cols = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
-    df = df[cols]
-    st.dataframe(style_matchup_dataframe(df), use_container_width=True, hide_index=True)
+    opp_norms = set()
+    for v in [opponent_team_name, opponent_abbrev]:
+        if v:
+            opp_norms.add(normalize_name(v))
+    if not opp_norms:
+        result["note"] = "Opponent name unavailable for repeat-matchup check"
+        return result
+
+    today = california_now().date()
+    matches = []
+
+    for g in splits:
+        try:
+            gdate = datetime.strptime(g.get("date", ""), "%Y-%m-%d").date()
+        except Exception:
+            continue
+        days_ago = (today - gdate).days
+        if days_ago < 0 or days_ago > int(lookback_days):
+            continue
+
+        opp_obj = g.get("opponent", {}) or {}
+        opp_values = [
+            opp_obj.get("name"),
+            opp_obj.get("abbreviation"),
+            opp_obj.get("teamName"),
+            opp_obj.get("clubName"),
+        ]
+        opp_game_norms = {normalize_name(x) for x in opp_values if x}
+        if opp_norms & opp_game_norms:
+            matches.append(days_ago)
+
+    if not matches:
+        return result
+
+    matches = sorted(matches)
+    n = len(matches)
+    last_days = matches[0]
+    factor = 1.0
+    label = "LOW"
+
+    if n >= 2 and last_days <= 21:
+        factor = REPEAT_MATCHUP_MULTI_RECENT_FACTOR
+        label = "HIGH"
+    elif last_days <= 7:
+        factor = REPEAT_MATCHUP_SAME_7D_FACTOR
+        label = "HIGH"
+    elif last_days <= 14:
+        factor = REPEAT_MATCHUP_SAME_14D_FACTOR
+        label = "MILD"
+    elif last_days <= 21:
+        factor = REPEAT_MATCHUP_SAME_21D_FACTOR
+        label = "LOW"
+
+    factor = float(clamp(factor, REPEAT_MATCHUP_FACTOR_MIN, REPEAT_MATCHUP_FACTOR_MAX))
+    return {
+        "available": True,
+        "factor": factor,
+        "recent_matchups": int(n),
+        "last_days_ago": int(last_days),
+        "label": label,
+        "note": f"Repeat opponent familiarity {label}: faced opponent {n} time(s) in last {lookback_days} days; most recent {last_days} day(s) ago; K factor x{factor:.3f}"
+    }
+
+def apply_repeat_matchup_factor(k_rate, repeat_profile):
+    kr = safe_float(k_rate)
+    if kr is None:
+        return k_rate, "Repeat matchup factor skipped; missing K rate"
+    factor = safe_float((repeat_profile or {}).get("factor"), 1.0) or 1.0
+    return float(clamp(kr * factor, 0.08, 0.50)), (repeat_profile or {}).get("note", "Repeat matchup neutral")
 
 # =========================
 # STATCAST
@@ -3669,6 +3588,18 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         game_script_risk = {"label": "UNKNOWN", "factor": 1.0, "score": 0, "notes": f"Game-script risk skipped: {_gs_e}"}
         game_script_note = game_script_risk.get("notes")
 
+    # v11.6 repeat opponent familiarity
+    try:
+        repeat_matchup_profile = pitcher_recent_opponent_familiarity(
+            pid,
+            opponent_team_name=game.get("opponent", game.get("opp_team", "")) if isinstance(game, dict) else "",
+            opponent_abbrev=game.get("opponent", "") if isinstance(game, dict) else "",
+            lookback_days=REPEAT_MATCHUP_LOOKBACK_DAYS,
+        )
+    except Exception as _rep_e:
+        repeat_matchup_profile = {"available": False, "factor": 1.0, "label": "UNKNOWN", "note": f"Repeat matchup skipped: {_rep_e}"}
+    repeat_matchup_note = repeat_matchup_profile.get("note", "Repeat matchup neutral")
+
     calibration_profile = build_model_calibration_profile(load_json(RESULT_LOG, []))
     pitcher_k, calibration_note = apply_calibration_adjustment(pitcher_k, calibration_profile, enabled=use_calibration)
 
@@ -3870,6 +3801,8 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
             rr["Bullpen Fatigue Note"] = bullpen_note
             rr["Game Script Risk"] = game_script_risk.get("label", "UNKNOWN") if "game_script_risk" in locals() else "UNKNOWN"
             rr["Game Script Note"] = game_script_note if "game_script_note" in locals() else ""
+            rr["Repeat Matchup"] = repeat_matchup_profile.get("label", "NEUTRAL") if "repeat_matchup_profile" in locals() else "NEUTRAL"
+            rr["Repeat Matchup Note"] = repeat_matchup_note if "repeat_matchup_note" in locals() else (repeat_matchup_profile.get("note", "") if "repeat_matchup_profile" in locals() else "")
             rr["Run Damage Risk"] = pitcher_damage_profile.get("risk_level", "UNKNOWN") if "pitcher_damage_profile" in locals() else "UNKNOWN"
             rr["Opponent Damage Risk"] = opponent_damage_profile.get("risk_level", "UNKNOWN") if "opponent_damage_profile" in locals() else "UNKNOWN"
             rr["Pitch-Type Batter Detail Rows"] = len(batter_pitch_profile_rows) if "batter_pitch_profile_rows" in locals() else 0
@@ -3928,6 +3861,8 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "bullpen_note": bullpen_note,
         "game_script_risk": game_script_risk,
         "game_script_note": game_script_note,
+        "repeat_matchup_profile": repeat_matchup_profile,
+        "repeat_matchup_note": repeat_matchup_note if "repeat_matchup_note" in locals() else repeat_matchup_profile.get("note", ""),
         "pitcher_damage_profile": pitcher_damage_profile,
         "opponent_damage_profile": opponent_damage_profile,
         "bullpen_recent_games": bullpen_usage.get("games") if isinstance(bullpen_usage, dict) else None,
@@ -4209,7 +4144,7 @@ def render_pick_card(p):
       <div class="small-muted" style="margin-top:12px;">Risk Notes: {p.get('risk_notes')}</div>
       <div class="small-muted">Statcast: {p.get('statcast_note')} | Pitch Type: {p.get('pitch_type_note')} | Calibration: {p.get('calibration_note')}</div>
       <div class="small-muted">Projection Source: {p.get('projection_source')} | Lineup Status: {p.get('lineup_status')} | Lineup Note: {p.get('lineup_note')}</div>
-      <div class="small-muted">Bullpen Fatigue: {p.get('bullpen_status')} | factor {p.get('bullpen_bf_factor')} | {p.get('bullpen_recent_pitches')} pitches / {p.get('bullpen_recent_ip')} IP | {p.get('bullpen_note')}</div>
+      <div class="small-muted">Repeat Matchup: {p.get("repeat_matchup_note", "Neutral")}\nBullpen Fatigue: {p.get('bullpen_status')} | factor {p.get('bullpen_bf_factor')} | {p.get('bullpen_recent_pitches')} pitches / {p.get('bullpen_recent_ip')} IP | {p.get('bullpen_note')}</div>
       <div class="small-muted">Weather: {p.get('weather_note')} | Umpire: {p.get('umpire_note')}</div>
       <div class="small-muted">Advanced Sim: {p.get('bayesian_markov_note')} | XGBoost: {p.get('xgboost_note')}</div>
     </div>
@@ -4444,7 +4379,7 @@ with tab4:
             st.info("No pitch-type rows loaded yet.")
         st.subheader("Per-Batter Pitch-Type Profile")
         if batter_pitch_rows:
-            render_clean_batter_matchup_table(batter_pitch_rows)
+            st.dataframe(pd.DataFrame(batter_pitch_rows), use_container_width=True, hide_index=True)
         else:
             st.info("No per-batter pitch-type rows loaded yet.")
         st.subheader("Lineup Batter K Inputs")
