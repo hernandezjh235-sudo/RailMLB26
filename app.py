@@ -19,7 +19,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.3 PER-BATTER PITCH-TYPE CONTACT + SLG"
+APP_VERSION = "v11.4 RUN-DAMAGE + GAME-SCRIPT RISK CONTROL"
 
 try:
     import pytz
@@ -102,6 +102,20 @@ MIN_BETTABLE_PROB = 0.64
 MIN_BETTABLE_EV = 0.06
 MIN_CONFIRMED_LINEUP_SCORE = 90
 MAX_RECOMMENDED_KELLY = 0.02
+
+# =========================
+# v11.4 RUN-DAMAGE / GAME-SCRIPT RISK SETTINGS
+# =========================
+OVER_MIN_PROB_STRONG = 0.65
+OVER_MIN_EDGE_STRONG = 1.25
+RUN_DAMAGE_BF_CUT_MILD = 0.96
+RUN_DAMAGE_BF_CUT_HIGH = 0.91
+RUN_DAMAGE_BF_CUT_EXTREME = 0.86
+HIGH_RUN_DAMAGE_WHIP = 1.35
+HIGH_RUN_DAMAGE_RECENT_ER = 4.0
+HIGH_OPP_CONTACT_RATE = 0.78
+HIGH_OPP_SLG_VS_PITCH = 0.520
+
 LEARNING_MIN_PRIOR_STARTS = 5
 LEARNING_RATE = 0.04
 LEARNING_SCALE_MIN = 0.92
@@ -761,6 +775,10 @@ def get_recent_logs(pid, n=12):
             "Ks": so,
             "BF": bf,
             "Pitches": pitches,
+            "ER": safe_float(stat.get("earnedRuns")),
+            "H": safe_float(stat.get("hits")),
+            "R": safe_float(stat.get("runs")),
+            "BB": safe_float(stat.get("baseOnBalls")),
             "K%": None if not bf else round((so or 0) / bf * 100, 1)
         })
     return rows
@@ -1510,6 +1528,210 @@ def apply_context_guardrail_projection(
         "Opponent K Rank": opp_rank,
         "Opponent K Rank Label": opp_label,
     }
+
+
+# =========================
+# v11.4 RUN-DAMAGE / SHORT-OUTING RISK LAYER
+# =========================
+def pitcher_run_damage_profile(pitcher_id, recent_rows=None, statcast_profile=None):
+    profile = {
+        "available": False,
+        "whip": None,
+        "era": None,
+        "recent_er_avg": None,
+        "recent_hits_avg": None,
+        "recent_ip_avg": None,
+        "risk_score": 0,
+        "risk_level": "UNKNOWN",
+        "notes": []
+    }
+
+    try:
+        data = safe_get_json(
+            f"{MLB_BASE}/people/{pitcher_id}/stats",
+            params={"stats": "season", "group": "pitching"},
+            timeout=12,
+        )
+        split = get_first_stat_split(data)
+        stat = (split or {}).get("stat", {}) if split else {}
+        profile["whip"] = safe_float(stat.get("whip"))
+        profile["era"] = safe_float(stat.get("era"))
+        if profile["whip"] is not None:
+            profile["available"] = True
+            if profile["whip"] >= 1.45:
+                profile["risk_score"] += 3
+                profile["notes"].append(f"High WHIP {profile['whip']:.2f}")
+            elif profile["whip"] >= HIGH_RUN_DAMAGE_WHIP:
+                profile["risk_score"] += 2
+                profile["notes"].append(f"Elevated WHIP {profile['whip']:.2f}")
+        if profile["era"] is not None:
+            if profile["era"] >= 5.00:
+                profile["risk_score"] += 2
+                profile["notes"].append(f"High ERA {profile['era']:.2f}")
+            elif profile["era"] >= 4.25:
+                profile["risk_score"] += 1
+                profile["notes"].append(f"Elevated ERA {profile['era']:.2f}")
+    except Exception as e:
+        profile["notes"].append(f"Season run-damage unavailable: {e}")
+
+    try:
+        ers, hits, ips = [], [], []
+        for r in (recent_rows or [])[:5]:
+            er = safe_float(r.get("ER", r.get("Earned Runs")))
+            h = safe_float(r.get("H", r.get("Hits")))
+            ip = safe_float(r.get("IP_float"))
+            if er is not None:
+                ers.append(er)
+            if h is not None:
+                hits.append(h)
+            if ip is not None:
+                ips.append(ip)
+        if ers:
+            profile["recent_er_avg"] = float(np.mean(ers))
+            profile["available"] = True
+            if profile["recent_er_avg"] >= HIGH_RUN_DAMAGE_RECENT_ER:
+                profile["risk_score"] += 3
+                profile["notes"].append(f"High recent ER avg {profile['recent_er_avg']:.1f}")
+            elif profile["recent_er_avg"] >= 3.0:
+                profile["risk_score"] += 2
+                profile["notes"].append(f"Elevated recent ER avg {profile['recent_er_avg']:.1f}")
+        if hits:
+            profile["recent_hits_avg"] = float(np.mean(hits))
+            if profile["recent_hits_avg"] >= 6.0:
+                profile["risk_score"] += 2
+                profile["notes"].append(f"High recent hits avg {profile['recent_hits_avg']:.1f}")
+            elif profile["recent_hits_avg"] >= 5.0:
+                profile["risk_score"] += 1
+                profile["notes"].append(f"Elevated recent hits avg {profile['recent_hits_avg']:.1f}")
+        if ips:
+            profile["recent_ip_avg"] = float(np.mean(ips))
+            if profile["recent_ip_avg"] < 5.0:
+                profile["risk_score"] += 2
+                profile["notes"].append(f"Recent IP short {profile['recent_ip_avg']:.1f}")
+    except Exception as e:
+        profile["notes"].append(f"Recent run-damage unavailable: {e}")
+
+    score = int(profile.get("risk_score", 0) or 0)
+    if not profile["available"]:
+        profile["risk_level"] = "UNKNOWN"
+        if not profile["notes"]:
+            profile["notes"].append("Run-damage inputs unavailable")
+    elif score >= 7:
+        profile["risk_level"] = "EXTREME"
+    elif score >= 5:
+        profile["risk_level"] = "HIGH"
+    elif score >= 3:
+        profile["risk_level"] = "MILD"
+    else:
+        profile["risk_level"] = "LOW"
+    return profile
+
+def opponent_contact_damage_profile(batter_pitch_rows=None):
+    out = {
+        "available": False,
+        "avg_contact": None,
+        "avg_slg_vs_pitch": None,
+        "risk_score": 0,
+        "risk_level": "UNKNOWN",
+        "notes": []
+    }
+    contacts, slgs = [], []
+    for r in (batter_pitch_rows or []):
+        c = safe_float(r.get("Per-Batter Contact%"))
+        s = safe_float(r.get("Per-Batter SLG vs Pitch"))
+        if c is not None:
+            contacts.append(c / 100.0 if c > 1 else c)
+        if s is not None:
+            slgs.append(s)
+
+    if contacts:
+        out["available"] = True
+        out["avg_contact"] = float(np.mean(contacts))
+        if out["avg_contact"] >= 0.79:
+            out["risk_score"] += 3
+            out["notes"].append(f"High opponent contact vs pitch mix {out['avg_contact']:.1%}")
+        elif out["avg_contact"] >= 0.75:
+            out["risk_score"] += 2
+            out["notes"].append(f"Elevated opponent contact vs pitch mix {out['avg_contact']:.1%}")
+    if slgs:
+        out["available"] = True
+        out["avg_slg_vs_pitch"] = float(np.mean(slgs))
+        if out["avg_slg_vs_pitch"] >= 0.560:
+            out["risk_score"] += 3
+            out["notes"].append(f"High opponent SLG vs pitch mix {out['avg_slg_vs_pitch']:.3f}")
+        elif out["avg_slg_vs_pitch"] >= HIGH_OPP_SLG_VS_PITCH:
+            out["risk_score"] += 2
+            out["notes"].append(f"Elevated opponent SLG vs pitch mix {out['avg_slg_vs_pitch']:.3f}")
+
+    score = int(out.get("risk_score", 0) or 0)
+    if not out["available"]:
+        out["risk_level"] = "UNKNOWN"
+        out["notes"].append("Opponent contact/SLG profile unavailable")
+    elif score >= 5:
+        out["risk_level"] = "HIGH"
+    elif score >= 3:
+        out["risk_level"] = "MILD"
+    else:
+        out["risk_level"] = "LOW"
+    return out
+
+def combined_game_script_risk(pitcher_damage, opponent_damage, line=None, side=None):
+    p_score = safe_int((pitcher_damage or {}).get("risk_score"), 0) or 0
+    o_score = safe_int((opponent_damage or {}).get("risk_score"), 0) or 0
+    total = p_score + o_score
+    ln = safe_float(line)
+    side_text = str(side or "").upper()
+
+    notes = []
+    notes.extend((pitcher_damage or {}).get("notes", [])[:3])
+    notes.extend((opponent_damage or {}).get("notes", [])[:3])
+
+    if total >= 9 or (pitcher_damage or {}).get("risk_level") == "EXTREME":
+        label, factor = "EXTREME", RUN_DAMAGE_BF_CUT_EXTREME
+    elif total >= 6 or (pitcher_damage or {}).get("risk_level") == "HIGH" or (opponent_damage or {}).get("risk_level") == "HIGH":
+        label, factor = "HIGH", RUN_DAMAGE_BF_CUT_HIGH
+    elif total >= 3 or (pitcher_damage or {}).get("risk_level") == "MILD" or (opponent_damage or {}).get("risk_level") == "MILD":
+        label, factor = "MILD", RUN_DAMAGE_BF_CUT_MILD
+    else:
+        label, factor = "LOW", 1.0
+
+    if "OVER" in side_text and ln is not None and ln >= 5.5 and label in ["MILD", "HIGH", "EXTREME"]:
+        factor = min(factor, 0.94 if label == "MILD" else 0.88 if label == "HIGH" else 0.82)
+        notes.append("Over line needs 6+ Ks; early-hook risk amplified")
+
+    return {
+        "label": label,
+        "factor": float(clamp(factor, 0.82, 1.0)),
+        "score": int(total),
+        "notes": " | ".join(notes[:8]) if notes else "No major run-damage risk detected"
+    }
+
+def apply_game_script_bf_cut(expected_bf, game_script_risk):
+    bf = safe_float(expected_bf)
+    if bf is None:
+        return expected_bf
+    factor = safe_float((game_script_risk or {}).get("factor"), 1.0) or 1.0
+    return float(clamp(bf * factor, 12, 31))
+
+def stronger_over_gate(side, prob, edge, source_label, game_script_risk, market_source_count=None):
+    if "OVER" not in str(side or "").upper():
+        return None
+    notes = []
+    p = safe_float(prob)
+    e = safe_float(edge)
+    label = (game_script_risk or {}).get("label", "UNKNOWN")
+
+    if p is not None and p < OVER_MIN_PROB_STRONG:
+        notes.append(f"stronger over gate: probability below {int(OVER_MIN_PROB_STRONG*100)}%")
+    if e is not None and e < OVER_MIN_EDGE_STRONG:
+        notes.append(f"stronger over gate: edge below {OVER_MIN_EDGE_STRONG:.2f} K")
+    if source_label != "TRUE LINEUP":
+        notes.append("stronger over gate: lineup not true/confirmed")
+    if label in ["HIGH", "EXTREME"]:
+        notes.append(f"stronger over gate: game-script risk {label}")
+    if market_source_count is not None and safe_int(market_source_count, 0) <= 1:
+        notes.append("market confirmation rule: only one market source")
+    return "; ".join(notes) if notes else None
 
 # =========================
 # STATCAST
@@ -3234,6 +3456,19 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
 
     batter_pitch_profile_rows = matchup_profile.get("batter_rows", []) if isinstance(matchup_profile, dict) else []
 
+    # v11.4 run-damage / game-script risk
+    try:
+        pitcher_damage_profile = pitcher_run_damage_profile(pid, recent_rows=recent_rows, statcast_profile=statcast_profile)
+        opponent_damage_profile = opponent_contact_damage_profile(batter_pitch_profile_rows if "batter_pitch_profile_rows" in locals() else [])
+        game_script_risk = combined_game_script_risk(pitcher_damage_profile, opponent_damage_profile)
+        leash["expected_bf"] = apply_game_script_bf_cut(leash.get("expected_bf"), game_script_risk)
+        game_script_note = f"{game_script_risk.get('label')} | factor {game_script_risk.get('factor'):.2f} | {game_script_risk.get('notes')}"
+    except Exception as _gs_e:
+        pitcher_damage_profile = {"risk_level": "UNKNOWN", "risk_score": 0, "notes": [str(_gs_e)]}
+        opponent_damage_profile = {"risk_level": "UNKNOWN", "risk_score": 0, "notes": []}
+        game_script_risk = {"label": "UNKNOWN", "factor": 1.0, "score": 0, "notes": f"Game-script risk skipped: {_gs_e}"}
+        game_script_note = game_script_risk.get("notes")
+
     calibration_profile = build_model_calibration_profile(load_json(RESULT_LOG, []))
     pitcher_k, calibration_note = apply_calibration_adjustment(pitcher_k, calibration_profile, enabled=use_calibration)
 
@@ -3433,6 +3668,10 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
             rr["Bullpen IP"] = bullpen_usage.get("bullpen_ip") if isinstance(bullpen_usage, dict) else None
             rr["Bullpen Fatigue Factor"] = round(safe_float(bullpen_factor, 1.0), 3)
             rr["Bullpen Fatigue Note"] = bullpen_note
+            rr["Game Script Risk"] = game_script_risk.get("label", "UNKNOWN") if "game_script_risk" in locals() else "UNKNOWN"
+            rr["Game Script Note"] = game_script_note if "game_script_note" in locals() else ""
+            rr["Run Damage Risk"] = pitcher_damage_profile.get("risk_level", "UNKNOWN") if "pitcher_damage_profile" in locals() else "UNKNOWN"
+            rr["Opponent Damage Risk"] = opponent_damage_profile.get("risk_level", "UNKNOWN") if "opponent_damage_profile" in locals() else "UNKNOWN"
             rr["Pitch-Type Batter Detail Rows"] = len(batter_pitch_profile_rows) if "batter_pitch_profile_rows" in locals() else 0
             prop_rows.append(rr)
 
@@ -3487,6 +3726,10 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "bullpen_status": bullpen_usage.get("label") if isinstance(bullpen_usage, dict) else None,
         "bullpen_bf_factor": round(safe_float(bullpen_factor, 1.0), 3),
         "bullpen_note": bullpen_note,
+        "game_script_risk": game_script_risk,
+        "game_script_note": game_script_note,
+        "pitcher_damage_profile": pitcher_damage_profile,
+        "opponent_damage_profile": opponent_damage_profile,
         "bullpen_recent_games": bullpen_usage.get("games") if isinstance(bullpen_usage, dict) else None,
         "bullpen_recent_ip": bullpen_usage.get("bullpen_ip") if isinstance(bullpen_usage, dict) else None,
         "bullpen_recent_pitches": bullpen_usage.get("bullpen_pitches") if isinstance(bullpen_usage, dict) else None,
