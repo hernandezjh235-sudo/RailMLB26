@@ -19,7 +19,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v10.8 WEATHER + UMPIRE CAPS"
+APP_VERSION = "v11.1 REAL 2-3 DAY BULLPEN FATIGUE"
 
 try:
     import pytz
@@ -133,7 +133,7 @@ def get_secret(key, default=""):
     except Exception:
         return os.getenv(key, default)
 
-ODDS_API_KEY = get_secret("ODDS_API_KEY", "c9f5eadbe263f64c3fd17df20a4f1f3b")
+ODDS_API_KEY = get_secret("ODDS_API_KEY", "")
 SPORTSGAMEODDS_API_KEY = get_secret("SPORTSGAMEODDS_API_KEY", "")
 OPTICODDS_API_KEY = get_secret("OPTICODDS_API_KEY", "")
 
@@ -834,13 +834,18 @@ def build_leash_model(recent_rows):
         expected_bf -= 1.4
         leash_risk = "HIGH_RECENT_WORKLOAD"
 
+    pitch_trend_factor, pitch_trend_note = pitch_count_trend_bf_factor(recent_rows)
+    expected_bf = float(clamp(expected_bf * pitch_trend_factor, 14, 31))
+
     return {
-        "expected_bf": float(clamp(expected_bf, 14, 31)),
+        "expected_bf": expected_bf,
         "ppb": float(ppb),
         "recent_ip": float(avg_ip_l3 or 5.5),
         "last_10_ks": [safe_int(r.get("Ks"), 0) or 0 for r in recent_rows[:10]],
         "leash_risk": leash_risk,
-        "source": source
+        "pitch_count_trend_factor": round(float(pitch_trend_factor), 3),
+        "pitch_count_trend_note": pitch_trend_note,
+        "source": f"{source}; {pitch_trend_note}"
     }
 
 def blend_pitcher_k_rate(profile_k, recent_rows, pitcher_id):
@@ -867,6 +872,74 @@ def calculate_log5_k_rate(pitcher_k, lineup_k, league_avg_k=LEAGUE_AVG_K):
     num = (pitcher_k * lineup_k) / league_avg_k
     den = num + ((1 - pitcher_k) * (1 - lineup_k)) / (1 - league_avg_k)
     return float(num / den)
+
+# =========================
+# v10.9 TRUE EDGE MERGE HELPERS
+# =========================
+def elite_pitcher_boost_factor(k_rate):
+    """Small K-skill boost for elite strikeout arms.
+
+    Kept conservative because Statcast, recent form, and Log5 already capture a lot
+    of pitcher skill. This should never turn a weak edge into an automatic play.
+    """
+    k_rate = safe_float(k_rate, LEAGUE_AVG_K) or LEAGUE_AVG_K
+    if k_rate >= 0.30:
+        return 1.035, "Elite pitcher K boost x1.035"
+    if k_rate >= 0.27:
+        return 1.025, "High-K pitcher boost x1.025"
+    if k_rate >= 0.24:
+        return 1.015, "Above-average pitcher K boost x1.015"
+    return 1.000, "No elite pitcher boost"
+
+def opponent_k_context_factor(lineup_k):
+    """Extra lineup strikeout-context nudge after Log5.
+
+    The main opponent-K signal is still the posted-lineup/hitter blend. This small
+    factor only recognizes extreme high-K or low-K lineups without double-counting.
+    """
+    lk = safe_float(lineup_k, LEAGUE_AVG_K) or LEAGUE_AVG_K
+    diff = lk - LEAGUE_AVG_K
+    if diff >= 0.040:
+        return 1.045, "Extreme high-K opponent context x1.045"
+    if diff >= 0.030:
+        return 1.035, "High-K opponent context x1.035"
+    if diff >= 0.020:
+        return 1.020, "Above-average opponent K context x1.020"
+    if diff <= -0.035:
+        return 0.955, "Extreme contact opponent context x0.955"
+    if diff <= -0.025:
+        return 0.970, "Low-K opponent context x0.970"
+    return 1.000, "Neutral opponent K context"
+
+def pitch_count_trend_bf_factor(recent_rows):
+    """Recent pitch-count trend factor for starter BF/leash.
+
+    Uses only real recent game-log pitch counts. Missing data remains neutral.
+    """
+    vals = []
+    for r in (recent_rows or [])[:3]:
+        p = safe_float(r.get("Pitches"))
+        if p is not None and p > 0:
+            vals.append(p)
+    if not vals:
+        return 1.0, "Pitch-count trend unavailable; neutral"
+    avg = float(np.mean(vals))
+    if avg >= 100:
+        return 1.040, f"Recent pitch-count leash boost x1.040 (L3 avg {avg:.0f})"
+    if avg >= 92:
+        return 1.020, f"Recent pitch-count leash boost x1.020 (L3 avg {avg:.0f})"
+    if avg <= 82:
+        return 0.940, f"Recent low pitch-count leash cut x0.940 (L3 avg {avg:.0f})"
+    return 1.000, f"Neutral pitch-count trend (L3 avg {avg:.0f})"
+
+def tto_decay_factor(pa_index):
+    """Third-time-through-order decay for PA-by-PA K probabilities."""
+    i = int(pa_index)
+    if i < 18:
+        return 1.000
+    if i < 27:
+        return 0.925
+    return 0.860
 
 # =========================
 # LINEUP / BATTER K
@@ -1067,6 +1140,190 @@ def team_k_vs_hand(team_id, hand):
     except Exception:
         pass
     return LEAGUE_AVG_K, "League average fallback"
+
+
+def projection_source_label(lineup_msg, lineup_locked, lineup_rows):
+    """Clear projection-source label for every board/prop row.
+
+    TRUE LINEUP = current posted 1-9 lineup from MLB boxscore.
+    CACHED LINEUP = previously locked lineup used because current boxscore/feed is thin.
+    TEAM FALLBACK = no usable lineup, using team K-rate fallback only.
+    """
+    msg = str(lineup_msg or "").lower()
+    row_count = len(lineup_rows or [])
+    if "cached" in msg:
+        return "CACHED LINEUP"
+    if lineup_locked and row_count >= 8 and ("posted lineup" in msg or "posted" in msg):
+        return "TRUE LINEUP"
+    if lineup_locked and row_count >= 8:
+        return "TRUE LINEUP"
+    return "TEAM FALLBACK"
+
+def confirmed_lineup_status(source_label, lineup_rows):
+    if source_label == "TRUE LINEUP":
+        return "CONFIRMED"
+    if source_label == "CACHED LINEUP":
+        return "CACHED"
+    return "FALLBACK"
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_recent_team_bullpen_usage(team_id, as_of_date, lookback_days=3):
+    """Real 2-3 day bullpen workload from MLB schedule + boxscores.
+
+    This reads actual team pitcher rows from completed MLB boxscores, excludes the
+    starting pitcher, and sums reliever innings + pitch counts. Missing or
+    incomplete data returns neutral so projections are not forced by guesses.
+    """
+    empty = {
+        "available": False,
+        "games": 0,
+        "bullpen_ip": 0.0,
+        "bullpen_pitches": 0.0,
+        "appearances": 0,
+        "back_to_back_relief_appearances": 0,
+        "label": "UNKNOWN",
+        "message": "Recent bullpen usage unavailable",
+    }
+    if not team_id:
+        return empty
+
+    try:
+        end_dt = datetime.strptime(str(as_of_date)[:10], "%Y-%m-%d") - timedelta(days=1)
+    except Exception:
+        end_dt = california_now().replace(tzinfo=None) - timedelta(days=1)
+    start_dt = end_dt - timedelta(days=max(1, int(lookback_days)) - 1)
+
+    sched = safe_get_json(
+        f"{MLB_BASE}/schedule",
+        params={
+            "sportId": 1,
+            "teamId": int(team_id),
+            "startDate": start_dt.strftime("%Y-%m-%d"),
+            "endDate": end_dt.strftime("%Y-%m-%d"),
+        },
+        timeout=12,
+    ) or {}
+
+    games = []
+    for d in sched.get("dates", []):
+        for g in d.get("games", []):
+            status = (g.get("status") or {}).get("abstractGameState", "")
+            if status == "Final" and g.get("gamePk"):
+                games.append(g)
+
+    total_bullpen_ip = 0.0
+    total_bullpen_pitches = 0.0
+    total_appearances = 0
+    used_games = 0
+    reliever_dates = {}
+
+    for g in games[-int(lookback_days):]:
+        game_pk = g.get("gamePk")
+        game_date = str(g.get("gameDate") or "")[:10] or str(g.get("officialDate") or "")[:10]
+        box = safe_get_json(f"{MLB_BASE}/game/{game_pk}/boxscore", timeout=12)
+        if not isinstance(box, dict):
+            continue
+
+        side = None
+        for sname in ["away", "home"]:
+            if str((box.get("teams", {}).get(sname, {}).get("team", {}) or {}).get("id")) == str(team_id):
+                side = sname
+                break
+        if not side:
+            continue
+
+        team_box = box.get("teams", {}).get(side, {})
+        pitcher_ids = team_box.get("pitchers") or []
+        players = team_box.get("players") or {}
+        if not pitcher_ids:
+            continue
+
+        starter_id = str(pitcher_ids[0])
+        game_had_reliever = False
+
+        for pid in pitcher_ids:
+            pid_str = str(pid)
+            if pid_str == starter_id:
+                continue
+            pdata = players.get(f"ID{pid_str}", {}) or {}
+            pitching = ((pdata.get("stats") or {}).get("pitching") or {})
+            ip = baseball_ip_to_float(pitching.get("inningsPitched"))
+            pitches = safe_float(
+                pitching.get("numberOfPitches", pitching.get("pitchesThrown", pitching.get("pitchCount"))),
+                0,
+            ) or 0
+
+            # Count only real reliever workload rows. If IP is 0 but pitches exist,
+            # keep the pitches because a rough/short outing still fatigues the pen.
+            if ip is None and pitches <= 0:
+                continue
+
+            total_bullpen_ip += float(ip or 0.0)
+            total_bullpen_pitches += float(pitches or 0.0)
+            total_appearances += 1
+            game_had_reliever = True
+            reliever_dates.setdefault(pid_str, set()).add(game_date)
+
+        if game_had_reliever:
+            used_games += 1
+
+    if used_games <= 0:
+        return empty
+
+    back_to_back = sum(1 for dates in reliever_dates.values() if len(dates) >= 2)
+    label = "NEUTRAL"
+    if total_bullpen_pitches >= 240 or total_bullpen_ip >= 18 or back_to_back >= 4:
+        label = "TIRED"
+    elif total_bullpen_pitches <= 120 and total_bullpen_ip <= 9 and back_to_back <= 1:
+        label = "FRESH"
+
+    return {
+        "available": True,
+        "games": int(used_games),
+        "bullpen_ip": round(total_bullpen_ip, 2),
+        "bullpen_pitches": round(total_bullpen_pitches, 1),
+        "appearances": int(total_appearances),
+        "back_to_back_relief_appearances": int(back_to_back),
+        "label": label,
+        "message": (
+            f"Bullpen {label}: {total_bullpen_pitches:.0f} pitches, "
+            f"{total_bullpen_ip:.1f} IP, {total_appearances} relief apps, "
+            f"{back_to_back} B2B relievers over {used_games} game(s)"
+        ),
+    }
+
+
+def bullpen_fatigue_bf_factor(team_id, as_of_date):
+    """Small, capped starter BF adjustment from real recent bullpen fatigue.
+
+    Tired bullpen = slightly longer starter leash. Fresh bullpen = tiny leash cut.
+    This cannot override pitcher skill, lineup quality, Statcast, or real prop lines.
+    """
+    usage = get_recent_team_bullpen_usage(team_id, as_of_date, lookback_days=3)
+    if not usage.get("available"):
+        return 1.0, usage.get("message", "Recent bullpen usage unavailable"), usage
+
+    label = usage.get("label", "NEUTRAL")
+    pitches = safe_float(usage.get("bullpen_pitches"), 0) or 0
+    ip = safe_float(usage.get("bullpen_ip"), 0) or 0
+    b2b = safe_float(usage.get("back_to_back_relief_appearances"), 0) or 0
+
+    factor = 1.0
+    if label == "TIRED":
+        factor = 1.04
+        note = "Tired bullpen; capped starter-leash boost"
+    elif label == "FRESH":
+        factor = 0.97
+        note = "Fresh bullpen; capped starter-leash haircut"
+    else:
+        # Small extra nudge for near-heavy usage without calling it tired.
+        if pitches >= 190 or ip >= 14 or b2b >= 3:
+            factor = 1.02
+            note = "Moderate bullpen workload; small starter-leash boost"
+        else:
+            note = "Neutral recent bullpen workload"
+
+    return float(clamp(factor, 0.96, 1.04)), f"{note} ({usage.get('message')})", usage
 
 # =========================
 # STATCAST
@@ -1532,9 +1789,9 @@ def build_pa_sequence(lineup_rows, bf, fallback_k):
 
 def simulate_matchup(pitcher_k, batter_rates, park=1.0, ump=1.0, sims=12000):
     rates = []
-    for br in batter_rates:
+    for idx, br in enumerate(batter_rates):
         k = calculate_log5_k_rate(pitcher_k, br)
-        k *= park * ump
+        k *= park * ump * tto_decay_factor(idx)
         rates.append(clamp(k, 0.03, 0.60))
     out = np.random.binomial(1, np.array(rates), size=(sims, len(rates))).sum(axis=1)
     return out, rates
@@ -1570,9 +1827,9 @@ def simulate_bayesian_markov_matchup(pitcher_k, batter_rates, expected_bf, park=
     - PA-by-PA Markov flow instead of fixed 27 outs
     """
     base_rates = []
-    for br in batter_rates:
+    for idx, br in enumerate(batter_rates):
         k = calculate_log5_k_rate(pitcher_k, br)
-        base_rates.append(clamp(k * park * ump, 0.03, 0.60))
+        base_rates.append(clamp(k * park * ump * tto_decay_factor(idx), 0.03, 0.60))
 
     if not base_rates:
         base_rates = [clamp(pitcher_k * park * ump, 0.03, 0.60)] * int(max(1, round(expected_bf or DEFAULT_BF)))
@@ -2563,26 +2820,9 @@ def build_signal(proj, line, fair_prob, ev, ppb, score):
 
 
 
-def bullpen_workload_bf_factor(team_id):
-    """Conservative team pitching workload proxy for starter leash.
-
-    It only nudges expected batters faced slightly and never creates a fake edge.
-    """
-    data = safe_get_json(f"{MLB_BASE}/teams/{team_id}/stats", params={"stats": "season", "group": "pitching"})
-    try:
-        split = get_first_stat_split(data)
-        if not split:
-            return 1.0, "Bullpen/team workload unavailable"
-        stat = split.get("stat", {})
-        ip = baseball_ip_to_float(stat.get("inningsPitched"))
-        games = safe_float(stat.get("gamesPlayed"), 0) or 0
-        if not ip or not games:
-            return 1.0, "Bullpen/team workload unavailable"
-        ip_per_game = ip / max(games, 1)
-        factor = clamp(1.0 + ((ip_per_game - 8.7) * 0.015), 0.97, 1.03)
-        return float(factor), f"Conservative bullpen workload BF factor x{factor:.3f}"
-    except Exception:
-        return 1.0, "Bullpen/team workload unavailable"
+def bullpen_workload_bf_factor(team_id, as_of_date=None):
+    """Backward-compatible wrapper for the newer real recent bullpen fatigue model."""
+    return bullpen_fatigue_bf_factor(team_id, as_of_date or california_now().strftime("%Y-%m-%d"))[:2]
 
 # =========================
 # PROJECTION ENGINE
@@ -2603,7 +2843,12 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         lineup_msg = fallback_msg
         lineup_locked = False
 
+    proj_source_label = projection_source_label(lineup_msg, lineup_locked, lineup_rows)
+    lineup_status_label = confirmed_lineup_status(proj_source_label, lineup_rows)
+
     pitcher_k, pitcher_k_source, learn_scale = blend_pitcher_k_rate(profile["Pitcher K%"], recent_rows, pid)
+    elite_factor, elite_note = elite_pitcher_boost_factor(pitcher_k)
+    pitcher_k = clamp(pitcher_k * elite_factor, 0.08, 0.50)
 
     statcast_profile = get_statcast_pitch_profile(pid, days=365)
     pitcher_k, statcast_note = apply_statcast_csw_adjustment(pitcher_k, statcast_profile, enabled=use_statcast)
@@ -2631,13 +2876,15 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
     pitcher_k, calibration_note = apply_calibration_adjustment(pitcher_k, calibration_profile, enabled=use_calibration)
 
     matchup_k = calculate_log5_k_rate(pitcher_k, lineup_k)
+    opp_context_factor, opp_context_note = opponent_k_context_factor(lineup_k)
+    matchup_k = clamp(matchup_k * opp_context_factor, 0.03, 0.60)
     ump_mult, ump_name, umpire_note = umpire_factor(row["game_pk"], enabled=use_umpire)
     park = park_k_factor(row.get("venue"))
     weather_mult, weather_note, weather_details = weather_k_factor(row.get("venue"), row.get("game_time"), enabled=use_weather)
     env_mult = float(clamp(park * ump_mult * weather_mult, 0.94, 1.06))
 
     bf = leash["expected_bf"]
-    bullpen_factor, bullpen_note = bullpen_workload_bf_factor(row.get("team_id"))
+    bullpen_factor, bullpen_note, bullpen_usage = bullpen_fatigue_bf_factor(row.get("team_id"), row.get("date"))
     bf = float(clamp(bf * bullpen_factor, 14, 31))
     batter_rates, simulation_source = build_pa_sequence(lineup_rows if lineup_locked else [], bf, lineup_k)
 
@@ -2817,6 +3064,13 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
                     line_source=rr.get("Source")
                 )
             rr["All Real"] = "YES"
+            rr["Projection Source"] = proj_source_label
+            rr["Lineup Status"] = lineup_status_label
+            rr["Bullpen Status"] = bullpen_usage.get("label") if isinstance(bullpen_usage, dict) else None
+            rr["Bullpen Pitches"] = bullpen_usage.get("bullpen_pitches") if isinstance(bullpen_usage, dict) else None
+            rr["Bullpen IP"] = bullpen_usage.get("bullpen_ip") if isinstance(bullpen_usage, dict) else None
+            rr["Bullpen Fatigue Factor"] = round(safe_float(bullpen_factor, 1.0), 3)
+            rr["Bullpen Fatigue Note"] = bullpen_note
             prop_rows.append(rr)
 
     pick_id = f"{row['date']}_{row['game_pk']}_{pid}_{active_line}_{active_source}"
@@ -2840,6 +3094,8 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "pitcher_confirmed": bool(row.get("pitcher_confirmed")),
         "lineup_locked": bool(lineup_locked),
         "lineup_note": lineup_msg,
+        "projection_source": proj_source_label,
+        "lineup_status": lineup_status_label,
         "pitcher_k": round(pitcher_k, 3),
         "pitcher_k_source": pitcher_k_source,
         "opp_k": round(lineup_k, 3),
@@ -2865,8 +3121,14 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "expected_bf": round(bf, 1),
         "ppb": round(leash["ppb"], 2),
         "leash_risk": leash.get("leash_risk"),
+        "bullpen_status": bullpen_usage.get("label") if isinstance(bullpen_usage, dict) else None,
         "bullpen_bf_factor": round(safe_float(bullpen_factor, 1.0), 3),
         "bullpen_note": bullpen_note,
+        "bullpen_recent_games": bullpen_usage.get("games") if isinstance(bullpen_usage, dict) else None,
+        "bullpen_recent_ip": bullpen_usage.get("bullpen_ip") if isinstance(bullpen_usage, dict) else None,
+        "bullpen_recent_pitches": bullpen_usage.get("bullpen_pitches") if isinstance(bullpen_usage, dict) else None,
+        "bullpen_recent_appearances": bullpen_usage.get("appearances") if isinstance(bullpen_usage, dict) else None,
+        "bullpen_back_to_back_relievers": bullpen_usage.get("back_to_back_relief_appearances") if isinstance(bullpen_usage, dict) else None,
         "recent_ip": round(leash["recent_ip"], 2),
         "last_10_ks": leash["last_10_ks"],
         "projection": round(mean, 2),
@@ -3111,6 +3373,8 @@ def render_pick_card(p):
           <div class="small-muted">{p.get('team')} vs {p.get('opponent')}</div>
           <span class="badge {badge}">{p.get('risk_label')}</span>
           <span class="badge">{p.get('line_source')}</span>
+          <span class="badge good-badge">{p.get('projection_source')}</span>
+          <span class="badge">Lineup: {p.get('lineup_status')}</span>
         </div>
         <div><div class="small-muted">Projection</div><div class="big-number {color_class}">{p.get('projection')}</div><div class="small-muted">BF {p.get('expected_bf')} | PPB {p.get('ppb')}</div></div>
         <div><div class="small-muted">Line</div><div class="big-number">{line_display}</div><div class="small-muted">Edge: {edge_display} K</div></div>
@@ -3137,6 +3401,8 @@ def render_pick_card(p):
       </div>
       <div class="small-muted" style="margin-top:12px;">Risk Notes: {p.get('risk_notes')}</div>
       <div class="small-muted">Statcast: {p.get('statcast_note')} | Pitch Type: {p.get('pitch_type_note')} | Calibration: {p.get('calibration_note')}</div>
+      <div class="small-muted">Projection Source: {p.get('projection_source')} | Lineup Status: {p.get('lineup_status')} | Lineup Note: {p.get('lineup_note')}</div>
+      <div class="small-muted">Bullpen Fatigue: {p.get('bullpen_status')} | factor {p.get('bullpen_bf_factor')} | {p.get('bullpen_recent_pitches')} pitches / {p.get('bullpen_recent_ip')} IP | {p.get('bullpen_note')}</div>
       <div class="small-muted">Weather: {p.get('weather_note')} | Umpire: {p.get('umpire_note')}</div>
       <div class="small-muted">Advanced Sim: {p.get('bayesian_markov_note')} | XGBoost: {p.get('xgboost_note')}</div>
     </div>
@@ -3297,7 +3563,7 @@ with tab2:
         cols = [
             "date", "pitcher", "matchup", "hand", "projection", "line", "pick_side",
             "fair_probability", "edge_ks", "ev", "signal", "risk_label",
-            "line_source", "underdog_line", "underdog_status", "underdog_message", "data_score", "lineup_locked", "pitcher_confirmed",
+            "line_source", "projection_source", "lineup_status", "bullpen_status", "bullpen_bf_factor", "bullpen_recent_pitches", "bullpen_recent_ip", "bullpen_back_to_back_relievers", "underdog_line", "underdog_status", "underdog_message", "data_score", "lineup_locked", "pitcher_confirmed",
             "statcast_available", "pitch_type_matchup_available", "pitch_type_factor", "bayesian_markov_enabled", "xgboost_active", "xgboost_samples", "xgboost_adjustment", "bettable", "leash_risk"
         ]
         cols = [c for c in cols if c in show.columns]
