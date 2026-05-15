@@ -20,7 +20,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.16 HARD GATE FIX — BET/LEAN/PASS ALIGNED"
+APP_VERSION = "v11.17 K PROJ UPSIDE TAB + HARD GATE FIX"
 
 try:
     import pytz
@@ -5575,7 +5575,295 @@ def render_best4_builder(board):
     else:
         st.dataframe(ranked_all, use_container_width=True, hide_index=True)
 
-tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+
+
+# =========================
+# v11.17 K PROJ / UPSIDE TAB
+# =========================
+def kproj_line_for_display(p):
+    """Use Underdog line first, then the active real line. Never creates fake lines."""
+    ud = safe_float(p.get("underdog_line"))
+    if ud is not None:
+        return ud, "Underdog"
+    active = safe_float(p.get("line"))
+    if active is not None:
+        return active, str(p.get("line_source") or "Active Line")
+    return None, "NO LINE"
+
+def kproj_putaway_value(p):
+    # Best available strikeout-stuff proxy already inside this app.
+    whiff = safe_float(p.get("statcast_whiff"))
+    csw = safe_float(p.get("statcast_csw"))
+    if whiff is not None:
+        return whiff, "Whiff%"
+    if csw is not None:
+        return csw, "CSW%"
+    pk = safe_float(p.get("pitcher_k"))
+    if pk is not None:
+        return pk * 100, "Pitcher K%"
+    return None, "Unavailable"
+
+def kproj_upside_projection(p):
+    """Display-only K projection model inspired by the screenshot.
+
+    This tab is intentionally different from the main betting engine:
+    - It emphasizes raw K ceiling, batter K matchup, BF, recent Ks, and pitch/Statcast upside.
+    - It uses the same real board data and Underdog line.
+    - It does NOT change main projections, EV, grading, or bet sizing.
+    """
+    base = safe_float(p.get("pre_calibration_projection"), safe_float(p.get("projection"), 0.0)) or 0.0
+    main_proj = safe_float(p.get("projection"), base) or base
+    p90 = safe_float(p.get("p90"))
+    pk = safe_float(p.get("pitcher_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
+    ok = safe_float(p.get("opp_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
+    bf = safe_float(p.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF
+    ppb = safe_float(p.get("ppb"), 3.9) or 3.9
+    upside = safe_float(p.get("elite_upside_score"), 0.0) or 0.0
+    pitch_factor = safe_float(p.get("pitch_type_factor"), 1.0) or 1.0
+    stat_whiff = safe_float(p.get("statcast_whiff"))
+    stat_csw = safe_float(p.get("statcast_csw"))
+    last = [safe_float(x, 0) or 0 for x in (p.get("last_10_ks") or [])[:5]]
+
+    proj = max(base, main_proj)
+
+    # Use ceiling but only partially, otherwise the tab gets too aggressive.
+    if p90 is not None and p90 > proj:
+        ceiling_weight = 0.18 + min(upside, 100) / 100.0 * 0.22
+        proj += (p90 - proj) * ceiling_weight
+
+    # Raw K and lineup matchup nudges.
+    if pk >= 0.30:
+        proj += 0.45
+    elif pk >= 0.27:
+        proj += 0.28
+    elif pk >= 0.245:
+        proj += 0.14
+    elif pk <= 0.205:
+        proj -= 0.18
+
+    if ok >= 0.255:
+        proj += 0.42
+    elif ok >= 0.240:
+        proj += 0.24
+    elif ok <= 0.205:
+        proj -= 0.35
+
+    if bf >= 26:
+        proj += 0.45
+    elif bf >= 24:
+        proj += 0.25
+    elif bf <= 18:
+        proj -= 0.55
+    elif bf <= 20:
+        proj -= 0.25
+
+    if ppb <= 3.70:
+        proj += 0.18
+    elif ppb >= 4.20:
+        proj -= 0.25
+
+    if pitch_factor >= 1.025:
+        proj += 0.20
+    elif pitch_factor <= 0.975:
+        proj -= 0.18
+
+    if stat_whiff is not None:
+        if stat_whiff >= 31:
+            proj += 0.30
+        elif stat_whiff >= 27:
+            proj += 0.15
+    elif stat_csw is not None:
+        if stat_csw >= 31:
+            proj += 0.20
+        elif stat_csw >= 29:
+            proj += 0.10
+
+    if last:
+        avg = sum(last) / len(last)
+        if avg >= 6.5:
+            proj += 0.30
+        elif avg >= 5.5:
+            proj += 0.15
+        if max(last) >= 9:
+            proj += 0.25
+        elif max(last) >= 8:
+            proj += 0.15
+
+    # Do not let pure-upside ignore severe confirmed risk completely.
+    rd = str(p.get("run_damage_risk_level") or "").upper()
+    leash = str(p.get("leash_risk") or "").upper()
+    if rd == "EXTREME" and upside < 60:
+        proj -= 0.35
+    if leash in ["SHORT_RECENT_STARTS", "HIGH_PITCH_COUNT", "HIGH_RECENT_WORKLOAD"] and upside < 60:
+        proj -= 0.25
+
+    return round(float(clamp(proj, 0.0, 15.0)), 2)
+
+def kproj_decision(p):
+    line, line_source = kproj_line_for_display(p)
+    proj = kproj_upside_projection(p)
+    if line is None:
+        return {
+            "line": None, "line_source": line_source, "projection": proj,
+            "side": "NO LINE", "confidence": None, "decision": "🚫 NO UD LINE", "over_needed": None,
+            "note": "No Underdog/active real line found"
+        }
+    over_needed = required_ks_for_over(line)
+    under_max = max_ks_for_under(line)
+    diff_to_over = proj - over_needed
+    diff_to_under = under_max - proj
+    upside = safe_float(p.get("elite_upside_score"), 0.0) or 0.0
+    pk = safe_float(p.get("pitcher_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
+    ok = safe_float(p.get("opp_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
+
+    # Confidence is display-only for this tab.
+    if diff_to_over >= 0.75:
+        conf = clamp(0.60 + min(diff_to_over, 2.5) * 0.055 + upside / 1000.0, 0.50, 0.78)
+        side = "OVER"
+    elif diff_to_under >= 0.75:
+        conf = clamp(0.60 + min(diff_to_under, 2.5) * 0.045 - max(0, upside - 55) / 1200.0, 0.50, 0.76)
+        side = "UNDER"
+    else:
+        # Near key number: use matchup side, otherwise pass.
+        if pk >= 0.27 and ok >= 0.235 and upside >= 55:
+            side = "OVER LEAN"
+            conf = 0.56
+        elif upside <= 35 and diff_to_under > 0.20:
+            side = "UNDER LEAN"
+            conf = 0.55
+        else:
+            side = "PASS"
+            conf = 0.50
+
+    if side == "OVER":
+        decision = "🔥 OVER" if conf >= 0.64 else "⚠️ OVER LEAN"
+    elif side == "UNDER":
+        decision = "🔥 UNDER" if conf >= 0.66 else "⚠️ UNDER LEAN"
+    elif side == "OVER LEAN":
+        decision = "⚠️ OVER LEAN"
+    elif side == "UNDER LEAN":
+        decision = "⚠️ UNDER LEAN"
+    else:
+        decision = "🚫 PASS"
+
+    return {
+        "line": line, "line_source": line_source, "projection": proj,
+        "side": side, "confidence": round(conf, 3), "decision": decision,
+        "over_needed": over_needed,
+        "note": f"Over needs {over_needed}+ | Under wins {under_max} or fewer | Pure K tab, not bankroll gate"
+    }
+
+def kproj_bar_html(vals):
+    vals = [safe_int(x, 0) or 0 for x in (vals or [])[:10]]
+    if not vals:
+        return "<span class='small-muted'>No recent starts</span>"
+    mx = max(max(vals), 1)
+    parts = []
+    for v in vals:
+        h = int(20 + (v / mx) * 42)
+        color = "#31e84f" if v >= 6 else "#a92b2b" if v <= 3 else "#ffbe3c"
+        parts.append(f"<span class='mini-k-bar-wrap'><span class='mini-k-bar' style='height:{h}px;background:{color};'></span><span class='mini-k-label'>{v}</span></span>")
+    return "<div class='mini-k-bars'>" + "".join(parts) + "</div>"
+
+def render_kproj_pitcher_card(p):
+    d = kproj_decision(p)
+    putaway, put_label = kproj_putaway_value(p)
+    put_display = "—" if putaway is None else f"{putaway:.1f}%"
+    pk = safe_float(p.get("pitcher_k"), 0.0) or 0.0
+    ok = safe_float(p.get("opp_k"), 0.0) or 0.0
+    bf = safe_float(p.get("expected_bf"), 0.0) or 0.0
+    line_display = "NO LINE" if d["line"] is None else f"{d['line']:.1f}"
+    conf_display = "—" if d["confidence"] is None else f"{d['confidence']*100:.0f}%"
+    line_badge = "good-badge" if d["line_source"] == "Underdog" else "yellow-badge"
+    lineup_badge = "good-badge" if p.get("lineup_locked") else "yellow-badge"
+    recent_html = kproj_bar_html(p.get("last_10_ks"))
+    st.markdown(f"""
+    <div class="pick-card" style="border-color:rgba(90,100,255,.45);box-shadow:0 0 26px rgba(90,100,255,.16);">
+      <div style="display:grid;grid-template-columns:1.25fr .8fr .8fr .9fr;gap:18px;align-items:center;">
+        <div>
+          <div class="player-name">{p.get('pitcher')}</div>
+          <div class="small-muted">{p.get('matchup')} | {p.get('hand')}HP</div>
+          <span class="badge {line_badge}">{d['line_source']} Line</span>
+          <span class="badge {lineup_badge}">Lineup: {p.get('lineup_status')}</span>
+          <span class="badge">K Upside: {p.get('elite_upside_score', 0)}/100</span>
+        </div>
+        <div><div class="small-muted">K PROJ</div><div class="big-number green">{d['projection']}</div><div class="small-muted">Exp BF {bf:.1f}</div></div>
+        <div><div class="small-muted">Line</div><div class="big-number">{line_display}</div><div class="small-muted">{d['note']}</div></div>
+        <div><div class="small-muted">Decision</div><div class="big-number green" style="font-size:32px;">{d['decision']}</div><div class="small-muted">Confidence {conf_display}</div></div>
+      </div>
+      <div class="hr-soft"></div>
+      <div class="kpi-strip" style="grid-template-columns:repeat(4,minmax(0,1fr));">
+        <div class="kpi-box"><div class="kpi-label">{put_label}</div><div class="kpi-value">{put_display}</div><div class="kpi-sub">Putaway/stuff proxy</div></div>
+        <div class="kpi-box"><div class="kpi-label">Pitcher K%</div><div class="kpi-value">{pk*100:.1f}%</div><div class="kpi-sub">Season/recent blend</div></div>
+        <div class="kpi-box"><div class="kpi-label">Opp K%</div><div class="kpi-value">{ok*100:.1f}%</div><div class="kpi-sub">Lineup/team matchup</div></div>
+        <div class="kpi-box"><div class="kpi-label">Last 10 Starts</div>{recent_html}</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    lineup_rows = p.get("lineup_rows") or []
+    if lineup_rows:
+        with st.expander(f"Batter-by-batter K matchup — {p.get('pitcher')}", expanded=False):
+            rows = []
+            for i, r in enumerate(lineup_rows[:9], start=1):
+                rows.append({
+                    "#": i,
+                    "Batter": r.get("Batter") or r.get("Name") or r.get("Player") or r.get("player") or "",
+                    "K%": r.get("K%") if r.get("K%") is not None else r.get("Raw_K_Rate"),
+                    "Source": r.get("K Source") or r.get("Source") or r.get("K_Note") or "",
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.caption("No confirmed batter-by-batter lineup yet. This tab will improve when lineups lock.")
+
+def build_kproj_table(board):
+    rows = []
+    for p in board or []:
+        d = kproj_decision(p)
+        rows.append({
+            "Pitcher": p.get("pitcher"),
+            "Matchup": p.get("matchup"),
+            "K PROJ": d.get("projection"),
+            "UD/Line": d.get("line"),
+            "Line Source": d.get("line_source"),
+            "Decision": d.get("decision"),
+            "Confidence %": None if d.get("confidence") is None else round(d.get("confidence") * 100, 1),
+            "Over Needs": d.get("over_needed"),
+            "Pitcher K%": round((safe_float(p.get("pitcher_k"),0) or 0)*100,1),
+            "Opp K%": round((safe_float(p.get("opp_k"),0) or 0)*100,1),
+            "Exp BF": p.get("expected_bf"),
+            "Putaway/Whiff": p.get("statcast_whiff") or p.get("statcast_csw"),
+            "Lineup": p.get("lineup_status"),
+            "Main Engine Action": p.get("bet_action"),
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(["Decision", "Confidence %", "K PROJ"], ascending=[True, False, False])
+    return df
+
+def render_kproj_tab(board):
+    st.markdown('<div class="section-title-pro">K PROJ / Pure Upside Model</div>', unsafe_allow_html=True)
+    st.caption("Built to mirror the K-projection style: raw K ceiling, batter matchup, expected BF, recent Ks, and Underdog line. Display-only; main BET/LEAN/PASS engine stays unchanged.")
+    if not board:
+        st.info("Click 🔄 Refresh Live Board first.")
+        return
+    df = build_kproj_table(board)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("K Proj Rows", len(df))
+    c2.metric("Over Leans", int(df["Decision"].astype(str).str.contains("OVER", regex=False).sum()) if not df.empty else 0)
+    c3.metric("Under Leans", int(df["Decision"].astype(str).str.contains("UNDER", regex=False).sum()) if not df.empty else 0)
+    c4.metric("Underdog Lines", int((df["Line Source"] == "Underdog").sum()) if not df.empty else 0)
+
+    st.subheader("Projection Board")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.subheader("Pitcher Cards")
+    priority = sorted(board, key=lambda p: ("🔥" in str(kproj_decision(p).get("decision")), safe_float(kproj_decision(p).get("confidence"), 0) or 0, kproj_upside_projection(p)), reverse=True)
+    for p in priority[:20]:
+        render_kproj_pitcher_card(p)
+
+tab_kproj, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "K PROJ / UPSIDE",
     "TOP PLAYS",
     "BEST 4 BUILDER",
     "ALL PLAYERS",
@@ -5584,6 +5872,9 @@ tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "AFTER GAMES / LEARNING",
     "SETTINGS"
 ])
+
+with tab_kproj:
+    render_kproj_tab(board)
 
 with tab1:
     st.markdown('<div class="section-title-pro">Top Plays</div>', unsafe_allow_html=True)
