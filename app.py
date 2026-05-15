@@ -20,7 +20,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.12 RUN DAMAGE RISK + BEST 4 POWER BUILD"
+APP_VERSION = "v11.14 FINAL DECISION + BET ACTIONS + RUN DAMAGE"
 
 try:
     import pytz
@@ -3362,11 +3362,38 @@ def apply_xgboost_assist(current_features, current_projection, enabled=False):
         info["message"] = f"XGBoost assist error: {e}"
         return base, info
 
+# =========================
+# v11.14 FINAL DECISION / BET ACTION ENGINE
+# =========================
+# These helpers prevent the app from treating 5.64 as an automatic 6.
+# They use the actual strikeout threshold: over 5.5 needs 6+, over 6.5 needs 7+.
+def required_ks_for_over(line):
+    line = safe_float(line)
+    if line is None:
+        return None
+    return int(math.floor(line)) + 1
+
+def max_ks_for_under(line):
+    line = safe_float(line)
+    if line is None:
+        return None
+    return int(math.floor(line))
+
+def discrete_side_probability(sims, line):
+    if line is None:
+        return None, None, None
+    needed = required_ks_for_over(line)
+    arr = np.asarray(sims, dtype=float)
+    # If sims are continuous, this still correctly asks: how often does the
+    # simulated outcome clear the whole-number strikeout threshold?
+    over_prob = float(np.mean(arr >= needed))
+    under_prob = float(1.0 - over_prob)
+    return over_prob, under_prob, needed
+
 def calculate_pick_metrics(sims, line):
     if line is None:
-        return {"over_prob": None, "under_prob": None, "fair_prob": None, "pick_side": "NO LINE", "edge": None, "grade": "NO LINE", "ev": None}
-    over_prob = float(np.mean(sims > line))
-    under_prob = 1 - over_prob
+        return {"over_prob": None, "under_prob": None, "fair_prob": None, "pick_side": "NO LINE", "edge": None, "grade": "NO LINE", "ev": None, "over_needed": None}
+    over_prob, under_prob, over_needed = discrete_side_probability(sims, line)
     if over_prob >= under_prob:
         side = "OVER"
         fair = over_prob
@@ -3375,7 +3402,178 @@ def calculate_pick_metrics(sims, line):
         fair = under_prob
     edge = (fair - 0.50) * 100
     grade = "S" if fair >= 0.68 else "A" if fair >= 0.60 else "B" if fair >= 0.55 else "C"
-    return {"over_prob": over_prob, "under_prob": under_prob, "fair_prob": fair, "pick_side": side, "edge": edge, "grade": grade, "ev": (fair * 100) - ((1 - fair) * 100)}
+    return {"over_prob": over_prob, "under_prob": under_prob, "fair_prob": fair, "pick_side": side, "edge": edge, "grade": grade, "ev": (fair * 100) - ((1 - fair) * 100), "over_needed": over_needed}
+
+def is_key_k_line(line):
+    line = safe_float(line)
+    if line is None:
+        return False
+    return abs((line % 1) - 0.5) < 1e-9 and int(math.floor(line)) in [3, 4, 5, 6, 7]
+
+def elite_k_upside_score(pitcher_k, lineup_k, expected_bf=None, p90=None, recent_ks=None, ppb=None, run_damage_level=None):
+    """Ceiling protection for pitchers who can realistically spike 7-10 Ks.
+
+    This does not force an OVER. It mainly blocks weak UNDER bets on high-upside arms.
+    """
+    score = 0.0
+    pk = safe_float(pitcher_k, LEAGUE_AVG_K) or LEAGUE_AVG_K
+    lk = safe_float(lineup_k, LEAGUE_AVG_K) or LEAGUE_AVG_K
+    bf = safe_float(expected_bf, DEFAULT_BF) or DEFAULT_BF
+    ppb_val = safe_float(ppb, 3.9) or 3.9
+    p90v = safe_float(p90)
+
+    if pk >= 0.315:
+        score += 32
+    elif pk >= 0.290:
+        score += 25
+    elif pk >= 0.265:
+        score += 16
+    elif pk >= 0.245:
+        score += 8
+
+    if lk >= 0.260:
+        score += 24
+    elif lk >= 0.245:
+        score += 18
+    elif lk >= 0.235:
+        score += 10
+
+    if bf >= 25.0:
+        score += 18
+    elif bf >= 23.0:
+        score += 11
+    elif bf >= 21.0:
+        score += 5
+
+    if p90v is not None:
+        if p90v >= 8.0:
+            score += 14
+        elif p90v >= 7.0:
+            score += 9
+        elif p90v >= 6.5:
+            score += 5
+
+    if recent_ks:
+        try:
+            vals = [safe_float(x, 0) or 0 for x in recent_ks[:5]]
+            if vals:
+                avg = float(np.mean(vals))
+                mx = max(vals)
+                if avg >= 6.0:
+                    score += 10
+                elif avg >= 5.0:
+                    score += 5
+                if mx >= 8:
+                    score += 8
+                elif mx >= 7:
+                    score += 5
+        except Exception:
+            pass
+
+    if ppb_val <= 3.75:
+        score += 5
+    elif ppb_val >= 4.15:
+        score -= 8
+
+    rd = str(run_damage_level or '').upper()
+    if rd == 'EXTREME':
+        score -= 18
+    elif rd == 'HIGH':
+        score -= 10
+    elif rd == 'MILD':
+        score -= 4
+
+    return int(clamp(score, 0, 100))
+
+def final_pick_decision(projection, line, over_prob, under_prob, edge_abs, data_score=0, ev=None,
+                        pitcher_k=None, lineup_k=None, expected_bf=None, ppb=None, p90=None,
+                        recent_ks=None, run_damage_level=None, leash_risk=None,
+                        lineup_locked=False, pitcher_confirmed=False):
+    """Single source of truth for OVER / UNDER / LEAN / PASS.
+
+    Output meanings:
+    - 🔥 BET OVER / 🔥 BET UNDER = playable recommendation
+    - ⚠️ LEAN OVER / ⚠️ LEAN UNDER = informational lean only, not a full bet
+    - 🚫 PASS = do not bet
+    """
+    if line is None or projection is None:
+        return {"model_side": "NO LINE", "bet_action": "🚫 PASS", "action_tier": "PASS", "fair_probability": None, "decision_note": "No real line", "elite_upside_score": 0, "over_needed": None}
+
+    over_needed = required_ks_for_over(line)
+    over_prob = safe_float(over_prob)
+    under_prob = safe_float(under_prob)
+    if over_prob is None or under_prob is None:
+        return {"model_side": "NO PROB", "bet_action": "🚫 PASS", "action_tier": "PASS", "fair_probability": None, "decision_note": "No usable probability", "elite_upside_score": 0, "over_needed": over_needed}
+
+    # Choose side by probability, not by decimal projection alone.
+    if over_prob >= under_prob:
+        side = "OVER"
+        fair = over_prob
+    else:
+        side = "UNDER"
+        fair = under_prob
+
+    edge_abs = safe_float(edge_abs, 0.0) or 0.0
+    score = safe_float(data_score, 0.0) or 0.0
+    evv = safe_float(ev, 0.0) or 0.0
+    ppb_val = safe_float(ppb, 3.9) or 3.9
+    key_line = is_key_k_line(line)
+    upside = elite_k_upside_score(pitcher_k, lineup_k, expected_bf, p90, recent_ks, ppb, run_damage_level)
+    rd = str(run_damage_level or '').upper()
+    leash = str(leash_risk or '').upper()
+
+    notes = []
+    if key_line:
+        notes.append(f"key line: over needs {over_needed}+")
+    if upside >= 70:
+        notes.append(f"elite upside {upside}/100")
+    elif upside >= 55:
+        notes.append(f"upside {upside}/100")
+    if rd in ['HIGH', 'EXTREME']:
+        notes.append(f"run-damage risk {rd}")
+    if leash in ['HIGH_PITCH_COUNT', 'SHORT_RECENT_STARTS', 'HIGH_RECENT_WORKLOAD', 'STRICT_HOOK']:
+        notes.append(f"leash risk {leash}")
+
+    # Thin edges around half-number K lines are traps.
+    if key_line and edge_abs < 0.55:
+        return {"model_side": side, "bet_action": "🚫 PASS", "action_tier": "PASS", "fair_probability": fair, "decision_note": "Thin key-line edge; " + "; ".join(notes), "elite_upside_score": upside, "over_needed": over_needed}
+
+    # Never make a confident UNDER on a high-upside arm unless the under edge is very large.
+    if side == "UNDER" and upside >= 60 and edge_abs < 1.35:
+        return {"model_side": side, "bet_action": "🚫 PASS", "action_tier": "PASS", "fair_probability": fair, "decision_note": "Blocked weak UNDER vs high-K upside; " + "; ".join(notes), "elite_upside_score": upside, "over_needed": over_needed}
+
+    # Asymmetric thresholds: unders need stronger proof than overs.
+    if side == "UNDER":
+        min_bet_prob = 0.67 if key_line else 0.65
+        min_bet_edge = 1.10 if key_line else 0.95
+        min_lean_prob = 0.62 if key_line else 0.60
+        min_lean_edge = 0.90 if key_line else 0.75
+
+        if fair >= min_bet_prob and edge_abs >= min_bet_edge and score >= 88 and evv >= 0.04:
+            return {"model_side": side, "bet_action": "🔥 BET UNDER", "action_tier": "BET", "fair_probability": fair, "decision_note": "Clears strict UNDER gate; " + "; ".join(notes), "elite_upside_score": upside, "over_needed": over_needed}
+        if fair >= min_lean_prob and edge_abs >= min_lean_edge:
+            return {"model_side": side, "bet_action": "⚠️ LEAN UNDER", "action_tier": "LEAN", "fair_probability": fair, "decision_note": "Lean only, not full bet; " + "; ".join(notes), "elite_upside_score": upside, "over_needed": over_needed}
+        return {"model_side": side, "bet_action": "🚫 PASS", "action_tier": "PASS", "fair_probability": fair, "decision_note": "UNDER edge/probability too thin; " + "; ".join(notes), "elite_upside_score": upside, "over_needed": over_needed}
+
+    if side == "OVER":
+        min_bet_prob = 0.62 if not key_line else 0.63
+        min_bet_edge = 1.00 if not key_line else 1.05
+        min_lean_prob = 0.57
+        min_lean_edge = 0.70 if not key_line else 0.80
+
+        # Run damage should block fragile overs, but not automatically kill elite-upside profiles.
+        if rd == 'EXTREME' and edge_abs < 1.35:
+            return {"model_side": side, "bet_action": "🚫 PASS", "action_tier": "PASS", "fair_probability": fair, "decision_note": "Extreme run-damage blocks borderline OVER; " + "; ".join(notes), "elite_upside_score": upside, "over_needed": over_needed}
+        if rd == 'HIGH' and edge_abs < 1.15 and upside < 70:
+            return {"model_side": side, "bet_action": "🚫 PASS", "action_tier": "PASS", "fair_probability": fair, "decision_note": "High run-damage blocks weak OVER; " + "; ".join(notes), "elite_upside_score": upside, "over_needed": over_needed}
+
+        if fair >= min_bet_prob and edge_abs >= min_bet_edge and score >= 86 and (evv >= 0.03 or upside >= 70):
+            return {"model_side": side, "bet_action": "🔥 BET OVER", "action_tier": "BET", "fair_probability": fair, "decision_note": "Clears OVER gate; " + "; ".join(notes), "elite_upside_score": upside, "over_needed": over_needed}
+        if fair >= min_lean_prob and edge_abs >= min_lean_edge:
+            return {"model_side": side, "bet_action": "⚠️ LEAN OVER", "action_tier": "LEAN", "fair_probability": fair, "decision_note": "Lean only, not full bet; " + "; ".join(notes), "elite_upside_score": upside, "over_needed": over_needed}
+        return {"model_side": side, "bet_action": "🚫 PASS", "action_tier": "PASS", "fair_probability": fair, "decision_note": "OVER edge/probability too thin; " + "; ".join(notes), "elite_upside_score": upside, "over_needed": over_needed}
+
+    return {"model_side": side, "bet_action": "🚫 PASS", "action_tier": "PASS", "fair_probability": fair, "decision_note": "No final gate cleared", "elite_upside_score": upside, "over_needed": over_needed}
 
 # =========================
 # REAL PROP SOURCES
@@ -4461,6 +4659,7 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         kelly = 0.0
         edge_pct = None
         gap = None
+        final_decision = {"model_side": pick_side, "bet_action": "🚫 PASS", "action_tier": "PASS", "fair_probability": None, "decision_note": "No real line", "elite_upside_score": 0, "over_needed": None}
     else:
         pick_side = "OVER" if mean > active_line else "UNDER"
         fair_prob = over_prob if pick_side == "OVER" else under_prob
@@ -4508,11 +4707,42 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
             under_prob = fair_prob
             over_prob = 1 - fair_prob if fair_prob is not None else None
 
+        gap = abs(mean - active_line)
+        # v11.14: centralized final decision layer. This may change the model side
+        # by probability, and it separates BET / LEAN / PASS.
+        provisional_ev = expected_value(fair_prob, price)
+        final_decision = final_pick_decision(
+            projection=mean,
+            line=active_line,
+            over_prob=over_prob,
+            under_prob=under_prob,
+            edge_abs=gap,
+            data_score=score,
+            ev=provisional_ev,
+            pitcher_k=pitcher_k,
+            lineup_k=lineup_k,
+            expected_bf=bf,
+            ppb=leash.get("ppb"),
+            p90=p90,
+            recent_ks=leash.get("last_10_ks"),
+            run_damage_level=leash.get("run_damage_risk_level") or (pitcher_damage_profile.get("risk_level") if isinstance(pitcher_damage_profile, dict) else None),
+            leash_risk=leash.get("leash_risk"),
+            lineup_locked=lineup_locked,
+            pitcher_confirmed=row.get("pitcher_confirmed"),
+        )
+        pick_side = final_decision.get("model_side") or pick_side
+        fair_prob = final_decision.get("fair_probability") if final_decision.get("fair_probability") is not None else fair_prob
+        if pick_side == "OVER":
+            over_prob = fair_prob
+            under_prob = 1 - fair_prob if fair_prob is not None else under_prob
+        elif pick_side == "UNDER":
+            under_prob = fair_prob
+            over_prob = 1 - fair_prob if fair_prob is not None else over_prob
+
         ev = expected_value(fair_prob, price)
         raw_kelly = kelly_fraction(fair_prob, price)
         kelly = min(raw_kelly, MAX_RECOMMENDED_KELLY) if raw_kelly is not None else 0.0
         edge_pct = ((fair_prob - no_vig) * 100) if no_vig is not None and fair_prob is not None else None
-        gap = abs(mean - active_line)
 
     risk_label, risk_notes = classify_risk(
         fair_prob,
@@ -4545,7 +4775,31 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
             signal = f"PASS — {pick_side}"
         else:
             signal = "PASS"
+        if isinstance(final_decision, dict) and final_decision.get("action_tier") == "BET":
+            # Hard no-bet gate downgrades full bets to lean/pass when market/data gates fail.
+            final_decision["bet_action"] = f"⚠️ LEAN {pick_side}" if pick_side in ["OVER", "UNDER"] else "🚫 PASS"
+            final_decision["action_tier"] = "LEAN" if pick_side in ["OVER", "UNDER"] else "PASS"
+            final_decision["decision_note"] = (final_decision.get("decision_note", "") + "; downgraded by no-bet gate").strip("; ")
         risk_notes = (risk_notes + "; " if risk_notes else "") + "No-bet gate: " + "; ".join(no_bet_reasons)
+
+    # v11.14 visible action label. Only 🔥 BET means official playable.
+    if isinstance(final_decision, dict):
+        bet_action = final_decision.get("bet_action", "🚫 PASS")
+        action_tier = final_decision.get("action_tier", "PASS")
+        final_decision_note = final_decision.get("decision_note", "")
+        if action_tier == "BET":
+            signal_type = "good"
+            signal = bet_action
+        elif action_tier == "LEAN":
+            signal_type = "lean"
+            signal = bet_action
+        else:
+            signal_type = "pass"
+            signal = bet_action
+    else:
+        bet_action = "🚫 PASS"
+        action_tier = "PASS"
+        final_decision_note = "Final decision unavailable"
 
     if active_line is not None and not price_is_real:
         risk_notes = (risk_notes + "; " if risk_notes else "") + "EV/odds are estimated from sidebar default odds, not a real sportsbook price"
@@ -4557,6 +4811,8 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         risk_notes = (risk_notes + "; " if risk_notes else "") + true_probability_calibration.get("note")
     if isinstance(game_script_risk, dict) and game_script_risk.get("label") in ["MILD", "HIGH", "EXTREME"]:
         risk_notes = (risk_notes + "; " if risk_notes else "") + "Run Damage Engine: " + str(game_script_note)
+    if final_decision_note:
+        risk_notes = (risk_notes + "; " if risk_notes else "") + "Final Decision: " + str(final_decision_note)
 
     prop_rows = []
     for src in [sportsbook_data, pp_data, ud_data, sgo_data, optic_data]:
@@ -4570,6 +4826,8 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
                 lean = "OVER" if mean > line else "UNDER"
                 lean_prob = cal_p if lean == "OVER" else 1 - cal_p
                 rr["Model Lean"] = lean
+                rr["Model Action"] = bet_action if 'bet_action' in locals() else "🚫 PASS"
+                rr["Final Action Tier"] = action_tier if 'action_tier' in locals() else "PASS"
                 rr["Raw Model Prob %"] = round((raw_p if lean == "OVER" else 1 - raw_p) * 100, 1)
                 rr["Model Prob %"] = round(lean_prob * 100, 1)
                 rr["Hit Risk"], rr["Risk Notes"] = classify_risk(
@@ -4711,6 +4969,11 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "odds": price,
         "price_is_real": bool(price_is_real),
         "price_source": price_source,
+        "bet_action": bet_action if 'bet_action' in locals() else "🚫 PASS",
+        "action_tier": action_tier if 'action_tier' in locals() else "PASS",
+        "final_decision_note": final_decision_note if 'final_decision_note' in locals() else "",
+        "elite_upside_score": final_decision.get("elite_upside_score") if isinstance(final_decision, dict) else None,
+        "over_needed": final_decision.get("over_needed") if isinstance(final_decision, dict) else None,
         "pick_side": pick_side,
         "over_probability": None if over_prob is None else round(over_prob, 4),
         "under_probability": None if under_prob is None else round(under_prob, 4),
@@ -4956,7 +5219,8 @@ def render_pick_card(p):
         <div><div class="small-muted">Projection</div><div class="big-number {color_class}">{p.get('projection')}</div><div class="small-muted">BF {p.get('expected_bf')} | PPB {p.get('ppb')}</div></div>
         <div><div class="small-muted">Line</div><div class="big-number">{line_display}</div><div class="small-muted">Edge: {edge_display} K</div></div>
         <div>
-          <div class="small-muted">Pick</div><div class="big-number {color_class}">{p.get('pick_side')}</div>
+          <div class="small-muted">Model Side</div><div class="big-number {color_class}">{p.get('pick_side')}</div>
+          <div class="small-muted">Final Action</div><div class="{color_class}" style="font-size:22px;font-weight:950;">{p.get('bet_action', '🚫 PASS')}</div>
           <div class="small-muted">Fair Prob</div><div class="{color_class}" style="font-size:26px;font-weight:900;">{prob_display}</div>
           <div class="progress-wrap"><div class="{progress_class}" style="width:{progress_width}%;"></div></div>
         </div>
@@ -4977,6 +5241,7 @@ def render_pick_card(p):
         <div><div class="small-muted">CLV Δ</div><div style="font-size:22px;font-weight:900;">{p.get('line_delta')}</div></div>
         <div><div class="small-muted">Last 10 Ks</div>{bars}</div>
       </div>
+      <div class="small-muted" style="margin-top:12px;">Final Decision: {p.get('final_decision_note', '')} | Elite Upside: {p.get('elite_upside_score')} | Over Needs: {p.get('over_needed')}+</div>
       <div class="small-muted" style="margin-top:12px;">Risk Notes: {p.get('risk_notes')}</div>
       <div class="small-muted">Statcast: {p.get('statcast_note')} | Pitch Type: {p.get('pitch_type_note')} | Calibration: {p.get('calibration_note')}</div>
       <div class="small-muted">Projection Source: {p.get('projection_source')} | Lineup Status: {p.get('lineup_status')} | Lineup Note: {p.get('lineup_note')}</div>
@@ -5229,11 +5494,14 @@ def build_best4_table(board):
             and top_score >= 88
             and _best4_num(p.get("fair_probability"), 0) >= MIN_BETTABLE_PROB
             and best4_abs_edge(p) >= MIN_BETTABLE_GAP_KS
+            and str(p.get("action_tier", "PASS")).upper() == "BET"
         )
         rows.append({
             "Player": p.get("pitcher") or p.get("player") or "",
             "Matchup": p.get("matchup", ""),
             "Pick": direction,
+            "Final Action": p.get("bet_action", "🚫 PASS"),
+            "Action Tier": p.get("action_tier", "PASS"),
             "Line": line,
             "Projection": round(proj, 2),
             "Edge": round(edge_signed, 2),
@@ -5327,7 +5595,7 @@ with tab2:
     if board:
         show = pd.DataFrame([{k: v for k, v in p.items() if k not in ["prop_rows", "lineup_rows", "pitch_type_rows"]} for p in board])
         cols = [
-            "date", "pitcher", "matchup", "hand", "projection", "line", "pick_side",
+            "date", "pitcher", "matchup", "hand", "projection", "line", "pick_side", "bet_action", "action_tier",
             "fair_probability", "edge_ks", "ev", "price_source", "price_is_real", "signal", "risk_label",
             "line_source", "projection_source", "lineup_status", "bullpen_status", "bullpen_bf_factor", "bullpen_recent_pitches", "bullpen_recent_ip", "bullpen_back_to_back_relievers", "underdog_line", "underdog_status", "underdog_message", "data_score", "lineup_locked", "pitcher_confirmed",
             "statcast_available", "pitch_type_matchup_available", "pitch_type_factor", "bayesian_markov_enabled", "xgboost_active", "xgboost_samples", "xgboost_adjustment", "bettable", "leash_risk"
