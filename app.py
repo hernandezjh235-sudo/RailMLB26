@@ -20,7 +20,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.14 FINAL DECISION + BET ACTIONS + RUN DAMAGE"
+APP_VERSION = "v11.16 HARD GATE FIX — BET/LEAN/PASS ALIGNED"
 
 try:
     import pytz
@@ -4661,7 +4661,13 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         gap = None
         final_decision = {"model_side": pick_side, "bet_action": "🚫 PASS", "action_tier": "PASS", "fair_probability": None, "decision_note": "No real line", "elite_upside_score": 0, "over_needed": None}
     else:
-        pick_side = "OVER" if mean > active_line else "UNDER"
+        # v11.15 audit fix: choose the priced/model side from discrete probability,
+        # not from decimal mean alone. This keeps side, price lookup, EV, and final
+        # decision aligned around 4.5/5.5/6.5 key lines.
+        if over_prob is not None and under_prob is not None:
+            pick_side = "OVER" if over_prob >= under_prob else "UNDER"
+        else:
+            pick_side = "OVER" if mean > active_line else "UNDER"
         fair_prob = over_prob if pick_side == "OVER" else under_prob
 
         # Price handling fix:
@@ -4775,11 +4781,18 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
             signal = f"PASS — {pick_side}"
         else:
             signal = "PASS"
-        if isinstance(final_decision, dict) and final_decision.get("action_tier") == "BET":
-            # Hard no-bet gate downgrades full bets to lean/pass when market/data gates fail.
-            final_decision["bet_action"] = f"⚠️ LEAN {pick_side}" if pick_side in ["OVER", "UNDER"] else "🚫 PASS"
-            final_decision["action_tier"] = "LEAN" if pick_side in ["OVER", "UNDER"] else "PASS"
-            final_decision["decision_note"] = (final_decision.get("decision_note", "") + "; downgraded by no-bet gate").strip("; ")
+
+        # v11.16 audit fix:
+        # A failed hard no-bet gate must always become PASS, even if the
+        # softer decision layer originally said LEAN or BET. LEAN is not a bet,
+        # but showing LEAN next to hard-fail reasons can confuse the UI.
+        if isinstance(final_decision, dict):
+            final_decision["bet_action"] = "🚫 PASS"
+            final_decision["action_tier"] = "PASS"
+            final_decision["decision_note"] = (
+                final_decision.get("decision_note", "") + "; blocked by hard no-bet gate"
+            ).strip("; ")
+
         risk_notes = (risk_notes + "; " if risk_notes else "") + "No-bet gate: " + "; ".join(no_bet_reasons)
 
     # v11.14 visible action label. Only 🔥 BET means official playable.
@@ -4985,7 +4998,9 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "edge_pct": None if edge_pct is None else round(edge_pct, 2),
         "ev": None if ev is None else round(ev, 4),
         "kelly": round(kelly, 4),
-        "bet_size": round(bankroll * kelly, 2),
+        # v11.15 audit fix: only official BET actions receive a stake.
+        # LEAN and PASS are informational only and must display $0.
+        "bet_size": round(bankroll * kelly, 2) if (locals().get("action_tier") == "BET" and locals().get("bettable", False)) else 0.0,
         "data_score": score,
         "risk_label": risk_label,
         "risk_notes": risk_notes,
