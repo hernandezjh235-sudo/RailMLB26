@@ -13,6 +13,7 @@ import math
 import difflib
 import io
 import unicodedata
+import html
 import requests
 import numpy as np
 import pandas as pd
@@ -20,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.17 K PROJ UPSIDE TAB + HARD GATE FIX"
+APP_VERSION = "v11.18 HERO K UI + CONFIDENCE + DISTRIBUTION"
 
 try:
     import pytz
@@ -312,6 +313,42 @@ h1,h2,h3 {color:#fff;}
 .section-title-pro {margin-top:22px;margin-bottom:10px;font-size:24px;font-weight:950;color:#fff;border-left:5px solid #ff3b3b;padding-left:12px;}
 .stTabs [data-baseweb="tab"] {color:#b8c3cf;font-weight:850;}
 .stTabs [aria-selected="true"] {color:#31e84f!important;border-bottom:3px solid #31e84f;}
+
+.hero-board-panel {
+    background:linear-gradient(135deg,rgba(5,18,16,.96),rgba(8,8,8,.98));
+    border:1px solid rgba(0,255,160,.38);
+    border-radius:26px;
+    padding:20px;
+    box-shadow:0 0 34px rgba(0,255,160,.14);
+    margin-bottom:18px;
+}
+.hero-card {
+    background:linear-gradient(145deg,#090d12,#120000);
+    border:1px solid rgba(255,255,255,.12);
+    border-radius:24px;
+    padding:18px;
+    box-shadow:0 0 24px rgba(0,0,0,.35);
+    margin-bottom:14px;
+}
+.hero-card-elite {border-color:rgba(0,255,135,.70); box-shadow:0 0 28px rgba(0,255,135,.18);}
+.hero-card-strong {border-color:rgba(65,180,255,.55); box-shadow:0 0 26px rgba(65,180,255,.13);}
+.hero-card-risky {border-color:rgba(255,190,60,.55); box-shadow:0 0 24px rgba(255,190,60,.12);}
+.hero-card-pass {border-color:rgba(255,255,255,.13);}
+.tier-badge {display:inline-block;padding:7px 12px;border-radius:999px;font-weight:950;font-size:12px;letter-spacing:.03em;margin:3px 5px 3px 0;}
+.tier-elite {background:#002916;color:#b5ffd9;border:1px solid rgba(0,255,135,.65);}
+.tier-strong {background:#021a2b;color:#bde8ff;border:1px solid rgba(65,180,255,.65);}
+.tier-lean {background:#2b1d00;color:#ffe2a1;border:1px solid rgba(255,210,70,.65);}
+.tier-risky {background:#2b1600;color:#ffd2a1;border:1px solid rgba(255,155,60,.65);}
+.tier-pass {background:#171717;color:#d7d7d7;border:1px solid rgba(255,255,255,.20);}
+.tier-trap {background:#2b0000;color:#ffc0c0;border:1px solid rgba(255,75,75,.70);}
+.dist-row {display:grid;grid-template-columns:70px 1fr 46px;gap:9px;align-items:center;margin:7px 0;}
+.dist-label {font-size:12px;color:#cfcfcf;font-weight:850;}
+.dist-track {height:12px;border-radius:99px;background:#060606;border:1px solid rgba(255,255,255,.08);overflow:hidden;}
+.dist-fill {height:100%;border-radius:99px;background:linear-gradient(90deg,#31e84f,#46ff9a);}
+.dist-fill-mid {height:100%;border-radius:99px;background:linear-gradient(90deg,#ffbe3c,#ffe06b);}
+.dist-fill-low {height:100%;border-radius:99px;background:linear-gradient(90deg,#ff5f5f,#ff9b9b);}
+.clean-table-note {font-size:13px;color:#aeb7c2;margin-top:-4px;margin-bottom:12px;}
+
 @media (max-width: 1100px) {.kpi-strip {grid-template-columns: repeat(2, minmax(0, 1fr));}}
 </style>
 """, unsafe_allow_html=True)
@@ -5753,6 +5790,203 @@ def kproj_decision(p):
         "note": f"Over needs {over_needed}+ | Under wins {under_max} or fewer | Pure K tab, not bankroll gate"
     }
 
+
+# =========================
+# v11.18 HERO DISPLAY LAYER
+# =========================
+def hero_clean_text(x):
+    return html.escape(str(x if x is not None else ""))
+
+def hero_pick_side(p):
+    d = kproj_decision(p)
+    side = str(d.get("side") or "PASS").upper()
+    if "OVER" in side:
+        return "OVER"
+    if "UNDER" in side:
+        return "UNDER"
+    main = str(p.get("pick_side") or "").upper()
+    if main in ["OVER", "UNDER"]:
+        return main
+    return "PASS"
+
+def hero_edge(p):
+    d = kproj_decision(p)
+    line = safe_float(d.get("line"))
+    proj = safe_float(d.get("projection"))
+    if line is None or proj is None:
+        return None
+    return round(float(proj - line), 2)
+
+def hero_distribution(p):
+    """Display-only outcome distribution. Uses existing sims/percentiles if present;
+    otherwise builds a conservative simulated K range from projection + volatility.
+    Does not alter betting math, grading, saving, calibration, or EV.
+    """
+    d = kproj_decision(p)
+    proj = safe_float(d.get("projection"), safe_float(p.get("projection"), 0.0)) or 0.0
+    line = safe_float(d.get("line"))
+    p10 = safe_float(p.get("p10"))
+    p50 = safe_float(p.get("p50"))
+    p90 = safe_float(p.get("p90"))
+    if p10 is None:
+        p10 = max(0.0, proj - 2.1)
+    if p50 is None:
+        p50 = max(0.0, proj)
+    if p90 is None:
+        p90 = max(p50, proj + 2.3)
+
+    # Volatility estimate from existing context. Wider range for risky/unstable pitchers.
+    sim_range = max(1.1, p90 - p10)
+    sigma = clamp(sim_range / 2.55, 0.65, 2.25)
+    rng_seed = abs(hash(str(p.get("pitcher", "")) + str(p.get("game_pk", "")))) % (2**32)
+    rng = np.random.default_rng(rng_seed)
+    sims = rng.normal(loc=proj, scale=sigma, size=4500)
+    sims = np.clip(np.rint(sims), 0, 16)
+
+    if line is not None:
+        over_need = required_ks_for_over(line)
+        under_max = max_ks_for_under(line)
+        over_pct = float(np.mean(sims >= over_need))
+        under_pct = float(np.mean(sims <= under_max))
+    else:
+        over_pct = None
+        under_pct = None
+
+    return {
+        "floor": int(np.percentile(sims, 10)),
+        "median": int(np.percentile(sims, 50)),
+        "ceiling": int(np.percentile(sims, 90)),
+        "p_over": over_pct,
+        "p_under": under_pct,
+        "p_6_plus": float(np.mean(sims >= 6)),
+        "p_8_plus": float(np.mean(sims >= 8)),
+        "p_10_plus": float(np.mean(sims >= 10)),
+        "range": float(sim_range),
+    }
+
+def hero_volatility_label(p):
+    dist = hero_distribution(p)
+    score = 0
+    notes = []
+    if dist["range"] >= 4.8:
+        score += 2; notes.append("wide sim range")
+    elif dist["range"] >= 3.9:
+        score += 1; notes.append("medium sim range")
+    leash = str(p.get("leash_risk") or "").upper()
+    if leash in ["SHORT_RECENT_STARTS", "HIGH_PITCH_COUNT", "HIGH_RECENT_WORKLOAD"]:
+        score += 2; notes.append("leash risk")
+    hook = str(p.get("manager_hook_status") or p.get("manager_hook") or "").upper()
+    if "STRICT" in hook or "HOOK" in hook and "NORMAL" not in hook:
+        score += 1; notes.append("hook risk")
+    rd = str(p.get("run_damage_risk_level") or p.get("risk_label") or "").upper()
+    if "EXTREME" in rd or "HIGH" in rd:
+        score += 2; notes.append("run-damage risk")
+    if not p.get("lineup_locked"):
+        score += 1; notes.append("lineup fallback")
+    ppb = safe_float(p.get("ppb"), 3.9) or 3.9
+    if ppb >= 4.15:
+        score += 1; notes.append("high pitches/BF")
+    if score >= 5:
+        return "HIGH", ", ".join(notes[:4]) or "High variance profile"
+    if score >= 3:
+        return "MEDIUM", ", ".join(notes[:4]) or "Some volatility present"
+    return "LOW", ", ".join(notes[:4]) or "Stable profile"
+
+def hero_sharp_market_signal(p):
+    clv = safe_float(p.get("clv_delta"))
+    line_delta = safe_float(p.get("line_delta"))
+    edge = hero_edge(p)
+    side = hero_pick_side(p)
+    source = str(p.get("line_source") or p.get("price_source") or "")
+    signals = []
+    strength = 0
+    if clv is not None and side in ["OVER", "UNDER"]:
+        if side == "OVER" and clv > 0:
+            signals.append(f"line moved up {clv:+.1f}"); strength += 2
+        elif side == "UNDER" and clv < 0:
+            signals.append(f"line moved down {clv:+.1f}"); strength += 2
+        elif abs(clv) >= 1.0:
+            signals.append(f"movement against side {clv:+.1f}"); strength -= 1
+    if line_delta is not None and abs(line_delta) >= 1.0:
+        signals.append(f"tracked delta {line_delta:+.1f}"); strength += 1
+    if edge is not None and abs(edge) >= 1.25:
+        signals.append("strong model gap"); strength += 1
+    if "Underdog" in source or "underdog" in source.lower():
+        signals.append("UD line active"); strength += 1
+    if strength >= 3:
+        return "SHARP", "; ".join(signals[:4])
+    if strength >= 1:
+        return "WATCH", "; ".join(signals[:4])
+    return "NEUTRAL", "; ".join(signals[:3]) if signals else "No strong market signal yet"
+
+def hero_confidence_tier(p):
+    d = kproj_decision(p)
+    line = safe_float(d.get("line"))
+    conf = safe_float(d.get("confidence"), 0.50) or 0.50
+    edge = hero_edge(p)
+    edge_abs = abs(edge) if edge is not None else 0.0
+    volatility, vol_note = hero_volatility_label(p)
+    sharp, sharp_note = hero_sharp_market_signal(p)
+    data_score = safe_float(p.get("data_score"), 75) or 75
+    main_action = str(p.get("action_tier") or "PASS").upper()
+
+    score = 0
+    score += conf * 42
+    score += min(edge_abs, 3.0) * 10
+    score += data_score * 0.18
+    if p.get("lineup_locked"):
+        score += 6
+    else:
+        score -= 5
+    if p.get("price_is_real"):
+        score += 4
+    if sharp == "SHARP":
+        score += 5
+    elif sharp == "WATCH":
+        score += 2
+    if volatility == "HIGH":
+        score -= 12
+    elif volatility == "MEDIUM":
+        score -= 5
+    if line is None:
+        score -= 30
+    if main_action == "BET":
+        score += 4
+    elif main_action == "PASS":
+        score -= 3
+
+    # Trap override: strong-looking projection with unstable environment.
+    if edge_abs >= 0.75 and volatility == "HIGH" and data_score < 90:
+        return "TRAP", round(clamp(score, 0, 100), 1), f"Projection edge but high volatility: {vol_note}"
+    if line is None:
+        return "PASS", round(clamp(score, 0, 100), 1), "No playable real line"
+    if score >= 86 and volatility == "LOW" and edge_abs >= 1.0:
+        return "ELITE", round(clamp(score, 0, 100), 1), "Best profile: edge + stability + data"
+    if score >= 78 and volatility in ["LOW", "MEDIUM"] and edge_abs >= 0.75:
+        return "STRONG", round(clamp(score, 0, 100), 1), "Playable profile with acceptable risk"
+    if score >= 68 and edge_abs >= 0.45:
+        return "LEAN", round(clamp(score, 0, 100), 1), "Lean only; do not force"
+    if volatility == "HIGH":
+        return "RISKY", round(clamp(score, 0, 100), 1), f"Risky: {vol_note}"
+    return "PASS", round(clamp(score, 0, 100), 1), "Not enough clean edge"
+
+def hero_tier_rank(tier):
+    order = {"ELITE": 0, "STRONG": 1, "LEAN": 2, "RISKY": 3, "TRAP": 4, "PASS": 5}
+    return order.get(str(tier).upper(), 9)
+
+def hero_dist_html(dist):
+    def pct(x):
+        return 0 if x is None else int(round(clamp(float(x), 0, 1) * 100))
+    rows = [
+        ("Over", pct(dist.get("p_over")), "dist-fill"),
+        ("Under", pct(dist.get("p_under")), "dist-fill-mid"),
+        ("8+ Ks", pct(dist.get("p_8_plus")), "dist-fill-low"),
+    ]
+    html_rows = []
+    for label, val, cls in rows:
+        html_rows.append(f"<div class='dist-row'><div class='dist-label'>{label}</div><div class='dist-track'><div class='{cls}' style='width:{val}%;'></div></div><div class='dist-label'>{val}%</div></div>")
+    return "".join(html_rows)
+
 def kproj_bar_html(vals):
     vals = [safe_int(x, 0) or 0 for x in (vals or [])[:10]]
     if not vals:
@@ -5767,33 +6001,76 @@ def kproj_bar_html(vals):
 
 def render_kproj_pitcher_card(p):
     d = kproj_decision(p)
+    dist = hero_distribution(p)
+    tier, tier_score, tier_note = hero_confidence_tier(p)
+    volatility, vol_note = hero_volatility_label(p)
+    sharp, sharp_note = hero_sharp_market_signal(p)
     putaway, put_label = kproj_putaway_value(p)
+
     put_display = "—" if putaway is None else f"{putaway:.1f}%"
     pk = safe_float(p.get("pitcher_k"), 0.0) or 0.0
     ok = safe_float(p.get("opp_k"), 0.0) or 0.0
     bf = safe_float(p.get("expected_bf"), 0.0) or 0.0
     line_display = "NO LINE" if d["line"] is None else f"{d['line']:.1f}"
     conf_display = "—" if d["confidence"] is None else f"{d['confidence']*100:.0f}%"
-    line_badge = "good-badge" if d["line_source"] == "Underdog" else "yellow-badge"
-    lineup_badge = "good-badge" if p.get("lineup_locked") else "yellow-badge"
+    edge = hero_edge(p)
+    edge_display = "—" if edge is None else f"{edge:+.2f} K"
+    line_badge = "tier-elite" if d["line_source"] == "Underdog" else "tier-lean"
+    lineup_badge = "tier-elite" if p.get("lineup_locked") else "tier-lean"
+    tier_class = {
+        "ELITE": "hero-card-elite tier-elite",
+        "STRONG": "hero-card-strong tier-strong",
+        "LEAN": "hero-card-risky tier-lean",
+        "RISKY": "hero-card-risky tier-risky",
+        "TRAP": "hero-card-risky tier-trap",
+        "PASS": "hero-card-pass tier-pass",
+    }.get(tier, "hero-card-pass tier-pass")
+    card_class = tier_class.split()[0]
+    badge_class = tier_class.split()[1]
     recent_html = kproj_bar_html(p.get("last_10_ks"))
+    dist_html = hero_dist_html(dist)
+
+    pitcher = hero_clean_text(p.get('pitcher'))
+    matchup = hero_clean_text(p.get('matchup'))
+    hand = hero_clean_text(p.get('hand'))
+    note = hero_clean_text(d.get('note'))
+    tier_note_safe = hero_clean_text(tier_note)
+    vol_note_safe = hero_clean_text(vol_note)
+    sharp_note_safe = hero_clean_text(sharp_note)
+
     st.markdown(f"""
-    <div class="pick-card" style="border-color:rgba(90,100,255,.45);box-shadow:0 0 26px rgba(90,100,255,.16);">
-      <div style="display:grid;grid-template-columns:1.25fr .8fr .8fr .9fr;gap:18px;align-items:center;">
+    <div class="hero-card {card_class}">
+      <div style="display:grid;grid-template-columns:1.25fr .68fr .68fr .78fr .9fr;gap:16px;align-items:center;">
         <div>
-          <div class="player-name">{p.get('pitcher')}</div>
-          <div class="small-muted">{p.get('matchup')} | {p.get('hand')}HP</div>
-          <span class="badge {line_badge}">{d['line_source']} Line</span>
-          <span class="badge {lineup_badge}">Lineup: {p.get('lineup_status')}</span>
-          <span class="badge">K Upside: {p.get('elite_upside_score', 0)}/100</span>
+          <div class="player-name">{pitcher}</div>
+          <div class="small-muted">{matchup} | {hand}HP</div>
+          <span class="tier-badge {badge_class}">{tier} · {tier_score:.0f}</span>
+          <span class="tier-badge {line_badge}">{hero_clean_text(d['line_source'])} Line</span>
+          <span class="tier-badge {lineup_badge}">Lineup: {hero_clean_text(p.get('lineup_status'))}</span>
         </div>
-        <div><div class="small-muted">K PROJ</div><div class="big-number green">{d['projection']}</div><div class="small-muted">Exp BF {bf:.1f}</div></div>
-        <div><div class="small-muted">Line</div><div class="big-number">{line_display}</div><div class="small-muted">{d['note']}</div></div>
-        <div><div class="small-muted">Decision</div><div class="big-number green" style="font-size:32px;">{d['decision']}</div><div class="small-muted">Confidence {conf_display}</div></div>
+        <div><div class="small-muted">K PROJ</div><div class="big-number green">{d['projection']}</div><div class="small-muted">BF {bf:.1f}</div></div>
+        <div><div class="small-muted">Line</div><div class="big-number">{line_display}</div><div class="small-muted">Edge {edge_display}</div></div>
+        <div><div class="small-muted">Pick</div><div class="big-number green" style="font-size:31px;">{hero_clean_text(d['decision'])}</div><div class="small-muted">Conf {conf_display}</div></div>
+        <div><div class="small-muted">Range</div><div class="big-number" style="font-size:28px;">{dist['floor']} / {dist['median']} / {dist['ceiling']}</div><div class="small-muted">Floor · Median · Upside</div></div>
+      </div>
+      <div class="hr-soft"></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:start;">
+        <div>
+          <div class="small-muted"><b>Distribution</b></div>
+          {dist_html}
+          <div class="small-muted">{note}</div>
+        </div>
+        <div>
+          <span class="tier-badge {'tier-elite' if volatility == 'LOW' else 'tier-lean' if volatility == 'MEDIUM' else 'tier-risky'}">Volatility: {volatility}</span>
+          <span class="tier-badge {'tier-elite' if sharp == 'SHARP' else 'tier-lean' if sharp == 'WATCH' else 'tier-pass'}">Market: {sharp}</span>
+          <div class="small-muted" style="margin-top:7px;">{tier_note_safe}</div>
+          <div class="small-muted">Vol: {vol_note_safe}</div>
+          <div class="small-muted">Sharp: {sharp_note_safe}</div>
+        </div>
       </div>
       <div class="hr-soft"></div>
       <div class="kpi-strip" style="grid-template-columns:repeat(4,minmax(0,1fr));">
-        <div class="kpi-box"><div class="kpi-label">{put_label}</div><div class="kpi-value">{put_display}</div><div class="kpi-sub">Putaway/stuff proxy</div></div>
+        <div class="kpi-box"><div class="kpi-label">{hero_clean_text(put_label)}</div><div class="kpi-value">{put_display}</div><div class="kpi-sub">Putaway/stuff proxy</div></div>
         <div class="kpi-box"><div class="kpi-label">Pitcher K%</div><div class="kpi-value">{pk*100:.1f}%</div><div class="kpi-sub">Season/recent blend</div></div>
         <div class="kpi-box"><div class="kpi-label">Opp K%</div><div class="kpi-value">{ok*100:.1f}%</div><div class="kpi-sub">Lineup/team matchup</div></div>
         <div class="kpi-box"><div class="kpi-label">Last 10 Starts</div>{recent_html}</div>
@@ -5806,60 +6083,107 @@ def render_kproj_pitcher_card(p):
         with st.expander(f"Batter-by-batter K matchup — {p.get('pitcher')}", expanded=False):
             rows = []
             for i, r in enumerate(lineup_rows[:9], start=1):
+                k_val = r.get("K%") if r.get("K%") is not None else r.get("Raw_K_Rate")
+                if isinstance(k_val, (int, float)) and k_val <= 1:
+                    k_val = round(k_val * 100, 1)
                 rows.append({
                     "#": i,
                     "Batter": r.get("Batter") or r.get("Name") or r.get("Player") or r.get("player") or "",
-                    "K%": r.get("K%") if r.get("K%") is not None else r.get("Raw_K_Rate"),
+                    "K%": k_val,
                     "Source": r.get("K Source") or r.get("Source") or r.get("K_Note") or "",
                 })
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     else:
-        st.caption("No confirmed batter-by-batter lineup yet. This tab will improve when lineups lock.")
+        st.caption("No confirmed batter-by-batter lineup yet. This card will improve when lineups lock.")
 
 def build_kproj_table(board):
     rows = []
     for p in board or []:
         d = kproj_decision(p)
+        dist = hero_distribution(p)
+        tier, tier_score, tier_note = hero_confidence_tier(p)
+        volatility, vol_note = hero_volatility_label(p)
+        sharp, sharp_note = hero_sharp_market_signal(p)
+        edge = hero_edge(p)
         rows.append({
+            "Tier Rank": hero_tier_rank(tier),
+            "Tier": tier,
+            "Score": tier_score,
             "Pitcher": p.get("pitcher"),
             "Matchup": p.get("matchup"),
             "K PROJ": d.get("projection"),
-            "UD/Line": d.get("line"),
-            "Line Source": d.get("line_source"),
-            "Decision": d.get("decision"),
+            "Line": d.get("line"),
+            "Pick": d.get("decision"),
+            "Edge": edge,
             "Confidence %": None if d.get("confidence") is None else round(d.get("confidence") * 100, 1),
+            "Volatility": volatility,
+            "Market": sharp,
+            "Floor": dist.get("floor"),
+            "Median": dist.get("median"),
+            "Upside": dist.get("ceiling"),
+            "Over %": None if dist.get("p_over") is None else round(dist.get("p_over") * 100, 1),
+            "Under %": None if dist.get("p_under") is None else round(dist.get("p_under") * 100, 1),
+            "8+ %": round(dist.get("p_8_plus") * 100, 1),
+            "10+ %": round(dist.get("p_10_plus") * 100, 1),
+            "Line Source": d.get("line_source"),
             "Over Needs": d.get("over_needed"),
             "Pitcher K%": round((safe_float(p.get("pitcher_k"),0) or 0)*100,1),
             "Opp K%": round((safe_float(p.get("opp_k"),0) or 0)*100,1),
-            "Exp BF": p.get("expected_bf"),
+            "Exp BF": round(safe_float(p.get("expected_bf"), 0) or 0, 1),
             "Putaway/Whiff": p.get("statcast_whiff") or p.get("statcast_csw"),
             "Lineup": p.get("lineup_status"),
             "Main Engine Action": p.get("bet_action"),
+            "Why": tier_note,
+            "Vol Note": vol_note,
+            "Market Note": sharp_note,
         })
     df = pd.DataFrame(rows)
     if not df.empty:
-        df = df.sort_values(["Decision", "Confidence %", "K PROJ"], ascending=[True, False, False])
+        df = df.sort_values(["Tier Rank", "Score", "Confidence %", "K PROJ"], ascending=[True, False, False, False])
     return df
 
 def render_kproj_tab(board):
-    st.markdown('<div class="section-title-pro">K PROJ / Pure Upside Model</div>', unsafe_allow_html=True)
-    st.caption("Built to mirror the K-projection style: raw K ceiling, batter matchup, expected BF, recent Ks, and Underdog line. Display-only; main BET/LEAN/PASS engine stays unchanged.")
+    st.markdown('<div class="section-title-pro">Hero K PROJ / UPSIDE Dashboard</div>', unsafe_allow_html=True)
+    st.caption("Safe overlay: keeps the current projection, save/grade, CLV, EV, calibration, and K PROJ / UPSIDE foundation. Adds cleaner tiers, volatility, market signal, and outcome distribution.")
     if not board:
-        st.info("Click 🔄 Refresh Live Board first.")
+        st.info("Click Refresh Live Board first.")
         return
+
     df = build_kproj_table(board)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("K Proj Rows", len(df))
-    c2.metric("Over Leans", int(df["Decision"].astype(str).str.contains("OVER", regex=False).sum()) if not df.empty else 0)
-    c3.metric("Under Leans", int(df["Decision"].astype(str).str.contains("UNDER", regex=False).sum()) if not df.empty else 0)
-    c4.metric("Underdog Lines", int((df["Line Source"] == "Underdog").sum()) if not df.empty else 0)
+    playable = df[df["Tier"].isin(["ELITE", "STRONG"])] if not df.empty else df
+    risky = df[df["Tier"].isin(["RISKY", "TRAP"])] if not df.empty else df
 
-    st.subheader("Projection Board")
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.markdown('<div class="hero-board-panel">', unsafe_allow_html=True)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("All K Plays", len(df))
+    c2.metric("Elite/Strong", len(playable))
+    c3.metric("Risk/Trap", len(risky))
+    c4.metric("Over Looks", int(df["Pick"].astype(str).str.contains("OVER", regex=False).sum()) if not df.empty else 0)
+    c5.metric("Underdog Lines", int((df["Line Source"] == "Underdog").sum()) if not df.empty else 0)
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    st.subheader("Pitcher Cards")
-    priority = sorted(board, key=lambda p: ("🔥" in str(kproj_decision(p).get("decision")), safe_float(kproj_decision(p).get("confidence"), 0) or 0, kproj_upside_projection(p)), reverse=True)
-    for p in priority[:20]:
+    st.subheader("Clean Hero Board")
+    st.markdown('<div class="clean-table-note">Use Tier first, then Score, then Volatility. All players still show — nothing is hidden.</div>', unsafe_allow_html=True)
+    display_cols = [
+        "Tier", "Score", "Pitcher", "K PROJ", "Line", "Pick", "Edge", "Confidence %",
+        "Volatility", "Market", "Floor", "Median", "Upside", "Over %", "Under %", "8+ %",
+        "Lineup", "Line Source", "Why"
+    ]
+    display_cols = [c for c in display_cols if c in df.columns]
+    st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
+
+    st.subheader("Top Hero Cards")
+    priority = sorted(
+        board,
+        key=lambda p: (
+            -hero_tier_rank(hero_confidence_tier(p)[0]),
+            hero_confidence_tier(p)[1],
+            abs(hero_edge(p) or 0),
+            kproj_upside_projection(p),
+        ),
+        reverse=True
+    )
+    for p in priority[:24]:
         render_kproj_pitcher_card(p)
 
 tab_kproj, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
