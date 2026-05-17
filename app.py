@@ -21,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.20 CLEAN MULTI-PROP TABS + HERO K"
+APP_VERSION = "v11.18 HERO K UI + CONFIDENCE + DISTRIBUTION"
 
 try:
     import pytz
@@ -226,7 +226,7 @@ OPTICODDS_API_KEY = get_secret("OPTICODDS_API_KEY", "")
 # PAGE CONFIG + UI
 # =========================
 st.set_page_config(
-    page_title="MLB Prop Engine — Hero K + Multi Tabs",
+    page_title="MLB K Prop Engine — Refresh Then Save",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -6186,222 +6186,8 @@ def render_kproj_tab(board):
     for p in priority[:24]:
         render_kproj_pitcher_card(p)
 
-
-
-# =========================
-# v11.19 MULTI-PROP SEPARATE TAB OVERLAY
-# =========================
-# Safety rule: these added prop tabs DO NOT touch the K engine, K projections,
-# K grading, K learning, K calibration, CLV files, or official save logic.
-# They are separate display/projection layers. Lines remain NO LINE unless a
-# real market line is attached later by the feed/parser. No fake betting lines.
-
-def prop_no_line_note():
-    return "NO LINE — tracking only until a real live prop line is found"
-
-def prop_pick_from_projection(proj, line):
-    proj = safe_float(proj)
-    line = safe_float(line)
-    if proj is None or line is None:
-        return "NO LINE"
-    if proj > line:
-        return "OVER"
-    if proj < line:
-        return "UNDER"
-    return "PASS"
-
-def prop_edge(proj, line):
-    proj = safe_float(proj)
-    line = safe_float(line)
-    if proj is None or line is None:
-        return None
-    return round(proj - line, 2)
-
-def prop_confidence_from_edge(edge, volatility="MED"):
-    e = abs(safe_float(edge, 0) or 0)
-    vol = str(volatility or "MED").upper()
-    base = 50 + min(e * 10, 25)
-    if vol == "LOW":
-        base += 6
-    elif vol == "HIGH":
-        base -= 8
-    return int(clamp(base, 1, 99))
-
-def prop_tier_from_confidence(conf, pick, volatility="MED"):
-    if str(pick).upper() == "NO LINE":
-        return "TRACKING"
-    if str(pick).upper() == "PASS":
-        return "PASS"
-    conf = safe_float(conf, 0) or 0
-    vol = str(volatility or "MED").upper()
-    if vol == "HIGH" and conf < 78:
-        return "RISKY"
-    if conf >= 82:
-        return "ELITE"
-    if conf >= 72:
-        return "STRONG"
-    if conf >= 62:
-        return "LEAN"
-    return "PASS"
-
-def prop_line_lookup(p, market_key):
-    """Placeholder-safe line lookup.
-
-    This does not create lines. It only reads explicit real line fields if future
-    parsers attach them to the board row, for example:
-      pitching_outs_line, hits_allowed_line, walks_line, earned_runs_line.
-    """
-    field_map = {
-        "Pitching Outs": ["pitching_outs_line", "outs_line", "po_line"],
-        "Hits Allowed": ["hits_allowed_line", "ha_line"],
-        "Walks Allowed": ["walks_allowed_line", "walks_line", "bb_line"],
-        "Earned Runs": ["earned_runs_line", "er_line"],
-    }
-    for key in field_map.get(market_key, []):
-        val = safe_float(p.get(key))
-        if val is not None:
-            return val, str(p.get(f"{key}_source") or "Real Line")
-    return None, "NO LINE"
-
-def pitcher_prop_base_rows(board):
-    rows = []
-    for p in board or []:
-        pitcher = p.get("pitcher")
-        matchup = p.get("matchup")
-        bf = safe_float(p.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF
-        ppb = safe_float(p.get("ppb"), 3.9) or 3.9
-        leash = str(p.get("leash_risk") or "NORMAL")
-        lineup_status = p.get("lineup_status") or ("CONFIRMED" if p.get("lineup_locked") else "FALLBACK")
-        volatility = "HIGH" if leash in ["SHORT_RECENT_STARTS", "HIGH_PITCH_COUNT", "HIGH_RECENT_WORKLOAD"] or not p.get("lineup_locked") else "MED"
-        if ppb <= 3.75 and p.get("lineup_locked"):
-            volatility = "LOW"
-
-        # Display-only projections. These should become stronger once real
-        # prop-specific parsers and grading are connected.
-        outs_proj = round(clamp(bf * 0.72, 9, 24), 1)
-        hits_proj = round(clamp((bf * 0.235) + (0.35 if str(p.get("run_damage_risk_level") or "").upper() in ["HIGH", "EXTREME"] else 0), 2.5, 9.5), 1)
-        walks_proj = round(clamp((bf * 0.082) + (0.25 if ppb >= 4.10 else 0), 0.5, 4.8), 1)
-        er_proj = round(clamp((hits_proj * 0.34) + (walks_proj * 0.18), 0.4, 6.0), 1)
-        markets = [
-            ("Pitching Outs", outs_proj, "Starter volume + leash estimate"),
-            ("Hits Allowed", hits_proj, "Contact/run-damage estimate"),
-            ("Walks Allowed", walks_proj, "Command + pitch efficiency estimate"),
-            ("Earned Runs", er_proj, "Run prevention + traffic estimate"),
-        ]
-        for market, proj, note in markets:
-            line, source = prop_line_lookup(p, market)
-            pick = prop_pick_from_projection(proj, line)
-            edge = prop_edge(proj, line)
-            conf = prop_confidence_from_edge(edge, volatility)
-            tier = prop_tier_from_confidence(conf, pick, volatility)
-            rows.append({
-                "Tier": tier, "Pitcher": pitcher, "Matchup": matchup, "Prop": market,
-                "Projection": proj, "Line": line if line is not None else "NO LINE",
-                "Pick": pick, "Edge": edge, "Confidence": conf if line is not None else None,
-                "Volatility": volatility, "Line Source": source, "Lineup": lineup_status,
-                "K Core Kept": "YES", "Note": note if line is not None else prop_no_line_note()
-            })
-    return pd.DataFrame(rows)
-
-def batter_prop_rows(board):
-    rows = []
-    seen = set()
-    for p in board or []:
-        matchup = p.get("matchup")
-        lineup_status = p.get("lineup_status") or ("CONFIRMED" if p.get("lineup_locked") else "FALLBACK")
-        for idx, r in enumerate((p.get("lineup_rows") or [])[:9], start=1):
-            name = r.get("Batter") or r.get("Player") or r.get("Name") or r.get("name")
-            if not name:
-                continue
-            key = (normalize_name(name), matchup)
-            if key in seen:
-                continue
-            seen.add(key)
-            k_rate = safe_float(r.get("K%"), safe_float(r.get("K Rate")))
-            pa = round(clamp(4.75 - (idx - 1) * 0.13, 3.3, 4.9), 2)
-            contact_boost = 0.08 if k_rate is not None and k_rate < 20 else (-0.06 if k_rate is not None and k_rate > 28 else 0)
-            hits_proj = round(clamp(0.78 + contact_boost + (0.06 if idx <= 3 else 0), 0.35, 1.45), 2)
-            hrrbi_proj = round(clamp(hits_proj + 0.75 + (0.18 if idx <= 4 else 0), 0.8, 3.2), 2)
-            for market, proj, note in [
-                ("Batter Hits", hits_proj, "Lineup slot + contact estimate"),
-                ("H+R+RBI", hrrbi_proj, "Volume combo estimate"),
-            ]:
-                rows.append({
-                    "Tier": "TRACKING", "Batter": name, "Matchup": matchup, "Lineup Slot": idx,
-                    "Prop": market, "Projection": proj, "Line": "NO LINE", "Pick": "NO LINE",
-                    "Edge": None, "Confidence": None, "Volatility": "MED" if lineup_status == "CONFIRMED" else "HIGH",
-                    "Line Source": "NO LINE", "Lineup": lineup_status, "Note": prop_no_line_note() if lineup_status != "CONFIRMED" else note,
-                })
-    return pd.DataFrame(rows)
-
-def render_prop_dataframe(title, df, subtitle=""):
-    st.markdown(f'<div class="section-title-pro">{hero_clean_text(title)}</div>', unsafe_allow_html=True)
-    if subtitle:
-        st.caption(subtitle)
-    if df is None or df.empty:
-        st.info("No rows available yet. Refresh the live board first.")
-        return
-    cols = [c for c in ["Tier", "Pitcher", "Batter", "Matchup", "Lineup Slot", "Prop", "Projection", "Line", "Pick", "Edge", "Confidence", "Volatility", "Line Source", "Lineup", "Note"] if c in df.columns]
-    st.dataframe(df[cols], use_container_width=True, hide_index=True)
-
-def render_main_multi_prop_board(board):
-    st.markdown('<div class="section-title-pro">Main Board — All Prop Types</div>', unsafe_allow_html=True)
-    st.caption("Clean combined view. K props remain the flagship. Added props are separate and will not become bettable without real lines.")
-    if not board:
-        st.info("Click Refresh Live Board first.")
-        return
-    kdf = build_kproj_table(board)
-    if not kdf.empty:
-        kdf = kdf.rename(columns={"K PROJ": "Projection"})
-        kdf["Prop"] = "Strikeouts"
-        kdf["Pitcher"] = kdf.get("Pitcher")
-        keep = [c for c in ["Tier", "Pitcher", "Prop", "Projection", "Line", "Pick", "Edge", "Confidence %", "Volatility", "Line Source", "Lineup", "Why"] if c in kdf.columns]
-        kdf = kdf[keep].rename(columns={"Confidence %": "Confidence", "Why": "Note"})
-    pdf = pitcher_prop_base_rows(board)
-    bdf = batter_prop_rows(board)
-    combined = pd.concat([x for x in [kdf, pdf, bdf] if x is not None and not x.empty], ignore_index=True, sort=False)
-    if combined.empty:
-        st.info("No prop rows yet.")
-        return
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("All Rows", len(combined))
-    c2.metric("K Rows", int((combined["Prop"] == "Strikeouts").sum()) if "Prop" in combined else 0)
-    c3.metric("Extra Prop Rows", int((combined["Prop"] != "Strikeouts").sum()) if "Prop" in combined else 0)
-    
-    # Count real lines only for added non-K prop rows. K strikeout rows are handled by the main K engine.
-    if "Prop" in combined.columns and "Line Source" in combined.columns:
-        extra_mask = combined["Prop"].astype(str) != "Strikeouts"
-        real_extra_mask = extra_mask & (combined["Line Source"].astype(str) != "NO LINE")
-        real_extra_lines = int(real_extra_mask.sum())
-    else:
-        real_extra_lines = 0
-    c4.metric("Real Extra Lines", real_extra_lines)
-    cols = [c for c in ["Tier", "Pitcher", "Batter", "Prop", "Projection", "Line", "Pick", "Edge", "Confidence", "Volatility", "Line Source", "Lineup", "Note"] if c in combined.columns]
-    st.dataframe(combined[cols], use_container_width=True, hide_index=True)
-
-def render_pitching_outs_tab(board):
-    df = pitcher_prop_base_rows(board)
-    if not df.empty:
-        df = df[df["Prop"] == "Pitching Outs"].copy()
-    render_prop_dataframe("Pitching Outs", df, "Separate outs tab. Uses starter volume/leash projection. No fake lines are created.")
-
-def render_pitcher_props_tab(board):
-    df = pitcher_prop_base_rows(board)
-    if not df.empty:
-        df = df[df["Prop"].isin(["Hits Allowed", "Walks Allowed", "Earned Runs"])].copy()
-    render_prop_dataframe("Pitcher Props — Hits Allowed / Walks / Earned Runs", df, "Separate pitcher-prop board. These do not affect K projections or K decisions.")
-
-def render_batter_props_tab(board):
-    df = batter_prop_rows(board)
-    render_prop_dataframe("Batter Props — Hits / H+R+RBI", df, "Separate batter board. Best after confirmed lineups. No fake lines are created.")
-
-
-tab_main_multi, tab_kproj, tab_outs, tab_pitcher_props, tab_batter_props, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "MAIN BOARD",
-    "STRIKEOUTS / K UPSIDE",
-    "PITCHING OUTS",
-    "PITCHER PROPS",
-    "BATTER PROPS",
+tab_kproj, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "K PROJ / UPSIDE",
     "TOP PLAYS",
     "BEST 4 BUILDER",
     "ALL PLAYERS",
@@ -6411,20 +6197,8 @@ tab_main_multi, tab_kproj, tab_outs, tab_pitcher_props, tab_batter_props, tab1, 
     "SETTINGS"
 ])
 
-with tab_main_multi:
-    render_main_multi_prop_board(board)
-
 with tab_kproj:
     render_kproj_tab(board)
-
-with tab_outs:
-    render_pitching_outs_tab(board)
-
-with tab_pitcher_props:
-    render_pitcher_props_tab(board)
-
-with tab_batter_props:
-    render_batter_props_tab(board)
 
 with tab1:
     st.markdown('<div class="section-title-pro">Top Plays</div>', unsafe_allow_html=True)
