@@ -6075,4 +6075,4 @@ with tab6:
             save_json(LINEUP_CACHE_FILE, {})
             st.error("All logs cleared.")
 
-st.caption("Workflow: Refresh live board → inspect lines → save official before-game snapshot → after games, grade and learn.")    kee[
+st.caption("Workflow: Refresh live board → inspect lines → save official before-game snapshot → after games, grade and learn.")
