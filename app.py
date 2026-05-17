@@ -20,7 +20,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.17 K PROJ UPSIDE TAB + HARD GATE FIX"
+APP_VERSION = "v11.17 K PROJ UPSIDE TAB + HARD GATE FIX — CLEAN"
 
 try:
     import pytz
@@ -6075,4 +6075,4 @@ with tab6:
             save_json(LINEUP_CACHE_FILE, {})
             st.error("All logs cleared.")
 
-st.caption("Workflow: Refresh live board → inspect lines → save official before-game snapshot → after games, grade and learn.")
+st.caption("Workflow: Refresh live board -> inspect lines -> save official before-game snapshot -> after games, grade and learn.")
