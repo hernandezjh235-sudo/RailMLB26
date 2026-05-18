@@ -20,7 +20,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.17 K PROJ UPSIDE TAB + HARD GATE FIX — CLEAN"
+APP_VERSION = "v11.17 K PROJ UPSIDE TAB + HARD GATE FIX — EDGE UI"
 
 try:
     import pytz
@@ -5706,6 +5706,7 @@ def kproj_decision(p):
         return {
             "line": None, "line_source": line_source, "projection": proj,
             "side": "NO LINE", "confidence": None, "decision": "🚫 NO UD LINE", "over_needed": None,
+            "line_edge": None, "edge_display": "—", "edge_class": "yellow-badge",
             "note": "No Underdog/active real line found"
         }
     over_needed = required_ks_for_over(line)
@@ -5746,10 +5747,22 @@ def kproj_decision(p):
     else:
         decision = "🚫 PASS"
 
+    line_edge = round(float(proj - line), 2)
+    edge_display = f"{line_edge:+.2f} K"
+    if line_edge >= 1.5:
+        edge_class = "good-badge"
+    elif line_edge <= -1.0:
+        edge_class = "good-badge"
+    elif abs(line_edge) >= 0.75:
+        edge_class = "yellow-badge"
+    else:
+        edge_class = "red-badge"
+
     return {
         "line": line, "line_source": line_source, "projection": proj,
         "side": side, "confidence": round(conf, 3), "decision": decision,
-        "over_needed": over_needed,
+        "over_needed": over_needed, "under_max": under_max,
+        "line_edge": line_edge, "edge_display": edge_display, "edge_class": edge_class,
         "note": f"Over needs {over_needed}+ | Under wins {under_max} or fewer | Pure K tab, not bankroll gate"
     }
 
@@ -5774,12 +5787,16 @@ def render_kproj_pitcher_card(p):
     bf = safe_float(p.get("expected_bf"), 0.0) or 0.0
     line_display = "NO LINE" if d["line"] is None else f"{d['line']:.1f}"
     conf_display = "—" if d["confidence"] is None else f"{d['confidence']*100:.0f}%"
+    edge_display = d.get("edge_display", "—")
+    edge_class = d.get("edge_class", "yellow-badge")
+    needs_display = "—" if d.get("over_needed") is None else f"{d.get('over_needed')}+"
+    under_max_display = "—" if d.get("under_max") is None else f"{d.get('under_max')} or fewer"
     line_badge = "good-badge" if d["line_source"] == "Underdog" else "yellow-badge"
     lineup_badge = "good-badge" if p.get("lineup_locked") else "yellow-badge"
     recent_html = kproj_bar_html(p.get("last_10_ks"))
     st.markdown(f"""
     <div class="pick-card" style="border-color:rgba(90,100,255,.45);box-shadow:0 0 26px rgba(90,100,255,.16);">
-      <div style="display:grid;grid-template-columns:1.25fr .8fr .8fr .9fr;gap:18px;align-items:center;">
+      <div style="display:grid;grid-template-columns:1.25fr .75fr .75fr .75fr .9fr;gap:18px;align-items:center;">
         <div>
           <div class="player-name">{p.get('pitcher')}</div>
           <div class="small-muted">{p.get('matchup')} | {p.get('hand')}HP</div>
@@ -5788,7 +5805,8 @@ def render_kproj_pitcher_card(p):
           <span class="badge">K Upside: {p.get('elite_upside_score', 0)}/100</span>
         </div>
         <div><div class="small-muted">K PROJ</div><div class="big-number green">{d['projection']}</div><div class="small-muted">Exp BF {bf:.1f}</div></div>
-        <div><div class="small-muted">Line</div><div class="big-number">{line_display}</div><div class="small-muted">{d['note']}</div></div>
+        <div><div class="small-muted">Line</div><div class="big-number">{line_display}</div><div class="small-muted">Needs {needs_display}</div></div>
+        <div><div class="small-muted">Edge</div><div class="big-number green">{edge_display}</div><div class="small-muted">Under wins {under_max_display}</div></div>
         <div><div class="small-muted">Decision</div><div class="big-number green" style="font-size:32px;">{d['decision']}</div><div class="small-muted">Confidence {conf_display}</div></div>
       </div>
       <div class="hr-soft"></div>
