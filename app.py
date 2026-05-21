@@ -20,7 +20,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.17 K PROJ UPSIDE TAB + SAFETY GATES — EDGE UI"
+APP_VERSION = "v11.17 K PROJ UPSIDE TAB + SAFETY GATES + PASS DIRECTION"
 
 try:
     import pytz
@@ -5271,7 +5271,7 @@ def render_pick_card(p):
 # =========================
 st.markdown("""
 <div class="hero-panel">
-  <div class="big-title">🔥 MLB STRIKEOUT PROP ENGINE v11.10 POWER LEARNING</div>
+  <div class="big-title">🔥 MLB STRIKEOUT PROP ENGINE v11.17 SAFETY GATES + PASS DIRECTION</div>
   <div class="sub-title">Strict Win Filter + MLB-only Underdog line lock → Refresh → Save → Grade</div>
 </div>
 """, unsafe_allow_html=True)
@@ -5717,7 +5717,13 @@ def kproj_role_stability_score(p):
     notes = []
 
     role = str(p.get("role") or p.get("pitcher_role") or p.get("probable_role") or "").lower()
-    starter_flag = p.get("is_starter")
+    starter_flag = (
+        p.get("is_starter") is True
+        or p.get("pitcher_confirmed") is True
+        or p.get("starter_confirmed") is True
+        or p.get("probable_pitcher") is True
+        or p.get("probable") is True
+    )
     expected_bf = safe_float(p.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF
     exp_ip = expected_bf / 4.25
 
@@ -5770,7 +5776,13 @@ def kproj_starter_confirmation_score(p):
     score = 70.0
     notes = []
 
-    probable = p.get("probable_pitcher") or p.get("probable") or p.get("starter_confirmed")
+    probable = (
+        p.get("probable_pitcher")
+        or p.get("probable")
+        or p.get("starter_confirmed")
+        or p.get("pitcher_confirmed")
+        or p.get("is_starter")
+    )
     role = str(p.get("role") or p.get("pitcher_role") or "").lower()
     lineup_status = str(p.get("lineup_status") or "").upper()
 
@@ -5793,6 +5805,8 @@ def kproj_probable_innings_floor(p):
     """Conservative innings floor proxy from expected BF and optional recent IP fields."""
     expected_bf = safe_float(p.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF
     recent_ip = safe_float(p.get("recent_ip_avg"), None)
+    if recent_ip is None:
+        recent_ip = safe_float(p.get("recent_ip"), None)
     last_ip = safe_float(p.get("last_start_ip"), None)
 
     bf_ip = expected_bf / 4.25
