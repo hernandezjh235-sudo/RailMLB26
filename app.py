@@ -20,7 +20,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.17 K PROJ UPSIDE TAB + SAFETY GATES + PASS DIRECTION"
+APP_VERSION = "v11.17 K PROJ UPSIDE TAB + HARD GATE FIX — EDGE UI + LIGHT OFFENSE RISK"
 
 try:
     import pytz
@@ -136,6 +136,26 @@ HIGH_RECENT_RUNS_AVG = 4.5
 HIGH_SEASON_HR9 = 1.35
 HIGH_SEASON_BB9 = 3.8
 HIGH_SEASON_H9 = 9.5
+
+
+# =========================
+# v11.17 HYBRID LIGHT OFFENSE RISK LAYER
+# =========================
+# Keeps the proven HARD GATE FIX projection engine intact.
+# This layer is intentionally tiny: it adds opponent offense risk tags and only
+# nudges expected BF by at most 1.5% down / 0.5% up.
+# It should NOT suppress strong K edges the way the heavier offense build did.
+OFFENSE_PRESSURE_ENABLED_DEFAULT = True
+OFFENSE_PRESSURE_BF_MIN = 0.985
+OFFENSE_PRESSURE_BF_MAX = 1.005
+OFFENSE_PRESSURE_STRONG_OPS = 0.760
+OFFENSE_PRESSURE_GOOD_OPS = 0.735
+OFFENSE_PRESSURE_STRONG_OBP = 0.330
+OFFENSE_PRESSURE_GOOD_OBP = 0.320
+OFFENSE_PRESSURE_STRONG_SLG = 0.430
+OFFENSE_PRESSURE_GOOD_SLG = 0.410
+OFFENSE_PRESSURE_STRONG_RPG = 5.00
+OFFENSE_PRESSURE_GOOD_RPG = 4.70
 
 # =========================
 # v11.6 REPEAT MATCHUP FAMILIARITY SETTINGS
@@ -2302,6 +2322,165 @@ def pitcher_run_damage_profile(pitcher_id, recent_rows=None, statcast_profile=No
     # Keep notes compact and readable in Streamlit/debug rows.
     profile["notes"] = profile["notes"][:10]
     return profile
+
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def team_offense_pressure_profile(team_id):
+    """Opponent offense pressure for K props.
+
+    Uses MLB team season hitting stats only when available. This layer is
+    intentionally small and leash-focused: strong OPS/OBP/SLG/RPG can reduce
+    expected BF a little because traffic and long innings can shorten a start.
+    It does not change the pitcher's raw K%, batter K%, Statcast, calibration,
+    or line matching.
+    """
+    profile = {
+        "available": False,
+        "ops": None,
+        "obp": None,
+        "slg": None,
+        "avg": None,
+        "runs_per_game": None,
+        "hits_per_game": None,
+        "score": 0,
+        "label": "UNKNOWN",
+        "bf_factor": 1.0,
+        "notes": []
+    }
+    if not team_id:
+        profile["notes"].append("Opponent offense pressure unavailable: no team id")
+        return profile
+
+    def add(points, note):
+        profile["score"] += int(points)
+        if note:
+            profile["notes"].append(str(note))
+
+    try:
+        data = safe_get_json(
+            f"{MLB_BASE}/teams/{team_id}/stats",
+            params={"stats": "season", "group": "hitting"},
+            timeout=12,
+        )
+        split = get_first_stat_split(data)
+        stat = (split or {}).get("stat", {}) if split else {}
+        if not stat:
+            profile["notes"].append("Opponent offense pressure unavailable: no team stats")
+            return profile
+
+        ops = safe_float(stat.get("ops"))
+        obp = safe_float(stat.get("obp"))
+        slg = safe_float(stat.get("slg"))
+        avg = safe_float(stat.get("avg"))
+        runs = safe_float(stat.get("runs"), 0) or 0
+        hits = safe_float(stat.get("hits"), 0) or 0
+        games = safe_float(stat.get("gamesPlayed"), 0) or 0
+
+        profile["ops"] = ops
+        profile["obp"] = obp
+        profile["slg"] = slg
+        profile["avg"] = avg
+        if games > 0:
+            profile["runs_per_game"] = float(runs / games)
+            profile["hits_per_game"] = float(hits / games)
+        if any(v is not None for v in [ops, obp, slg, avg, profile.get("runs_per_game")]):
+            profile["available"] = True
+
+        if ops is not None:
+            if ops >= OFFENSE_PRESSURE_STRONG_OPS:
+                add(3, f"Strong opponent OPS {ops:.3f}")
+            elif ops >= OFFENSE_PRESSURE_GOOD_OPS:
+                add(2, f"Good opponent OPS {ops:.3f}")
+            elif ops <= 0.675:
+                add(-1, f"Weak opponent OPS {ops:.3f}")
+
+        if obp is not None:
+            if obp >= OFFENSE_PRESSURE_STRONG_OBP:
+                add(2, f"High opponent OBP {obp:.3f}")
+            elif obp >= OFFENSE_PRESSURE_GOOD_OBP:
+                add(1, f"Good opponent OBP {obp:.3f}")
+            elif obp <= 0.295:
+                add(-1, f"Low opponent OBP {obp:.3f}")
+
+        if slg is not None:
+            if slg >= OFFENSE_PRESSURE_STRONG_SLG:
+                add(2, f"High opponent SLG {slg:.3f}")
+            elif slg >= OFFENSE_PRESSURE_GOOD_SLG:
+                add(1, f"Good opponent SLG {slg:.3f}")
+            elif slg <= 0.370:
+                add(-1, f"Low opponent SLG {slg:.3f}")
+
+        rpg = profile.get("runs_per_game")
+        if rpg is not None:
+            if rpg >= OFFENSE_PRESSURE_STRONG_RPG:
+                add(2, f"High opponent RPG {rpg:.1f}")
+            elif rpg >= OFFENSE_PRESSURE_GOOD_RPG:
+                add(1, f"Good opponent RPG {rpg:.1f}")
+            elif rpg <= 4.0:
+                add(-1, f"Low opponent RPG {rpg:.1f}")
+
+        score = int(profile.get("score", 0) or 0)
+        if not profile["available"]:
+            profile["label"] = "UNKNOWN"
+            profile["bf_factor"] = 1.0
+        elif score >= 7:
+            profile["label"] = "EXTREME_PRESSURE"
+            profile["bf_factor"] = 0.995
+        elif score >= 5:
+            profile["label"] = "HIGH_PRESSURE"
+            profile["bf_factor"] = 0.990
+        elif score >= 3:
+            profile["label"] = "MILD_PRESSURE"
+            profile["bf_factor"] = 0.985
+        elif score <= -3:
+            profile["label"] = "LOW_PRESSURE"
+            profile["bf_factor"] = 1.005
+        else:
+            profile["label"] = "NEUTRAL"
+            profile["bf_factor"] = 1.0
+
+        profile["bf_factor"] = float(clamp(profile["bf_factor"], OFFENSE_PRESSURE_BF_MIN, OFFENSE_PRESSURE_BF_MAX))
+        if not profile["notes"]:
+            profile["notes"].append("Opponent offense pressure neutral")
+    except Exception as e:
+        profile["notes"].append(f"Opponent offense pressure unavailable: {e}")
+
+    profile["notes"] = profile["notes"][:8]
+    return profile
+
+
+def apply_offense_pressure_bf_factor(expected_bf, pressure_profile, enabled=True):
+    """Apply a capped offense-pressure BF nudge.
+
+    Safe design: this only touches expected BF, and only by a very small capped amount.
+    Missing data is neutral.
+    """
+    bf = safe_float(expected_bf)
+    if bf is None:
+        return expected_bf, "Offense pressure skipped: no expected BF"
+    if not enabled:
+        return bf, "Offense pressure disabled"
+    if not isinstance(pressure_profile, dict) or not pressure_profile.get("available"):
+        note = " | ".join((pressure_profile or {}).get("notes", [])[:3]) if isinstance(pressure_profile, dict) else "unavailable"
+        return bf, f"Offense pressure neutral: {note}"
+    factor = safe_float(pressure_profile.get("bf_factor"), 1.0) or 1.0
+    factor = float(clamp(factor, OFFENSE_PRESSURE_BF_MIN, OFFENSE_PRESSURE_BF_MAX))
+    new_bf = float(clamp(bf * factor, 12, 31))
+    label = pressure_profile.get("label", "UNKNOWN")
+    stats = []
+    if pressure_profile.get("ops") is not None:
+        stats.append(f"OPS {pressure_profile.get('ops'):.3f}")
+    if pressure_profile.get("obp") is not None:
+        stats.append(f"OBP {pressure_profile.get('obp'):.3f}")
+    if pressure_profile.get("slg") is not None:
+        stats.append(f"SLG {pressure_profile.get('slg'):.3f}")
+    if pressure_profile.get("runs_per_game") is not None:
+        stats.append(f"R/G {pressure_profile.get('runs_per_game'):.1f}")
+    note = f"Offense pressure {label} x{factor:.3f}"
+    if stats:
+        note += " (" + ", ".join(stats[:4]) + ")"
+    return new_bf, note
 
 
 
@@ -4485,6 +4664,30 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         game_script_risk = {"label": "UNKNOWN", "factor": 1.0, "score": 0, "notes": f"Game-script risk skipped: {_gs_e}"}
         game_script_note = game_script_risk.get("notes")
 
+    # v11.17 Hybrid: LIGHT offense-risk layer from the offensive build.
+    # This keeps the HARD GATE FIX engine as the base and only adds a tiny BF nudge
+    # plus warning labels. It does NOT change raw pitcher K%, batter K%, Statcast,
+    # pitch-type factors, calibration, line matching, or K PROJ / Upside math.
+    try:
+        offense_pressure_profile = team_offense_pressure_profile(row.get("opp_team_id"))
+        pressured_bf, offense_pressure_note = apply_offense_pressure_bf_factor(
+            leash.get("expected_bf"),
+            offense_pressure_profile,
+            enabled=OFFENSE_PRESSURE_ENABLED_DEFAULT,
+        )
+        leash["expected_bf"] = pressured_bf
+        leash["offense_pressure_label"] = offense_pressure_profile.get("label", "UNKNOWN")
+        leash["offense_pressure_score"] = offense_pressure_profile.get("score", 0)
+        leash["offense_pressure_bf_factor"] = offense_pressure_profile.get("bf_factor", 1.0)
+        leash["offense_pressure_note"] = offense_pressure_note
+    except Exception as _off_e:
+        offense_pressure_profile = {"available": False, "label": "UNKNOWN", "score": 0, "bf_factor": 1.0, "notes": [str(_off_e)]}
+        offense_pressure_note = f"Offense pressure skipped: {_off_e}"
+        leash["offense_pressure_label"] = "UNKNOWN"
+        leash["offense_pressure_score"] = 0
+        leash["offense_pressure_bf_factor"] = 1.0
+        leash["offense_pressure_note"] = offense_pressure_note
+
     # v11.9 manager hook / TTTO volume upgrade. Applied after base leash and
     # game-script risk, before bullpen factor, so final BF still respects bullpen context.
     try:
@@ -4861,6 +5064,9 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
             rr["Bullpen Fatigue Note"] = bullpen_note
             rr["Game Script Risk"] = game_script_risk.get("label", "UNKNOWN") if "game_script_risk" in locals() else "UNKNOWN"
             rr["Game Script Note"] = game_script_note if "game_script_note" in locals() else ""
+            rr["Offense Pressure"] = leash.get("offense_pressure_label")
+            rr["Offense Pressure Factor"] = round(safe_float(leash.get("offense_pressure_bf_factor"), 1.0), 3)
+            rr["Offense Pressure Note"] = leash.get("offense_pressure_note")
             rr["Manager Hook"] = leash.get("manager_hook_status")
             rr["Manager Hook Note"] = leash.get("manager_hook_note")
             rr["Repeat Matchup"] = repeat_matchup_profile.get("label", "NEUTRAL") if "repeat_matchup_profile" in locals() else "NEUTRAL"
@@ -4934,6 +5140,11 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "bullpen_note": bullpen_note,
         "game_script_risk": game_script_risk,
         "game_script_note": game_script_note,
+        "offense_pressure_label": leash.get("offense_pressure_label"),
+        "offense_pressure_score": leash.get("offense_pressure_score"),
+        "offense_pressure_bf_factor": round(safe_float(leash.get("offense_pressure_bf_factor"), 1.0), 3),
+        "offense_pressure_note": leash.get("offense_pressure_note"),
+        "offense_pressure_profile": offense_pressure_profile if "offense_pressure_profile" in locals() else {},
         "run_damage_risk_level": pitcher_damage_profile.get("risk_level", "UNKNOWN") if isinstance(pitcher_damage_profile, dict) else "UNKNOWN",
         "run_damage_score": pitcher_damage_profile.get("risk_score") if isinstance(pitcher_damage_profile, dict) else None,
         "run_damage_bf_factor": pitcher_damage_profile.get("bf_factor") if isinstance(pitcher_damage_profile, dict) else None,
@@ -5271,7 +5482,7 @@ def render_pick_card(p):
 # =========================
 st.markdown("""
 <div class="hero-panel">
-  <div class="big-title">🔥 MLB STRIKEOUT PROP ENGINE v11.17 SAFETY GATES + PASS DIRECTION</div>
+  <div class="big-title">🔥 MLB STRIKEOUT PROP ENGINE v11.10 POWER LEARNING</div>
   <div class="sub-title">Strict Win Filter + MLB-only Underdog line lock → Refresh → Save → Grade</div>
 </div>
 """, unsafe_allow_html=True)
@@ -5455,6 +5666,12 @@ def best4_rejection_reasons(p):
     ])
     if best4_is_risky_text(risk_text):
         reasons.append("Risk flag present")
+    off_label = str(p.get("offense_pressure_label") or "").upper()
+    off_factor = safe_float(p.get("offense_pressure_bf_factor"), 1.0) or 1.0
+    # Do not block strong plays automatically; only warn/rank down if pressure is real and edge is small.
+    if off_label in ["HIGH_PRESSURE", "EXTREME_PRESSURE"] and off_factor < 0.995 and abs_edge < 1.15:
+        reasons.append("offense pressure warning + small edge")
+
     return reasons
 
 def best4_hit_rate_score(p):
@@ -5699,328 +5916,71 @@ def kproj_upside_projection(p):
 
     return round(float(clamp(proj, 0.0, 15.0)), 2)
 
-# =========================
-# v11.17+ SAFETY GATES — decision/risk only
-# Keeps K projection math untouched. Tightens official picks.
-# =========================
-KPROJ_MIN_OFFICIAL_GAP_OVER = 1.00
-KPROJ_MIN_OFFICIAL_GAP_UNDER = 1.25
-KPROJ_MIN_LEAN_GAP_OVER = 0.55
-KPROJ_MIN_LEAN_GAP_UNDER = 0.85
-KPROJ_MIN_OFFICIAL_HIT_RATE = 0.62
-KPROJ_MIN_LEAN_HIT_RATE = 0.56
-
-
-def kproj_role_stability_score(p):
-    """0-100 role stability score. Used only for decision gating, not K projection."""
-    score = 72.0
-    notes = []
-
-    role = str(p.get("role") or p.get("pitcher_role") or p.get("probable_role") or "").lower()
-    starter_flag = (
-        p.get("is_starter") is True
-        or p.get("pitcher_confirmed") is True
-        or p.get("starter_confirmed") is True
-        or p.get("probable_pitcher") is True
-        or p.get("probable") is True
-    )
-    expected_bf = safe_float(p.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF
-    exp_ip = expected_bf / 4.25
-
-    if starter_flag is True or "starter" in role:
-        score += 12
-        notes.append("starter role")
-    elif "opener" in role or "bulk" in role or "reliever" in role:
-        score -= 22
-        notes.append("opener/bulk/relief risk")
-    else:
-        score -= 6
-        notes.append("role not fully confirmed")
-
-    lineup_status = str(p.get("lineup_status") or "").upper()
-    if "CONFIRMED" in lineup_status or "TRUE" in lineup_status:
-        score += 8
-        notes.append("true lineup")
-    elif "FALLBACK" in lineup_status:
-        score -= 8
-        notes.append("fallback lineup")
-
-    leash = str(p.get("leash_risk") or "").upper()
-    if leash in ["SHORT_RECENT_STARTS", "HIGH_PITCH_COUNT", "HIGH_RECENT_WORKLOAD"]:
-        score -= 14
-        notes.append(f"leash {leash}")
-
-    rd = str(p.get("run_damage_risk_level") or "").upper()
-    if rd == "EXTREME":
-        score -= 12
-        notes.append("extreme run damage")
-    elif rd == "HIGH":
-        score -= 8
-        notes.append("high run damage")
-
-    if expected_bf < 16:
-        score -= 18
-        notes.append("low BF floor")
-    elif expected_bf < 19:
-        score -= 9
-        notes.append("medium BF floor")
-    elif expected_bf >= 22:
-        score += 5
-        notes.append("strong BF floor")
-
-    return int(clamp(score, 0, 100)), "; ".join(notes), round(exp_ip, 2)
-
-
-def kproj_starter_confirmation_score(p):
-    """0-100 confidence that pitcher role/start context is stable."""
-    score = 70.0
-    notes = []
-
-    probable = (
-        p.get("probable_pitcher")
-        or p.get("probable")
-        or p.get("starter_confirmed")
-        or p.get("pitcher_confirmed")
-        or p.get("is_starter")
-    )
-    role = str(p.get("role") or p.get("pitcher_role") or "").lower()
-    lineup_status = str(p.get("lineup_status") or "").upper()
-
-    if probable is True or "starter" in role:
-        score += 18
-        notes.append("starter/probable confirmed")
-    else:
-        score -= 10
-        notes.append("starter not fully confirmed")
-
-    if "CONFIRMED" in lineup_status or "TRUE" in lineup_status:
-        score += 8
-    elif "FALLBACK" in lineup_status:
-        score -= 8
-
-    return int(clamp(score, 0, 100)), "; ".join(notes)
-
-
-def kproj_probable_innings_floor(p):
-    """Conservative innings floor proxy from expected BF and optional recent IP fields."""
-    expected_bf = safe_float(p.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF
-    recent_ip = safe_float(p.get("recent_ip_avg"), None)
-    if recent_ip is None:
-        recent_ip = safe_float(p.get("recent_ip"), None)
-    last_ip = safe_float(p.get("last_start_ip"), None)
-
-    bf_ip = expected_bf / 4.25
-    vals = [bf_ip]
-    if recent_ip is not None:
-        vals.append(recent_ip)
-    if last_ip is not None:
-        vals.append(last_ip)
-
-    floor_ip = min(vals) if vals else bf_ip
-    return round(float(clamp(floor_ip, 0.0, 8.0)), 2)
-
-
-def kproj_sim_hit_rate(proj, line, side, p):
-    """Conservative hit-rate proxy. Uses no extra dependencies and does not change projection."""
-    proj = safe_float(proj, 0) or 0
-    line = safe_float(line)
-    if line is None:
-        return None
-
-    role_score, _, _ = kproj_role_stability_score(p)
-    starter_score, _ = kproj_starter_confirmation_score(p)
-    ip_floor = kproj_probable_innings_floor(p)
-    upside = safe_float(p.get("elite_upside_score"), 0) or 0
-
-    std = 1.20
-    if role_score < 60:
-        std += 0.35
-    if starter_score < 65:
-        std += 0.25
-    if ip_floor < 4.0:
-        std += 0.30
-    if upside >= 60:
-        std += 0.15
-
-    z = (proj - line) / max(std, 0.65)
-    over_prob = 0.5 * (1 + math.erf(z / math.sqrt(2)))
-
-    side_str = str(side).upper()
-    if side_str.startswith("OVER"):
-        prob = over_prob
-    elif side_str.startswith("UNDER"):
-        prob = 1 - over_prob
-        if upside >= 60:
-            prob -= 0.04
-        if role_score < 60:
-            prob -= 0.03
-    else:
-        prob = 0.50
-
-    prob += ((role_score - 70) / 1000.0) + ((starter_score - 70) / 1200.0)
-    return round(float(clamp(prob, 0.01, 0.99)), 3)
-
-
-def kproj_confidence_tier(conf, hit_rate, gap, role_score):
-    conf = safe_float(conf, 0.50) or 0.50
-    hit_rate = safe_float(hit_rate, 0.50) or 0.50
-    gap = abs(safe_float(gap, 0) or 0)
-
-    if conf >= 0.66 and hit_rate >= 0.64 and gap >= 1.25 and role_score >= 72:
-        return "A"
-    if conf >= 0.62 and hit_rate >= 0.60 and gap >= 0.90 and role_score >= 62:
-        return "B"
-    if hit_rate >= 0.56 and gap >= 0.55:
-        return "C"
-    return "PASS"
-
-
 def kproj_decision(p):
     line, line_source = kproj_line_for_display(p)
     proj = kproj_upside_projection(p)
-
     if line is None:
         return {
             "line": None, "line_source": line_source, "projection": proj,
             "side": "NO LINE", "confidence": None, "decision": "🚫 NO UD LINE", "over_needed": None,
-            "under_max": None, "line_edge": None, "edge_display": "—", "edge_class": "yellow-badge",
-            "hit_rate": None, "tier": "NO LINE", "role_score": None, "starter_score": None,
-            "ip_floor": None, "edge_gap": None,
+            "line_edge": None, "edge_display": "—", "edge_class": "yellow-badge",
             "note": "No Underdog/active real line found"
         }
-
     over_needed = required_ks_for_over(line)
     under_max = max_ks_for_under(line)
-
-    # Half-point cash logic: over must reach the required cash number.
     diff_to_over = proj - over_needed
     diff_to_under = under_max - proj
-
     upside = safe_float(p.get("elite_upside_score"), 0.0) or 0.0
     pk = safe_float(p.get("pitcher_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
     ok = safe_float(p.get("opp_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
 
-    role_score, role_note, _ = kproj_role_stability_score(p)
-    starter_score, starter_note = kproj_starter_confirmation_score(p)
-    ip_floor = kproj_probable_innings_floor(p)
-
-    # Always keep the model's preferred direction, even if strict gates say PASS.
-    # This lets the UI show PASS — OVER / PASS — UNDER without making it an official play.
-    if diff_to_over > diff_to_under:
-        pass_direction = "OVER"
-        pass_direction_gap = diff_to_over
-    elif diff_to_under > diff_to_over:
-        pass_direction = "UNDER"
-        pass_direction_gap = diff_to_under
-    else:
-        pass_direction = "OVER" if proj >= line else "UNDER"
-        pass_direction_gap = max(diff_to_over, diff_to_under)
-
-    side = "PASS"
-    conf = 0.50
-    gap = 0.0
-
-    # Official OVER: keep v11.17 strength, but require real edge.
-    if diff_to_over >= KPROJ_MIN_OFFICIAL_GAP_OVER:
+    # Confidence is display-only for this tab.
+    if diff_to_over >= 0.75:
+        conf = clamp(0.60 + min(diff_to_over, 2.5) * 0.055 + upside / 1000.0, 0.50, 0.78)
         side = "OVER"
-        gap = diff_to_over
-        conf = clamp(0.60 + min(diff_to_over, 2.5) * 0.055 + upside / 1000.0, 0.50, 0.80)
-
-    # Official UNDER: intentionally stricter after the bad under spike day.
-    elif diff_to_under >= KPROJ_MIN_OFFICIAL_GAP_UNDER and upside < 58 and role_score >= 60:
+    elif diff_to_under >= 0.75:
+        conf = clamp(0.60 + min(diff_to_under, 2.5) * 0.045 - max(0, upside - 55) / 1200.0, 0.50, 0.76)
         side = "UNDER"
-        gap = diff_to_under
-        conf = clamp(0.60 + min(diff_to_under, 2.5) * 0.045 - max(0, upside - 45) / 1000.0, 0.50, 0.77)
-
-    # Lean-only OVER.
-    elif diff_to_over >= KPROJ_MIN_LEAN_GAP_OVER and pk >= 0.25 and ok >= 0.225:
-        side = "OVER LEAN"
-        gap = diff_to_over
-        conf = 0.56
-
-    # Lean-only UNDER. No high-upside under leans.
-    elif diff_to_under >= KPROJ_MIN_LEAN_GAP_UNDER and upside <= 45 and role_score >= 65:
-        side = "UNDER LEAN"
-        gap = diff_to_under
-        conf = 0.55
-
-    # Old near-number upside lean preserved, but only as a weak lean.
-    elif pk >= 0.27 and ok >= 0.235 and upside >= 55 and diff_to_over > 0.25:
-        side = "OVER LEAN"
-        gap = diff_to_over
-        conf = 0.55
-
-    hit_rate = kproj_sim_hit_rate(proj, line, side, p)
-    tier = kproj_confidence_tier(conf, hit_rate, gap, role_score)
-    reasons = []
-
-    if side in ["OVER", "UNDER"] and hit_rate is not None and hit_rate < KPROJ_MIN_OFFICIAL_HIT_RATE:
-        side = f"{side} LEAN"
-        reasons.append("downgraded: hit-rate below official gate")
-
-    if "UNDER" in side and upside >= 58:
-        side = "PASS"
-        reasons.append("blocked under: high K upside/volatility")
-
-    if side == "OVER" and (role_score < 58 or starter_score < 58 or ip_floor < 3.7):
-        side = "OVER LEAN"
-        reasons.append("downgraded: role/IP floor risk")
-
-    if side == "UNDER" and role_score < 70:
-        side = "UNDER LEAN"
-        reasons.append("downgraded: under needs stable role")
-
-    # Re-score tier after possible downgrade.
-    tier = kproj_confidence_tier(conf, hit_rate, gap, role_score)
+    else:
+        # Near key number: use matchup side, otherwise pass.
+        if pk >= 0.27 and ok >= 0.235 and upside >= 55:
+            side = "OVER LEAN"
+            conf = 0.56
+        elif upside <= 35 and diff_to_under > 0.20:
+            side = "UNDER LEAN"
+            conf = 0.55
+        else:
+            side = "PASS"
+            conf = 0.50
 
     if side == "OVER":
-        decision = "🔥 OVER" if tier in ["A", "B"] else "⚠️ OVER LEAN"
+        decision = "🔥 OVER" if conf >= 0.64 else "⚠️ OVER LEAN"
     elif side == "UNDER":
-        decision = "🔥 UNDER" if tier in ["A", "B"] else "⚠️ UNDER LEAN"
+        decision = "🔥 UNDER" if conf >= 0.66 else "⚠️ UNDER LEAN"
     elif side == "OVER LEAN":
         decision = "⚠️ OVER LEAN"
     elif side == "UNDER LEAN":
         decision = "⚠️ UNDER LEAN"
     else:
-        decision = f"🚫 PASS — {pass_direction}"
+        decision = "🚫 PASS"
 
     line_edge = round(float(proj - line), 2)
     edge_display = f"{line_edge:+.2f} K"
-    if line_edge >= 1.5 or line_edge <= -1.25:
+    if line_edge >= 1.5:
+        edge_class = "good-badge"
+    elif line_edge <= -1.0:
         edge_class = "good-badge"
     elif abs(line_edge) >= 0.75:
         edge_class = "yellow-badge"
     else:
         edge_class = "red-badge"
 
-    note_parts = [
-        f"Over needs {over_needed}+",
-        f"Under wins {under_max} or fewer",
-        f"gap={round(gap, 2)}",
-        f"model lean={pass_direction}",
-        f"lean gap={round(pass_direction_gap, 2)}",
-        f"hit={None if hit_rate is None else round(hit_rate * 100, 1)}%",
-        f"tier={tier}",
-        f"role={role_score}/100",
-        f"starter={starter_score}/100",
-        f"IP floor={ip_floor}",
-    ]
-    if role_note:
-        note_parts.append(role_note)
-    if starter_note:
-        note_parts.append(starter_note)
-    if reasons:
-        note_parts.extend(reasons)
-
     return {
         "line": line, "line_source": line_source, "projection": proj,
-        "side": side, "lean_side": pass_direction, "lean_gap": round(pass_direction_gap, 2),
-        "confidence": round(conf, 3), "decision": decision,
+        "side": side, "confidence": round(conf, 3), "decision": decision,
         "over_needed": over_needed, "under_max": under_max,
         "line_edge": line_edge, "edge_display": edge_display, "edge_class": edge_class,
-        "hit_rate": hit_rate, "tier": tier, "role_score": role_score,
-        "starter_score": starter_score, "ip_floor": ip_floor, "edge_gap": round(gap, 2),
-        "note": " | ".join(str(x) for x in note_parts if x)
+        "note": f"Over needs {over_needed}+ | Under wins {under_max} or fewer | Pure K tab, not bankroll gate"
     }
 
 def kproj_bar_html(vals):
@@ -6102,8 +6062,6 @@ def build_kproj_table(board):
             "UD/Line": d.get("line"),
             "Line Source": d.get("line_source"),
             "Decision": d.get("decision"),
-            "Model Lean": d.get("lean_side"),
-            "Lean Gap": d.get("lean_gap"),
             "Confidence %": None if d.get("confidence") is None else round(d.get("confidence") * 100, 1),
             "Over Needs": d.get("over_needed"),
             "Pitcher K%": round((safe_float(p.get("pitcher_k"),0) or 0)*100,1),
@@ -6111,12 +6069,6 @@ def build_kproj_table(board):
             "Exp BF": p.get("expected_bf"),
             "Putaway/Whiff": p.get("statcast_whiff") or p.get("statcast_csw"),
             "Lineup": p.get("lineup_status"),
-            "Hit Rate %": None if d.get("hit_rate") is None else round(d.get("hit_rate") * 100, 1),
-            "Tier": d.get("tier"),
-            "Role Score": d.get("role_score"),
-            "Starter Score": d.get("starter_score"),
-            "IP Floor": d.get("ip_floor"),
-            "Edge Gap": d.get("edge_gap"),
             "Main Engine Action": p.get("bet_action"),
         })
     df = pd.DataFrame(rows)
