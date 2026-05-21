@@ -20,7 +20,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.17 K PROJ UPSIDE TAB + HARD GATE FIX — EDGE UI + LIGHT OFFENSE RISK"
+APP_VERSION = "v11.17 K PROJ UPSIDE TAB + HARD GATE FIX — EDGE UI + LIGHT OFFENSE RISK — BEST4 FIX"
 
 try:
     import pytz
@@ -5635,6 +5635,17 @@ def best4_is_risky_text(*vals):
     return any(x in t for x in bad)
 
 def best4_rejection_reasons(p):
+    # BEST4 FIX: define abs_edge before any rejection checks use it.
+    try:
+        _line_val = safe_float(p.get("underdog_line"), safe_float(p.get("line")))
+        _proj_val = safe_float(
+            p.get("projection"),
+            safe_float(p.get("k_proj"), safe_float(p.get("K PROJ")))
+        )
+        abs_edge = abs((_proj_val or 0.0) - _line_val) if _line_val is not None and _proj_val is not None else 0.0
+    except Exception:
+        abs_edge = 0.0
+
     reasons = []
     prob = _best4_num(p.get("fair_probability"), 0.0)
     edge = best4_abs_edge(p)
