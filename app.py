@@ -6166,46 +6166,131 @@ def kproj_probable_innings_floor(p):
     return round(float(clamp(floor_ip, 0.0, 8.0)), 2)
 
 
-def kproj_sim_hit_rate(proj, line, side, p):
-    """Conservative hit-rate proxy. Uses no extra dependencies and does not change projection."""
-    proj = safe_float(proj, 0) or 0
-    line = safe_float(line)
-    if line is None:
-        return None
+def kproj_distribution_profile(proj, line, p):
+    """K UPSIDE TAB ONLY: true distribution layer.
 
+    Returns floor / median / ceiling plus OVER and UNDER probabilities.
+    This is not a forced over boost. It widens outcomes for volatile strikeout
+    arms and makes UNDER confidence softer when the pitcher has real ceiling.
+    """
+    mean = safe_float(proj, 0.0) or 0.0
+    line = safe_float(line)
+    pk = safe_float(p.get("pitcher_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
+    ok = safe_float(p.get("opp_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
+    bf = safe_float(p.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF
+    p90 = safe_float(p.get("p90"))
+    upside = safe_float(p.get("elite_upside_score"), 0.0) or 0.0
     role_score, _, _ = kproj_role_stability_score(p)
     starter_score, _ = kproj_starter_confirmation_score(p)
     ip_floor = kproj_probable_innings_floor(p)
-    upside = safe_float(p.get("elite_upside_score"), 0) or 0
+    ceiling_risk, _ = kproj_ceiling_risk_score(p)
 
-    std = 1.20
-    if role_score < 60:
-        std += 0.35
-    if starter_score < 65:
+    recent_vals = [safe_float(x, None) for x in (p.get("last_10_ks") or [])[:10]]
+    recent_vals = [float(x) for x in recent_vals if x is not None]
+    recent_sd = 0.0
+    recent_max = 0.0
+    recent_avg = 0.0
+    if recent_vals:
+        recent_avg = float(np.mean(recent_vals))
+        recent_sd = float(np.std(recent_vals)) if len(recent_vals) >= 3 else 1.15
+        recent_max = max(recent_vals)
+
+    # Base spread: strikeouts are discrete and volatile. Higher talent/ceiling
+    # expands the upside tail; poor role stability expands uncertainty both ways.
+    std = 1.05
+    std += min(0.75, max(0.0, recent_sd * 0.22))
+    if pk >= 0.285:
         std += 0.25
-    if ip_floor < 4.0:
-        std += 0.30
-    if upside >= 60:
+    elif pk >= 0.255:
         std += 0.15
+    if ok >= 0.240:
+        std += 0.10
+    if ceiling_risk >= 70:
+        std += 0.28
+    elif ceiling_risk >= 55:
+        std += 0.16
+    if upside >= 70:
+        std += 0.20
+    elif upside >= 55:
+        std += 0.12
+    if bf >= 26:
+        std += 0.10
+    if role_score < 60:
+        std += 0.25
+    if starter_score < 60:
+        std += 0.18
+    if ip_floor is not None and ip_floor < 4.0:
+        std += 0.18
 
-    z = (proj - line) / max(std, 0.65)
-    over_prob = 0.5 * (1 + math.erf(z / math.sqrt(2)))
+    # Keep probabilities realistic; do not allow fake 99% unless the edge is enormous.
+    std = float(clamp(std, 0.95, 2.45))
 
+    # Distribution anchors. p90 from the main simulation can inform the ceiling,
+    # but cannot drag the current median around.
+    floor = max(0.0, mean - 1.15 * std)
+    median = mean
+    ceiling = mean + 1.25 * std
+    if p90 is not None and p90 > 0:
+        ceiling = max(ceiling, (mean * 0.70) + (p90 * 0.30))
+    if recent_max >= 8:
+        ceiling = max(ceiling, mean + 1.45)
+    elif recent_max >= 6:
+        ceiling = max(ceiling, mean + 0.95)
+
+    # Normal CDF approximation with continuity correction for strikeout counts.
+    def norm_cdf(x):
+        return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+    if line is None:
+        over_prob = None
+        under_prob = None
+    else:
+        over_needed = required_ks_for_over(line)
+        # P(K >= over_needed) ~= P(X > over_needed - 0.5)
+        threshold = over_needed - 0.5
+        z = (threshold - mean) / max(std, 0.50)
+        over_prob = 1 - norm_cdf(z)
+        under_prob = 1 - over_prob
+
+        # Soft UNDER protection: high-ceiling pitchers should rarely show extreme
+        # UNDER confidence unless the projection gap is very large.
+        if mean < line and ceiling_risk >= 60:
+            under_prob = min(under_prob, 0.68 if ceiling_risk >= 75 else 0.72)
+            over_prob = 1 - under_prob
+
+        # Fallback lineups are uncertain; pull extreme probabilities slightly toward 50.
+        lineup_status = str(p.get("lineup_status") or "").upper()
+        if "FALLBACK" in lineup_status:
+            over_prob = 0.50 + ((over_prob - 0.50) * 0.88)
+            under_prob = 1 - over_prob
+
+        over_prob = float(clamp(over_prob, 0.03, 0.97))
+        under_prob = float(clamp(under_prob, 0.03, 0.97))
+
+    return {
+        "floor": round(float(floor), 2),
+        "median": round(float(median), 2),
+        "ceiling": round(float(ceiling), 2),
+        "volatility": round(float(std), 2),
+        "recent_avg": round(float(recent_avg), 2),
+        "recent_max": round(float(recent_max), 2),
+        "over_prob": None if over_prob is None else round(float(over_prob), 3),
+        "under_prob": None if under_prob is None else round(float(under_prob), 3),
+    }
+
+
+def kproj_sim_hit_rate(proj, line, side, p):
+    """Distribution-aware hit-rate proxy for the K PROJ / Upside tab."""
+    line = safe_float(line)
+    if line is None:
+        return None
+    dist = kproj_distribution_profile(proj, line, p)
     side_str = str(side).upper()
     if side_str.startswith("OVER"):
-        prob = over_prob
-    elif side_str.startswith("UNDER"):
-        prob = 1 - over_prob
-        if upside >= 60:
-            prob -= 0.04
-        if role_score < 60:
-            prob -= 0.03
-    else:
-        prob = 0.50
-
-    prob += ((role_score - 70) / 1000.0) + ((starter_score - 70) / 1200.0)
-    return round(float(clamp(prob, 0.01, 0.99)), 3)
-
+        return dist.get("over_prob")
+    if side_str.startswith("UNDER"):
+        return dist.get("under_prob")
+    return 0.50
 
 def kproj_confidence_tier(conf, hit_rate, gap, role_score):
     conf = safe_float(conf, 0.50) or 0.50
@@ -6400,6 +6485,7 @@ def kproj_bar_html(vals):
 
 def render_kproj_pitcher_card(p):
     d = kproj_decision(p)
+    dist = kproj_distribution_profile(d.get("projection"), d.get("line"), p)
     putaway, put_label = kproj_putaway_value(p)
     put_display = "—" if putaway is None else f"{putaway:.1f}%"
     pk = safe_float(p.get("pitcher_k"), 0.0) or 0.0
@@ -6407,6 +6493,7 @@ def render_kproj_pitcher_card(p):
     bf = safe_float(p.get("expected_bf"), 0.0) or 0.0
     line_display = "NO LINE" if d["line"] is None else f"{d['line']:.1f}"
     conf_display = "—" if d["confidence"] is None else f"{d['confidence']*100:.0f}%"
+    dist_display = f"F {dist.get('floor')} | M {dist.get('median')} | C {dist.get('ceiling')}"
     edge_display = d.get("edge_display", "—")
     edge_class = d.get("edge_class", "yellow-badge")
     needs_display = "—" if d.get("over_needed") is None else f"{d.get('over_needed')}+"
@@ -6430,10 +6517,11 @@ def render_kproj_pitcher_card(p):
         <div><div class="small-muted">Decision</div><div class="big-number green" style="font-size:32px;">{d['decision']}</div><div class="small-muted">Confidence {conf_display}</div></div>
       </div>
       <div class="hr-soft"></div>
-      <div class="kpi-strip" style="grid-template-columns:repeat(4,minmax(0,1fr));">
+      <div class="kpi-strip" style="grid-template-columns:repeat(5,minmax(0,1fr));">
         <div class="kpi-box"><div class="kpi-label">{put_label}</div><div class="kpi-value">{put_display}</div><div class="kpi-sub">Putaway/stuff proxy</div></div>
         <div class="kpi-box"><div class="kpi-label">Pitcher K%</div><div class="kpi-value">{pk*100:.1f}%</div><div class="kpi-sub">Season/recent blend</div></div>
         <div class="kpi-box"><div class="kpi-label">Opp K%</div><div class="kpi-value">{ok*100:.1f}%</div><div class="kpi-sub">Lineup/team matchup</div></div>
+        <div class="kpi-box"><div class="kpi-label">Distribution</div><div class="kpi-value" style="font-size:17px;">{dist_display}</div><div class="kpi-sub">Floor | Median | Ceiling</div></div>
         <div class="kpi-box"><div class="kpi-label">Last 10 Starts</div>{recent_html}</div>
       </div>
     </div>
@@ -6458,10 +6546,17 @@ def build_kproj_table(board):
     rows = []
     for p in board or []:
         d = kproj_decision(p)
+        dist = kproj_distribution_profile(d.get("projection"), d.get("line"), p)
         rows.append({
             "Pitcher": p.get("pitcher"),
             "Matchup": p.get("matchup"),
             "K PROJ": d.get("projection"),
+            "Floor": dist.get("floor"),
+            "Median": dist.get("median"),
+            "Ceiling": dist.get("ceiling"),
+            "Volatility": dist.get("volatility"),
+            "Over Sim %": None if dist.get("over_prob") is None else round(dist.get("over_prob") * 100, 1),
+            "Under Sim %": None if dist.get("under_prob") is None else round(dist.get("under_prob") * 100, 1),
             "UD/Line": d.get("line"),
             "Line Source": d.get("line_source"),
             "Decision": d.get("decision"),
@@ -6489,7 +6584,7 @@ def build_kproj_table(board):
 
 def render_kproj_tab(board):
     st.markdown('<div class="section-title-pro">K PROJ / Pure Upside Model</div>', unsafe_allow_html=True)
-    st.caption("Built to mirror the K-projection style: raw K ceiling, batter matchup, expected BF, recent Ks, and Underdog line. Display-only; main BET/LEAN/PASS engine stays unchanged.")
+    st.caption("K Upside now uses true-talent projection + distribution simulation: floor, median, ceiling, volatility, recent Ks, BF, matchup, and Underdog line. Main engine stays separate.")
     if not board:
         st.info("Click 🔄 Refresh Live Board first.")
         return
