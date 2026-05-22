@@ -6222,13 +6222,23 @@ def kproj_confidence_tier(conf, hit_rate, gap, role_score):
 
 
 def kproj_decision(p):
+    """
+    Projection-first decision logic for the K PROJ / Upside tab.
+
+    Philosophy:
+    1) Build the true K projection first.
+    2) Use sim probability second.
+    3) PASS only when data/role is bad or edge is truly too thin.
+    4) Always keep directional output: PASS — OVER / PASS — UNDER.
+    """
     line, line_source = kproj_line_for_display(p)
     proj = kproj_upside_projection(p)
 
     if line is None:
         return {
             "line": None, "line_source": line_source, "projection": proj,
-            "side": "NO LINE", "confidence": None, "decision": "🚫 NO UD LINE", "over_needed": None,
+            "side": "NO LINE", "lean_side": "NO LINE", "lean_gap": None,
+            "confidence": None, "decision": "🚫 NO UD LINE", "over_needed": None,
             "under_max": None, "line_edge": None, "edge_display": "—", "edge_class": "yellow-badge",
             "hit_rate": None, "tier": "NO LINE", "role_score": None, "starter_score": None,
             "ip_floor": None, "edge_gap": None,
@@ -6238,9 +6248,15 @@ def kproj_decision(p):
     over_needed = required_ks_for_over(line)
     under_max = max_ks_for_under(line)
 
-    # Half-point cash logic: over must reach the required cash number.
-    diff_to_over = proj - over_needed
-    diff_to_under = under_max - proj
+    # True line edge: this drives model direction. Cash-number logic is still displayed.
+    line_edge = round(float(proj - line), 2)
+    abs_edge = abs(line_edge)
+    model_side = "OVER" if proj >= line else "UNDER"
+
+    # Cash-number edge: useful for explaining half-point lines.
+    diff_to_over_cash = proj - over_needed
+    diff_to_under_cash = under_max - proj
+    pass_direction_gap = line_edge if model_side == "OVER" else -line_edge
 
     upside = safe_float(p.get("elite_upside_score"), 0.0) or 0.0
     pk = safe_float(p.get("pitcher_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
@@ -6249,99 +6265,82 @@ def kproj_decision(p):
     role_score, role_note, _ = kproj_role_stability_score(p)
     starter_score, starter_note = kproj_starter_confirmation_score(p)
     ip_floor = kproj_probable_innings_floor(p)
+    ceiling_risk, ceiling_note = kproj_ceiling_risk_score(p)
+    true_floor, true_floor_note = kproj_true_projection_floor(p)
 
-    # Always keep the model's preferred direction, even if strict gates say PASS.
-    # This lets the UI show PASS — OVER / PASS — UNDER without making it an official play.
-    if diff_to_over > diff_to_under:
-        pass_direction = "OVER"
-        pass_direction_gap = diff_to_over
-    elif diff_to_under > diff_to_over:
-        pass_direction = "UNDER"
-        pass_direction_gap = diff_to_under
-    else:
-        pass_direction = "OVER" if proj >= line else "UNDER"
-        pass_direction_gap = max(diff_to_over, diff_to_under)
+    # Sim probability comes after projection direction.
+    hit_rate = kproj_sim_hit_rate(proj, line, model_side, p)
+    hit_rate_val = safe_float(hit_rate, 0.50) or 0.50
+
+    # PASS should mean data/role problem or no meaningful edge, not fear of a good projection.
+    bad_data = False
+    bad_data_reasons = []
+    if role_score < 45:
+        bad_data = True; bad_data_reasons.append(f"bad role score {role_score}/100")
+    if starter_score < 45:
+        bad_data = True; bad_data_reasons.append(f"bad starter score {starter_score}/100")
+    if ip_floor is not None and ip_floor < 2.6:
+        bad_data = True; bad_data_reasons.append(f"bad IP floor {ip_floor}")
 
     side = "PASS"
-    conf = 0.50
-    gap = 0.0
-
-    # Official OVER: keep v11.17 strength, but require real edge.
-    if diff_to_over >= KPROJ_MIN_OFFICIAL_GAP_OVER:
-        side = "OVER"
-        gap = diff_to_over
-        conf = clamp(0.60 + min(diff_to_over, 2.5) * 0.055 + upside / 1000.0, 0.50, 0.80)
-
-    # Official UNDER: intentionally stricter after the bad under spike day.
-    elif diff_to_under >= KPROJ_MIN_OFFICIAL_GAP_UNDER and upside < 50 and role_score >= 70:
-        side = "UNDER"
-        gap = diff_to_under
-        conf = clamp(0.60 + min(diff_to_under, 2.5) * 0.045 - max(0, upside - 45) / 1000.0, 0.50, 0.77)
-
-    # Lean-only OVER.
-    elif diff_to_over >= KPROJ_MIN_LEAN_GAP_OVER and pk >= 0.25 and ok >= 0.225:
-        side = "OVER LEAN"
-        gap = diff_to_over
-        conf = 0.56
-
-    # Lean-only UNDER. No high-upside under leans.
-    elif diff_to_under >= KPROJ_MIN_LEAN_GAP_UNDER and upside <= 38 and role_score >= 70:
-        side = "UNDER LEAN"
-        gap = diff_to_under
-        conf = 0.55
-
-    # Old near-number upside lean preserved, but only as a weak lean.
-    elif pk >= 0.27 and ok >= 0.235 and upside >= 55 and diff_to_over > 0.25:
-        side = "OVER LEAN"
-        gap = diff_to_over
-        conf = 0.55
-
-    hit_rate = kproj_sim_hit_rate(proj, line, side, p)
-    tier = kproj_confidence_tier(conf, hit_rate, gap, role_score)
+    conf = hit_rate_val
+    gap = abs_edge
     reasons = []
 
-    if side in ["OVER", "UNDER"] and hit_rate is not None and hit_rate < KPROJ_MIN_OFFICIAL_HIT_RATE:
-        side = f"{side} LEAN"
-        reasons.append("downgraded: hit-rate below official gate")
-
-    ceiling_risk, ceiling_note = kproj_ceiling_risk_score(p)
-
-    # Hard under block: if a pitcher has real strikeout ceiling, do not trust UNDER.
-    if "UNDER" in side and (upside >= 50 or ceiling_risk >= KPROJ_CEILING_RISK_BLOCK_UNDER or pk >= 0.255):
+    if bad_data:
         side = "PASS"
-        reasons.append(f"blocked under: K ceiling/talent risk {ceiling_risk}/100")
-    elif "UNDER" in side and ceiling_risk >= KPROJ_CEILING_RISK_WARN_UNDER:
-        side = "UNDER LEAN" if side == "UNDER" else side
-        reasons.append(f"downgraded under: ceiling warning {ceiling_risk}/100")
+        reasons.extend(bad_data_reasons)
+    else:
+        if model_side == "OVER":
+            # Official OVER: projection edge + sim probability. Keep it usable.
+            if abs_edge >= 0.75 and hit_rate_val >= 0.60:
+                side = "OVER"
+            elif abs_edge >= 0.30 and hit_rate_val >= 0.54:
+                side = "OVER LEAN"
+            else:
+                side = "PASS"
+                reasons.append("thin over edge / low sim probability")
 
-    # Do not make official UNDERs when the cash edge is thin.
-    if side == "UNDER" and diff_to_under < KPROJ_MIN_UNDER_EDGE_NO_CEILING:
-        side = "UNDER LEAN"
-        reasons.append(f"downgraded under: edge below {KPROJ_MIN_UNDER_EDGE_NO_CEILING:.1f} Ks")
+            # Role/IP risk downgrades but does not erase direction.
+            if side == "OVER" and (role_score < 58 or starter_score < 58 or (ip_floor is not None and ip_floor < 3.7)):
+                side = "OVER LEAN"
+                reasons.append("downgraded: role/IP floor risk")
 
-    if side == "OVER" and (role_score < 58 or starter_score < 58 or ip_floor < 3.7):
-        side = "OVER LEAN"
-        reasons.append("downgraded: role/IP floor risk")
+        else:
+            # Official UNDER is stricter because ceiling arms have been nuking unders.
+            dangerous_under = (
+                ceiling_risk >= KPROJ_CEILING_RISK_BLOCK_UNDER
+                or upside >= 55
+                or (pk >= 0.255 and ok >= 0.220)
+            )
 
-    if side == "UNDER" and role_score < 70:
-        side = "UNDER LEAN"
-        reasons.append("downgraded: under needs stable role")
+            if dangerous_under:
+                side = "PASS"
+                reasons.append(f"blocked under: ceiling/talent risk {ceiling_risk}/100")
+            elif abs_edge >= 1.25 and hit_rate_val >= 0.62 and role_score >= 62:
+                side = "UNDER"
+            elif abs_edge >= 0.45 and hit_rate_val >= 0.55:
+                side = "UNDER LEAN"
+            else:
+                side = "PASS"
+                reasons.append("thin under edge / low sim probability")
 
-    # Re-score tier after possible downgrade.
+    # Tier is informational. It should not override a valid projection+sim pick.
     tier = kproj_confidence_tier(conf, hit_rate, gap, role_score)
+    if side in ["OVER", "UNDER"] and tier == "PASS":
+        tier = "C"
 
     if side == "OVER":
-        decision = "🔥 OVER" if tier in ["A", "B"] else "⚠️ OVER LEAN"
+        decision = "🔥 OVER" if hit_rate_val >= 0.64 and abs_edge >= 1.00 else "✅ OVER"
     elif side == "UNDER":
-        decision = "🔥 UNDER" if tier in ["A", "B"] else "⚠️ UNDER LEAN"
+        decision = "🔥 UNDER" if hit_rate_val >= 0.65 and abs_edge >= 1.50 else "✅ UNDER"
     elif side == "OVER LEAN":
         decision = "⚠️ OVER LEAN"
     elif side == "UNDER LEAN":
         decision = "⚠️ UNDER LEAN"
     else:
-        decision = f"🚫 PASS — {pass_direction}"
+        decision = f"🚫 PASS — {model_side}"
 
-    line_edge = round(float(proj - line), 2)
     edge_display = f"{line_edge:+.2f} K"
     if line_edge >= 1.5 or line_edge <= -1.25:
         edge_class = "good-badge"
@@ -6351,21 +6350,22 @@ def kproj_decision(p):
         edge_class = "red-badge"
 
     note_parts = [
+        f"Projection-first decision",
         f"Over needs {over_needed}+",
         f"Under wins {under_max} or fewer",
-        f"gap={round(gap, 2)}",
-        f"model lean={pass_direction}",
-        f"lean gap={round(pass_direction_gap, 2)}",
-        f"hit={None if hit_rate is None else round(hit_rate * 100, 1)}%",
+        f"line edge={line_edge:+.2f}",
+        f"model lean={model_side}",
+        f"hit={round(hit_rate_val * 100, 1)}%",
         f"tier={tier}",
         f"role={role_score}/100",
         f"starter={starter_score}/100",
         f"IP floor={ip_floor}",
         f"ceiling risk={ceiling_risk}/100",
+        f"cash over edge={round(diff_to_over_cash, 2)}",
+        f"cash under edge={round(diff_to_under_cash, 2)}",
     ]
     if ceiling_note:
         note_parts.append(ceiling_note)
-    true_floor, true_floor_note = kproj_true_projection_floor(p)
     if true_floor_note:
         note_parts.append(true_floor_note)
     if role_note:
@@ -6377,7 +6377,7 @@ def kproj_decision(p):
 
     return {
         "line": line, "line_source": line_source, "projection": proj,
-        "side": side, "lean_side": pass_direction, "lean_gap": round(pass_direction_gap, 2),
+        "side": side, "lean_side": model_side, "lean_gap": round(pass_direction_gap, 2),
         "confidence": round(conf, 3), "decision": decision,
         "over_needed": over_needed, "under_max": under_max,
         "line_edge": line_edge, "edge_display": edge_display, "edge_class": edge_class,
