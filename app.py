@@ -20,7 +20,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.17 K PROJ TRUE GUARD + SAFETY GATES + PASS DIRECTION"
+APP_VERSION = "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT"
 
 try:
     import pytz
@@ -5603,114 +5603,294 @@ def kproj_putaway_value(p):
         return pk * 100, "Pitcher K%"
     return None, "Unavailable"
 
-def kproj_upside_projection(p):
-    """Display K projection with True Projection Guard.
+def kproj_true_talent_baseline(p):
+    """True-talent strikeout baseline used to stop fake-low projections.
 
-    Keeps the v11.17 upside style, but prevents fake-low projections caused by
-    stacked penalties. This is meant to fix misses like starter projected 2-3 Ks
-    while carrying real 6+ K ceiling.
+    This uses pitcher K skill + opponent K opportunity + expected BF, then applies
+    only capped/lite modifiers. It is not an automatic over boost; it is a sanity
+    baseline so arms like Rodón/Strider/Cavalli do not get crushed to 1-3 Ks.
+    """
+    pk = safe_float(p.get("pitcher_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
+    ok = safe_float(p.get("opp_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
+    bf = safe_float(p.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF
+    pitch_factor = safe_float(p.get("pitch_type_factor"), 1.0) or 1.0
+    stat_whiff = safe_float(p.get("statcast_whiff"))
+    stat_csw = safe_float(p.get("statcast_csw"))
+    recent_max, recent_avg, recent_n = kproj_recent_ceiling_stats(p) if "kproj_recent_ceiling_stats" in globals() else (0,0,0)
+
+    # Pitcher talent is the anchor. Opponent K helps, but cannot erase pitcher skill.
+    matchup_rate = (pk * 0.72) + (ok * 0.28)
+    baseline = bf * matchup_rate
+
+    # Lite stuff/context nudges.
+    if pitch_factor >= 1.035:
+        baseline += 0.30
+    elif pitch_factor >= 1.015:
+        baseline += 0.15
+    elif pitch_factor <= 0.965 and pk < 0.255:
+        baseline -= 0.12
+
+    if stat_whiff is not None:
+        if stat_whiff >= 31:
+            baseline += 0.35
+        elif stat_whiff >= 28:
+            baseline += 0.20
+    elif stat_csw is not None:
+        if stat_csw >= 31:
+            baseline += 0.25
+        elif stat_csw >= 29:
+            baseline += 0.12
+
+    # Recent ceiling matters more for preventing bad UNDERS than for forcing OVERS.
+    if recent_max >= 9:
+        baseline += 0.55
+    elif recent_max >= 7:
+        baseline += 0.35
+    elif recent_max >= 6:
+        baseline += 0.18
+    if recent_avg >= 6.0:
+        baseline += 0.35
+    elif recent_avg >= 5.0:
+        baseline += 0.18
+
+    # For confirmed starters, cap negative suppression. If not stable starter, stay conservative.
+    if kproj_is_confirmed_starter_like(p):
+        baseline = max(baseline, bf * pk * KPROJ_MAX_NEGATIVE_SUPPRESSION_STARTER)
+    else:
+        baseline *= 0.88
+
+    # Prevent nonsense floors, but do not make everyone elite.
+    cap = 8.25 if pk >= 0.285 else 7.35 if pk >= 0.260 else 6.55 if pk >= 0.240 else 5.65
+    return round(float(clamp(baseline, 0.0, cap)), 2)
+
+
+def apply_elite_pitcher_floor(raw_projection, historical_k9, expected_bf):
+    """
+    K UPSIDE TAB ONLY: circuit breaker that stops established high-strikeout
+    arms from being under-projected because of short-term rolling bias,
+    tight pitch-cap assumptions, or stacked matchup penalties.
+    """
+    raw_projection = safe_float(raw_projection, 0.0) or 0.0
+    historical_k9 = safe_float(historical_k9, 0.0) or 0.0
+    expected_bf = safe_float(expected_bf, DEFAULT_BF) or DEFAULT_BF
+    if historical_k9 >= 10.0:
+        implied_floor = expected_bf * (historical_k9 / 38.0)
+        return max(raw_projection, implied_floor)
+    if historical_k9 >= 9.0:
+        implied_floor = expected_bf * (historical_k9 / 41.0)
+        return max(raw_projection, implied_floor)
+    return raw_projection
+
+
+def project_volume_and_efficiency(p_avg_bf, p_pitches_per_bf, opp_ppa, league_ppa=3.90):
+    """
+    K UPSIDE TAB ONLY: dynamic BF scaler. It slightly rewards efficient pitchers
+    facing low-patience/high-vulnerability lineups, but caps the move so it
+    cannot create unrealistic volume.
+    """
+    p_avg_bf = safe_float(p_avg_bf, DEFAULT_BF) or DEFAULT_BF
+    p_pitches_per_bf = safe_float(p_pitches_per_bf, 3.85) or 3.85
+    opp_ppa = safe_float(opp_ppa, league_ppa) or league_ppa
+    if opp_ppa <= 0 or p_pitches_per_bf <= 0:
+        return p_avg_bf
+    ppa_scalar = league_ppa / opp_ppa
+    # Cap this because team PPA feeds can be noisy/missing.
+    ppa_scalar = clamp(ppa_scalar, 0.94, 1.08)
+    # Efficient pitchers get a small extra volume bump; inefficient arms get a small cut.
+    efficiency_scalar = clamp(3.90 / p_pitches_per_bf, 0.94, 1.06)
+    return round(float(clamp(p_avg_bf * ppa_scalar * efficiency_scalar, 14.0, 30.0)), 1)
+
+
+def kproj_historical_k9(p):
+    """Best K/9 proxy available inside the app data."""
+    for key in ["k9", "K/9", "pitcher_k9", "season_k9"]:
+        v = safe_float(p.get(key))
+        if v is not None and v > 0:
+            return v
+    pk = safe_float(p.get("pitcher_k"), None)
+    if pk is not None and pk > 0:
+        # K% to rough K/9 proxy, using starter BF/IP around 4.25.
+        return pk * 4.25 * 9.0
+    return 0.0
+
+
+def kproj_recent_form_projection(p, expected_bf=None):
+    """
+    K UPSIDE TAB ONLY: projection style inspired by the card example.
+    Weighted blend:
+      - matchup/BF projection
+      - last-10 K average
+      - K/9 baseline
+      - BF + opponent K opportunity boost
+    This does not touch the main engine or other tabs.
+    """
+    pk = safe_float(p.get("pitcher_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
+    ok = safe_float(p.get("opp_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
+    bf = safe_float(expected_bf, safe_float(p.get("expected_bf"), DEFAULT_BF)) or DEFAULT_BF
+    k9 = kproj_historical_k9(p)
+    recent_vals = [safe_float(x, None) for x in (p.get("last_10_ks") or [])[:10]]
+    recent_vals = [float(x) for x in recent_vals if x is not None]
+
+    # Pitcher skill remains the anchor, opponent K is opportunity.
+    combined_rate = clamp((pk * 0.68) + (ok * 0.32), 0.08, 0.42)
+    matchup_projection = bf * combined_rate
+
+    if recent_vals:
+        last10_avg = sum(recent_vals) / len(recent_vals)
+        last5_avg = sum(recent_vals[:5]) / max(1, len(recent_vals[:5]))
+        recent_avg = (last10_avg * 0.60) + (last5_avg * 0.40)
+        recent_max = max(recent_vals)
+    else:
+        recent_avg = matchup_projection
+        recent_max = 0.0
+
+    k9_projection = (k9 / 9.0) * (bf / 4.25) if k9 > 0 else matchup_projection
+
+    # Opportunity boost mirrors the card logic: high BF + high opponent K = over-friendly.
+    opportunity = 0.0
+    if bf >= 26:
+        opportunity += 0.45
+    elif bf >= 24:
+        opportunity += 0.25
+    elif bf <= 19:
+        opportunity -= 0.25
+
+    if ok >= 0.245:
+        opportunity += 0.35
+    elif ok >= 0.230:
+        opportunity += 0.18
+    elif ok <= 0.205 and pk < 0.260:
+        opportunity -= 0.22
+
+    if recent_max >= 9:
+        opportunity += 0.35
+    elif recent_max >= 7:
+        opportunity += 0.18
+
+    # If recent history is real, use it. If not, rely more on matchup.
+    if recent_vals:
+        blended = (matchup_projection * 0.45) + (recent_avg * 0.30) + (k9_projection * 0.15) + ((matchup_projection + opportunity) * 0.10)
+    else:
+        blended = (matchup_projection * 0.70) + (k9_projection * 0.20) + ((matchup_projection + opportunity) * 0.10)
+
+    # Do not let this layer create absurd projections on low-skill arms.
+    cap = 10.25 if pk >= 0.300 or k9 >= 10.0 else 9.25 if pk >= 0.270 or k9 >= 9.0 else 8.25 if pk >= 0.245 else 7.15
+    return round(float(clamp(blended, 0.0, cap)), 2)
+
+def kproj_upside_projection(p):
+    """K UPSIDE TAB projection with recent-form weighted true-talent guard.
+
+    This changes ONLY the K PROJ / Upside tab. The main engine remains separate.
+
+    Philosophy:
+    1) Respect pitcher strikeout talent and recent K history first.
+    2) Use expected BF/opponent K opportunity like the reference card.
+    3) Cap negative suppression so high-K arms do not become fake UNDERS.
+    4) Keep role/leash/weather risk, but only as controlled nudges.
     """
     base = safe_float(p.get("pre_calibration_projection"), safe_float(p.get("projection"), 0.0)) or 0.0
     main_proj = safe_float(p.get("projection"), base) or base
     p90 = safe_float(p.get("p90"))
     pk = safe_float(p.get("pitcher_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
     ok = safe_float(p.get("opp_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
-    bf = safe_float(p.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF
-    ppb = safe_float(p.get("ppb"), 3.9) or 3.9
+    raw_bf = safe_float(p.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF
+    ppb = safe_float(p.get("ppb"), safe_float(p.get("pitches_per_bf"), 3.9)) or 3.9
+    opp_ppa = safe_float(p.get("opp_team_ppa"), safe_float(p.get("opp_ppa"), 3.90)) or 3.90
     upside = safe_float(p.get("elite_upside_score"), 0.0) or 0.0
     pitch_factor = safe_float(p.get("pitch_type_factor"), 1.0) or 1.0
     stat_whiff = safe_float(p.get("statcast_whiff"))
     stat_csw = safe_float(p.get("statcast_csw"))
-    last = [safe_float(x, 0) or 0 for x in (p.get("last_10_ks") or [])[:5]]
+    historical_k9 = kproj_historical_k9(p)
 
-    # Start from the stronger of raw/pre-calibration and main projection,
-    # but guard against main projection being crushed by stacked penalties.
-    proj = max(base, main_proj)
+    expected_bf = project_volume_and_efficiency(raw_bf, ppb, opp_ppa)
+    talent_base = kproj_true_talent_baseline(p)
+    recent_form_proj = kproj_recent_form_projection(p, expected_bf=expected_bf)
 
-    # Use ceiling but only partially, otherwise the tab gets too aggressive.
+    # Start from the strongest reasonable baseline, then blend.
+    original_proj = max(base, main_proj)
+    if kproj_is_confirmed_starter_like(p):
+        proj = (original_proj * 0.22) + (talent_base * 0.34) + (recent_form_proj * 0.44)
+    else:
+        proj = (original_proj * 0.45) + (talent_base * 0.30) + (recent_form_proj * 0.25)
+
+    # Elite pitcher floor circuit breaker from K/9 + BF.
+    proj = apply_elite_pitcher_floor(proj, historical_k9, expected_bf)
+
+    # Partial ceiling pull. Keeps distributions alive without blindly forcing overs.
     if p90 is not None and p90 > proj:
-        ceiling_weight = 0.18 + min(upside, 100) / 100.0 * 0.22
+        ceiling_weight = 0.12 + min(upside, 100) / 100.0 * 0.16
         proj += (p90 - proj) * ceiling_weight
 
-    # Raw K and lineup matchup nudges.
-    if pk >= 0.30:
-        proj += 0.45
-    elif pk >= 0.27:
-        proj += 0.28
+    # Skill/opportunity nudges.
+    if pk >= 0.30 or historical_k9 >= 10.0:
+        proj += 0.30
+    elif pk >= 0.27 or historical_k9 >= 9.0:
+        proj += 0.18
     elif pk >= 0.245:
-        proj += 0.14
+        proj += 0.08
     elif pk <= 0.205:
-        proj -= 0.18
+        proj -= 0.08
 
     if ok >= 0.255:
-        proj += 0.42
+        proj += 0.22
     elif ok >= 0.240:
-        proj += 0.24
-    elif ok <= 0.205:
-        proj -= 0.28  # less harsh than before; pitcher talent should not get erased
+        proj += 0.12
+    elif ok <= 0.205 and pk < 0.255:
+        proj -= 0.12
 
-    if bf >= 26:
-        proj += 0.45
-    elif bf >= 24:
-        proj += 0.25
-    elif bf <= 18:
-        proj -= 0.45
-    elif bf <= 20:
-        proj -= 0.18
-
-    if ppb <= 3.70:
-        proj += 0.18
-    elif ppb >= 4.20:
-        proj -= 0.20
+    if expected_bf >= 26:
+        proj += 0.28
+    elif expected_bf >= 24:
+        proj += 0.14
+    elif expected_bf <= 18:
+        proj -= 0.22
 
     if pitch_factor >= 1.025:
-        proj += 0.20
-    elif pitch_factor <= 0.975:
-        proj -= 0.12
+        proj += 0.10
+    elif pitch_factor <= 0.975 and pk < 0.255:
+        proj -= 0.05
 
     if stat_whiff is not None:
         if stat_whiff >= 31:
-            proj += 0.30
+            proj += 0.18
         elif stat_whiff >= 27:
-            proj += 0.15
+            proj += 0.08
     elif stat_csw is not None:
         if stat_csw >= 31:
-            proj += 0.20
+            proj += 0.12
         elif stat_csw >= 29:
-            proj += 0.10
+            proj += 0.06
 
-    if last:
-        avg = sum(last) / len(last)
-        if avg >= 6.5:
-            proj += 0.30
-        elif avg >= 5.5:
-            proj += 0.15
-        if max(last) >= 9:
+    recent_max, recent_avg, recent_n = kproj_recent_ceiling_stats(p)
+    if recent_n:
+        if recent_avg >= 6.0:
             proj += 0.25
-        elif max(last) >= 8:
-            proj += 0.15
+        elif recent_avg >= 5.0:
+            proj += 0.12
+        if recent_max >= 9:
+            proj += 0.24
+        elif recent_max >= 7:
+            proj += 0.12
 
-    # Risk penalties still exist, but are lighter when the pitcher has real ceiling.
+    # Risk stays, but it cannot erase true K skill unless ceiling risk is low.
     rd = str(p.get("run_damage_risk_level") or "").upper()
     leash = str(p.get("leash_risk") or "").upper()
     ceiling_risk, _ = kproj_ceiling_risk_score(p)
-    if rd == "EXTREME" and upside < 60 and ceiling_risk < 55:
-        proj -= 0.30
-    if leash in ["SHORT_RECENT_STARTS", "HIGH_PITCH_COUNT", "HIGH_RECENT_WORKLOAD"] and upside < 60 and ceiling_risk < 55:
-        proj -= 0.20
+    if rd == "EXTREME" and ceiling_risk < 45 and upside < 55:
+        proj -= 0.18
+    elif rd == "HIGH" and ceiling_risk < 35 and upside < 50:
+        proj -= 0.08
+    if leash in ["SHORT_RECENT_STARTS", "HIGH_PITCH_COUNT", "HIGH_RECENT_WORKLOAD"] and ceiling_risk < 45 and upside < 55:
+        proj -= 0.10
 
-    # TRUE PROJECTION GUARD:
-    # Do not allow stacked penalties to push a starter with K ceiling into fake-low territory.
     true_floor, _floor_note = kproj_true_projection_floor(p)
     if true_floor is not None and proj < true_floor:
-        lift = min(true_floor - proj, KPROJ_MAX_PROJECTION_LIFT)
-        proj += lift
+        proj += min(true_floor - proj, KPROJ_MAX_PROJECTION_LIFT)
 
-    # Suppression cap: if base/main model had a reasonable projection and ceiling risk is real,
-    # display projection cannot be crushed too far below that anchor.
-    anchor = max(base, main_proj)
-    if ceiling_risk >= KPROJ_CEILING_RISK_WARN_UNDER and anchor >= 4.0:
-        proj = max(proj, anchor * KPROJ_TOTAL_SUPPRESSION_CAP)
+    # Hard suppression cap: confirmed starters with ceiling cannot be smashed below true talent/recent form.
+    if kproj_is_confirmed_starter_like(p):
+        if ceiling_risk >= KPROJ_CEILING_RISK_WARN_UNDER or historical_k9 >= 9.0 or recent_max >= 7:
+            proj = max(proj, talent_base * KPROJ_TOTAL_SUPPRESSION_CAP, recent_form_proj * 0.88)
 
     return round(float(clamp(proj, 0.0, 15.0)), 2)
 
@@ -5719,9 +5899,9 @@ def kproj_upside_projection(p):
 # Keeps K projection math untouched. Tightens official picks.
 # =========================
 KPROJ_MIN_OFFICIAL_GAP_OVER = 1.00
-KPROJ_MIN_OFFICIAL_GAP_UNDER = 1.25
+KPROJ_MIN_OFFICIAL_GAP_UNDER = 1.75
 KPROJ_MIN_LEAN_GAP_OVER = 0.55
-KPROJ_MIN_LEAN_GAP_UNDER = 0.85
+KPROJ_MIN_LEAN_GAP_UNDER = 1.15
 KPROJ_MIN_OFFICIAL_HIT_RATE = 0.62
 KPROJ_MIN_LEAN_HIT_RATE = 0.56
 
@@ -5735,11 +5915,14 @@ KPROJ_MIN_LEAN_HIT_RATE = 0.56
 # They DO NOT blindly boost every pitcher. They only activate when starter role,
 # BF floor, recent ceiling, or K-stuff signals show spike risk.
 KPROJ_TRUE_GUARD_ENABLED = True
-KPROJ_CEILING_RISK_BLOCK_UNDER = 58
-KPROJ_CEILING_RISK_WARN_UNDER = 45
-KPROJ_MAX_PROJECTION_LIFT = 1.45
-KPROJ_MIN_STARTER_BF_FOR_FLOOR = 18.0
-KPROJ_TOTAL_SUPPRESSION_CAP = 0.82  # display K PROJ should not fall below 82% of stuff/BF floor when risk is real
+KPROJ_CEILING_RISK_BLOCK_UNDER = 46
+KPROJ_CEILING_RISK_WARN_UNDER = 34
+KPROJ_MAX_PROJECTION_LIFT = 3.25
+KPROJ_MIN_STARTER_BF_FOR_FLOOR = 17.0
+KPROJ_TOTAL_SUPPRESSION_CAP = 0.92  # K PROJ should not fall far below true-talent baseline when K ceiling is real
+KPROJ_TRUE_TALENT_BLEND_WEIGHT = 0.72
+KPROJ_MAX_NEGATIVE_SUPPRESSION_STARTER = 0.88
+KPROJ_MIN_UNDER_EDGE_NO_CEILING = 2.00
 
 
 def kproj_recent_ceiling_stats(p):
@@ -5821,13 +6004,11 @@ def kproj_ceiling_risk_score(p):
 
 
 def kproj_true_projection_floor(p):
-    """Conservative floor so stacked penalties cannot create fake-low K PROJ."""
+    """Projection floor so stacked penalties cannot create fake-low K PROJ."""
     pk = safe_float(p.get("pitcher_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
-    ok = safe_float(p.get("opp_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
     bf = safe_float(p.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF
     p90 = safe_float(p.get("p90"))
     upside = safe_float(p.get("elite_upside_score"), 0) or 0
-    pitch_factor = safe_float(p.get("pitch_type_factor"), 1.0) or 1.0
     recent_max, recent_avg, recent_n = kproj_recent_ceiling_stats(p)
     ceiling_risk, _ = kproj_ceiling_risk_score(p)
 
@@ -5838,33 +6019,42 @@ def kproj_true_projection_floor(p):
     if ceiling_risk < KPROJ_CEILING_RISK_WARN_UNDER:
         return None, f"ceiling risk low {ceiling_risk}/100"
 
-    # Stuff/BF floor. Uses a conservative rate, not full raw K%.
-    matchup_k = (pk * 0.62) + (ok * 0.38)
-    stuff_floor = bf * matchup_k * 0.84
+    talent_base = kproj_true_talent_baseline(p)
 
-    # Add small ceiling proof only when real evidence exists.
+    # Stronger floors for true K arms. These are still below ceiling, but prevent 1-3 K nonsense.
+    if pk >= 0.300:
+        min_floor = 5.35
+    elif pk >= 0.275:
+        min_floor = 4.95
+    elif pk >= 0.255:
+        min_floor = 4.55
+    elif pk >= 0.235:
+        min_floor = 4.10
+    else:
+        min_floor = 3.45
+
+    if bf < 20:
+        min_floor -= 0.45
+    elif bf >= 24:
+        min_floor += 0.25
+
     if recent_max >= 8:
-        stuff_floor += 0.40
+        min_floor += 0.45
     elif recent_max >= 6:
-        stuff_floor += 0.25
+        min_floor += 0.25
     if recent_avg >= 5.5:
-        stuff_floor += 0.25
+        min_floor += 0.25
     if p90 is not None and p90 >= 7:
-        stuff_floor += 0.25
-    if upside >= 65:
-        stuff_floor += 0.20
-    if pitch_factor >= 1.025:
-        stuff_floor += 0.15
+        min_floor += 0.25
+    if upside >= 70:
+        min_floor += 0.25
 
-    # Prevent unrealistic floors on low-skill arms, but let high-skill arms breathe.
-    cap = 5.95
-    if pk >= 0.285 or upside >= 75:
-        cap = 6.45
-    elif pk < 0.225 and recent_max < 6:
-        cap = 4.25
+    floor = max(talent_base * 0.88, min_floor)
 
-    floor = round(float(clamp(stuff_floor, 0.0, cap)), 2)
-    return floor, f"true floor {floor} | ceiling risk {ceiling_risk}/100"
+    # Cap still prevents automatic overs on average arms.
+    cap = 7.35 if pk >= 0.285 or upside >= 75 else 6.65 if pk >= 0.255 else 5.75
+    floor = round(float(clamp(floor, 0.0, cap)), 2)
+    return floor, f"true floor {floor} | talent base {talent_base} | ceiling risk {ceiling_risk}/100"
 
 
 def kproj_role_stability_score(p):
@@ -6083,7 +6273,7 @@ def kproj_decision(p):
         conf = clamp(0.60 + min(diff_to_over, 2.5) * 0.055 + upside / 1000.0, 0.50, 0.80)
 
     # Official UNDER: intentionally stricter after the bad under spike day.
-    elif diff_to_under >= KPROJ_MIN_OFFICIAL_GAP_UNDER and upside < 58 and role_score >= 60:
+    elif diff_to_under >= KPROJ_MIN_OFFICIAL_GAP_UNDER and upside < 50 and role_score >= 70:
         side = "UNDER"
         gap = diff_to_under
         conf = clamp(0.60 + min(diff_to_under, 2.5) * 0.045 - max(0, upside - 45) / 1000.0, 0.50, 0.77)
@@ -6095,7 +6285,7 @@ def kproj_decision(p):
         conf = 0.56
 
     # Lean-only UNDER. No high-upside under leans.
-    elif diff_to_under >= KPROJ_MIN_LEAN_GAP_UNDER and upside <= 45 and role_score >= 65:
+    elif diff_to_under >= KPROJ_MIN_LEAN_GAP_UNDER and upside <= 38 and role_score >= 70:
         side = "UNDER LEAN"
         gap = diff_to_under
         conf = 0.55
@@ -6116,17 +6306,18 @@ def kproj_decision(p):
 
     ceiling_risk, ceiling_note = kproj_ceiling_risk_score(p)
 
-    if "UNDER" in side and (upside >= 58 or ceiling_risk >= KPROJ_CEILING_RISK_BLOCK_UNDER):
+    # Hard under block: if a pitcher has real strikeout ceiling, do not trust UNDER.
+    if "UNDER" in side and (upside >= 50 or ceiling_risk >= KPROJ_CEILING_RISK_BLOCK_UNDER or pk >= 0.255):
         side = "PASS"
-        reasons.append(f"blocked under: K ceiling risk {ceiling_risk}/100")
+        reasons.append(f"blocked under: K ceiling/talent risk {ceiling_risk}/100")
     elif "UNDER" in side and ceiling_risk >= KPROJ_CEILING_RISK_WARN_UNDER:
         side = "UNDER LEAN" if side == "UNDER" else side
         reasons.append(f"downgraded under: ceiling warning {ceiling_risk}/100")
 
     # Do not make official UNDERs when the cash edge is thin.
-    if side == "UNDER" and diff_to_under < 1.50:
+    if side == "UNDER" and diff_to_under < KPROJ_MIN_UNDER_EDGE_NO_CEILING:
         side = "UNDER LEAN"
-        reasons.append("downgraded under: edge below 1.50 Ks")
+        reasons.append(f"downgraded under: edge below {KPROJ_MIN_UNDER_EDGE_NO_CEILING:.1f} Ks")
 
     if side == "OVER" and (role_score < 58 or starter_score < 58 or ip_floor < 3.7):
         side = "OVER LEAN"
