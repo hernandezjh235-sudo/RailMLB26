@@ -5905,6 +5905,14 @@ KPROJ_MIN_LEAN_GAP_UNDER = 1.15
 KPROJ_MIN_OFFICIAL_HIT_RATE = 0.62
 KPROJ_MIN_LEAN_HIT_RATE = 0.56
 
+# Small official-play filter tweak: projections still decide direction,
+# but official OVERs need stronger edge + simulation + volume/role context.
+# This does NOT change K PROJ math. It only downgrades medium OVERS to OL/PASS.
+KPROJ_STRICT_OVER_EDGE = 1.00
+KPROJ_STRICT_OVER_HIT_RATE = 0.65
+KPROJ_STRICT_OVER_MIN_BF = 21.0
+KPROJ_STRICT_OVER_MIN_ROLE = 60
+
 
 # =========================
 # TRUE PROJECTION GUARD SETTINGS
@@ -6377,11 +6385,23 @@ def kproj_decision(p):
         reasons.extend(bad_data_reasons)
     else:
         if model_side == "OVER":
-            # Official OVER: projection edge + sim probability. Keep it usable.
-            if abs_edge >= 0.75 and hit_rate_val >= 0.60:
+            # Official OVER: projection edge + sim probability + usable volume/role context.
+            # This is intentionally stricter than before to improve win rate by cutting
+            # medium-edge overs, while keeping projection math unchanged.
+            expected_bf_gate = safe_float(p.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF
+            strong_over_setup = (
+                abs_edge >= KPROJ_STRICT_OVER_EDGE
+                and hit_rate_val >= KPROJ_STRICT_OVER_HIT_RATE
+                and expected_bf_gate >= KPROJ_STRICT_OVER_MIN_BF
+                and role_score >= KPROJ_STRICT_OVER_MIN_ROLE
+            )
+
+            if strong_over_setup:
                 side = "OVER"
             elif abs_edge >= 0.30 and hit_rate_val >= 0.54:
                 side = "OVER LEAN"
+                if abs_edge >= KPROJ_STRICT_OVER_EDGE and hit_rate_val >= KPROJ_STRICT_OVER_HIT_RATE:
+                    reasons.append("downgraded: official over needs stronger BF/role context")
             else:
                 side = "PASS"
                 reasons.append("thin over edge / low sim probability")
