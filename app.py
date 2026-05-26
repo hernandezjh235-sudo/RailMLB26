@@ -7174,10 +7174,409 @@ except Exception:
     pass
 
 
-tab_kproj, tab_edge_engine, tab_edge_analytics, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+
+
+MONEYLINE_PRO_UI_MOBILE_CSS = """
+<style>
+@media(max-width:900px){
+    div[style*="grid-template-columns:1fr 70px 1fr"]{
+        grid-template-columns:1fr!important;
+    }
+    div[style*="grid-template-columns:repeat(4,minmax(0,1fr))"]{
+        grid-template-columns:repeat(2,minmax(0,1fr))!important;
+    }
+}
+</style>
+"""
+try:
+    st.markdown(MONEYLINE_PRO_UI_MOBILE_CSS, unsafe_allow_html=True)
+except Exception:
+    pass
+
+# =========================
+# MONEYLINE PICKS TAB — SAFE TEAM-LEVEL LAYER
+# Separate from K Props. Does NOT change pitcher K projections, Edge Engine, OF2, grading, or learning.
+# Uses available schedule/board context + optional OddsAPI moneyline odds when configured.
+# =========================
+def ml_american_to_implied(price):
+    try:
+        price = float(price)
+        if price > 0:
+            return 100.0 / (price + 100.0)
+        return abs(price) / (abs(price) + 100.0)
+    except Exception:
+        return None
+
+def ml_model_team_score_from_pitcher(p):
+    """Team-level score from existing pitcher board row. Display layer only."""
+    try:
+        proj = safe_float(p.get("projection"), 0) or 0
+        line = safe_float(p.get("line") or p.get("underdog_line"), None)
+        k_edge = safe_float(p.get("edge_ks"), 0) or 0
+        fair = safe_float(p.get("fair_probability"), 0.50) or 0.50
+        if fair > 1:
+            fair = fair / 100.0
+
+        score = 50.0
+        score += clamp((proj - 4.5) * 3.0, -10, 16)
+        score += clamp(k_edge * 4.0, -10, 16)
+        score += clamp((fair - 0.55) * 55, -8, 14)
+
+        lineup = str(p.get("lineup_status") or "").upper()
+        if "TRUE" in lineup or "CONFIRMED" in lineup:
+            score += 3
+        elif "FALLBACK" in lineup:
+            score -= 4
+
+        risk = str(p.get("leash_risk") or p.get("risk_label") or "").upper()
+        if any(x in risk for x in ["HIGH", "EXTREME", "SHORT", "STRICT"]):
+            score -= 6
+        elif any(x in risk for x in ["MILD", "MEDIUM"]):
+            score -= 3
+
+        return float(clamp(score, 25, 78))
+    except Exception:
+        return 50.0
+
+def ml_fetch_oddsapi_moneyline():
+    """Fetch MLB h2h moneyline odds if ODDS_API_KEY exists. Safe optional source."""
+    try:
+        key = get_secret("ODDS_API_KEY", "")
+        if not key:
+            return {}
+        url = f"{ODDS_BASE}/sports/baseball_mlb/odds"
+        data = safe_get_json(
+            url,
+            params={
+                "apiKey": key,
+                "regions": "us",
+                "markets": "h2h",
+                "oddsFormat": "american",
+            },
+            timeout=14
+        )
+        out = {}
+        if not isinstance(data, list):
+            return out
+
+        for ev in data:
+            home = ev.get("home_team")
+            away = ev.get("away_team")
+            books = ev.get("bookmakers") or []
+            prices = {}
+            for b in books[:8]:
+                for m in b.get("markets") or []:
+                    if m.get("key") != "h2h":
+                        continue
+                    for o in m.get("outcomes") or []:
+                        nm = o.get("name")
+                        price = safe_float(o.get("price"), None)
+                        if nm and price is not None:
+                            prices.setdefault(nm, []).append(price)
+            avg_prices = {}
+            for team, vals in prices.items():
+                if vals:
+                    avg_prices[team] = round(float(sum(vals) / len(vals)))
+            if home or away:
+                out[(str(away or "").lower(), str(home or "").lower())] = {
+                    "home": home,
+                    "away": away,
+                    "prices": avg_prices,
+                }
+        return out
+    except Exception:
+        return {}
+
+def ml_match_odds_for_team(odds_map, team_name, matchup):
+    try:
+        if not odds_map:
+            return None, "No OddsAPI"
+        team_low = str(team_name or "").lower()
+        matchup_low = str(matchup or "").lower()
+        best_price = None
+        for _, ev in odds_map.items():
+            home = str(ev.get("home") or "").lower()
+            away = str(ev.get("away") or "").lower()
+            prices = ev.get("prices") or {}
+            if team_low and (team_low in home or team_low in away or home in team_low or away in team_low):
+                for t, price in prices.items():
+                    if team_low in str(t).lower() or str(t).lower() in team_low:
+                        return price, "OddsAPI"
+            # fallback: if matchup abbreviations are all we have, don't force false match
+        return best_price, "No Match"
+    except Exception:
+        return None, "No Match"
+
+def build_moneyline_board(board):
+    """Builds team-level moneyline candidates from current pitcher board."""
+    odds_map = ml_fetch_oddsapi_moneyline()
+    rows = []
+    seen = set()
+
+    for p in board or []:
+        team = p.get("team") or p.get("Team")
+        opp = p.get("opponent") or p.get("Opponent")
+        matchup = p.get("matchup") or ""
+        pitcher = p.get("pitcher") or ""
+        if not team or not matchup:
+            continue
+
+        key = (str(team), str(matchup))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        model_score = ml_model_team_score_from_pitcher(p)
+        # convert score to conservative win probability
+        model_prob = clamp(0.50 + ((model_score - 50.0) / 115.0), 0.36, 0.68)
+
+        ml_price, price_source = ml_match_odds_for_team(odds_map, team, matchup)
+        implied = ml_american_to_implied(ml_price)
+        edge = None if implied is None else round((model_prob - implied) * 100, 1)
+
+        flags = []
+        if ml_price is None:
+            flags.append("NO MONEYLINE ODDS")
+        if implied is not None and abs(model_prob - implied) < 0.025:
+            flags.append("SMALL ML EDGE")
+        lineup = str(p.get("lineup_status") or "").upper()
+        if "FALLBACK" in lineup:
+            flags.append("FALLBACK LINEUP")
+        risk = str(p.get("leash_risk") or p.get("risk_label") or "").upper()
+        if any(x in risk for x in ["HIGH", "EXTREME", "STRICT", "SHORT"]):
+            flags.append("PITCHER/ROLE RISK")
+
+        pick = "PASS"
+        grade = "🚫 PASS"
+        if edge is not None:
+            if edge >= 5.0 and not flags:
+                pick = team
+                grade = "🔥 ML EDGE"
+            elif edge >= 3.0:
+                pick = team
+                grade = "✅ ML LEAN"
+            elif edge >= 1.5:
+                pick = team
+                grade = "⚠️ WATCH"
+            else:
+                grade = "🚫 PASS"
+
+        rows.append({
+            "Team": team,
+            "Opponent": opp,
+            "Matchup": matchup,
+            "Pitcher": pitcher,
+            "Moneyline": ml_price if ml_price is not None else "NO ODDS",
+            "Model Win %": round(model_prob * 100, 1),
+            "Market Implied %": None if implied is None else round(implied * 100, 1),
+            "ML Edge %": edge,
+            "Pick": pick,
+            "Grade": grade,
+            "Flags": "Clean" if not flags else " | ".join(flags),
+            "Source": price_source,
+        })
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["_sort"] = pd.to_numeric(df["ML Edge %"], errors="coerce").fillna(-999)
+        df = df.sort_values("_sort", ascending=False).drop(columns=["_sort"])
+    return df
+
+def render_moneyline_cards(df, max_cards=8):
+    """Pro sportsbook-style matchup cards for Moneyline tab. UI only."""
+    if df is None or df.empty:
+        return
+
+    st.markdown("<div class='section-title-pro'>Moneyline Matchup Cards</div>", unsafe_allow_html=True)
+
+    for _, r in df.head(max_cards).iterrows():
+        team = str(r.get("Team", "Unknown"))
+        opp = str(r.get("Opponent", "Opponent") or "Opponent")
+        matchup = str(r.get("Matchup", ""))
+        pitcher = str(r.get("Pitcher", ""))
+        grade = str(r.get("Grade", "—"))
+        pick = str(r.get("Pick", "PASS"))
+        ml = str(r.get("Moneyline", "NO ODDS"))
+        model = safe_float(r.get("Model Win %"), None)
+        implied = safe_float(r.get("Market Implied %"), None)
+        edge = safe_float(r.get("ML Edge %"), None)
+        flags = str(r.get("Flags", "—"))
+        source = str(r.get("Source", "—"))
+
+        model_pct = model if model is not None else 0.0
+        opp_pct = max(0, 100 - model_pct) if model is not None else 0.0
+        edge_txt = "—" if edge is None else f"{edge:+.1f}%"
+        implied_txt = "—" if implied is None else f"{implied:.1f}%"
+        model_txt = "—" if model is None else f"{model:.1f}%"
+
+        # simple team abbreviations from matchup/team names
+        team_abbr = "".join([x[:1] for x in team.split()[:2]]).upper()[:3] or team[:3].upper()
+        opp_abbr = "".join([x[:1] for x in opp.split()[:2]]).upper()[:3] or opp[:3].upper()
+
+        playable = pick != "PASS" and "NO MONEYLINE ODDS" not in flags
+        card_border = "rgba(34,197,94,.45)" if playable else "rgba(148,163,184,.22)"
+        best_label = "🔥 BEST ML EDGE" if playable and edge is not None and edge >= 5 else "⚠️ WATCH ML" if playable else "🚫 PASS / NO EDGE"
+        confidence = min(99, max(50, int((model_pct or 50) + (edge or 0) * 2))) if model is not None else 0
+        bar_w = int(max(5, min(95, model_pct))) if model is not None else 50
+
+        # colors
+        left_color = "#22c55e" if playable else "#94a3b8"
+        right_color = "#ef4444"
+        edge_color = "#22c55e" if edge is not None and edge > 0 else "#facc15" if edge is not None else "#94a3b8"
+
+        st.markdown(f"""
+        <div style="
+            background:
+              radial-gradient(circle at 10% 0%, rgba(34,197,94,.10), transparent 28%),
+              radial-gradient(circle at 90% 0%, rgba(239,68,68,.11), transparent 28%),
+              linear-gradient(145deg, rgba(7,12,22,.98), rgba(3,5,10,.98));
+            border:1px solid {card_border};
+            border-radius:26px;
+            padding:22px;
+            margin:16px 0;
+            box-shadow:0 18px 46px rgba(0,0,0,.38);
+            overflow:hidden;
+        ">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
+                <div style="color:#94a3b8;font-size:13px;font-weight:800;">
+                    {html.escape(str(source))} • Moneyline Model
+                </div>
+                <div style="
+                    padding:7px 13px;
+                    border-radius:999px;
+                    border:1px solid rgba(250,204,21,.55);
+                    color:#fde68a;
+                    background:rgba(250,204,21,.12);
+                    font-weight:950;
+                    font-size:13px;
+                ">{html.escape(str(grade))}</div>
+            </div>
+
+            <div style="
+                display:grid;
+                grid-template-columns:1fr 70px 1fr;
+                gap:12px;
+                align-items:center;
+                margin-top:20px;
+                text-align:center;
+            ">
+                <div>
+                    <div style="
+                        width:74px;height:74px;border-radius:22px;
+                        display:flex;align-items:center;justify-content:center;
+                        margin:0 auto 10px auto;
+                        background:rgba(34,197,94,.12);
+                        border:1px solid rgba(34,197,94,.45);
+                        color:#22c55e;
+                        font-size:32px;font-weight:950;
+                    ">{html.escape(team_abbr)}</div>
+                    <div style="font-size:21px;font-weight:950;color:#fff;line-height:1.1;">{html.escape(team)}</div>
+                    <div style="font-size:13px;color:#cbd5e1;margin-top:6px;">SP: {html.escape(pitcher)}</div>
+                    <div style="font-size:13px;color:#94a3b8;margin-top:4px;">ML {html.escape(ml)}</div>
+                </div>
+
+                <div style="font-size:18px;color:#64748b;font-weight:900;">@</div>
+
+                <div>
+                    <div style="
+                        width:74px;height:74px;border-radius:22px;
+                        display:flex;align-items:center;justify-content:center;
+                        margin:0 auto 10px auto;
+                        background:rgba(239,68,68,.10);
+                        border:1px solid rgba(239,68,68,.38);
+                        color:#f87171;
+                        font-size:32px;font-weight:950;
+                    ">{html.escape(opp_abbr)}</div>
+                    <div style="font-size:21px;font-weight:950;color:#fff;line-height:1.1;">{html.escape(opp)}</div>
+                    <div style="font-size:13px;color:#cbd5e1;margin-top:6px;">Opponent</div>
+                    <div style="font-size:13px;color:#94a3b8;margin-top:4px;">Market implied {implied_txt}</div>
+                </div>
+            </div>
+
+            <div style="margin-top:22px;">
+                <div style="display:flex;justify-content:space-between;color:#cbd5e1;font-size:14px;font-weight:850;margin-bottom:8px;">
+                    <span>{html.escape(team_abbr)} {model_txt}</span>
+                    <span>Win Probability</span>
+                    <span>{html.escape(opp_abbr)} {opp_pct:.1f}%</span>
+                </div>
+                <div style="height:8px;background:rgba(148,163,184,.16);border-radius:999px;overflow:hidden;">
+                    <div style="height:100%;width:{bar_w}%;background:linear-gradient(90deg,#22c55e,#ef4444);border-radius:999px;"></div>
+                </div>
+            </div>
+
+            <div style="
+                display:grid;
+                grid-template-columns:repeat(4,minmax(0,1fr));
+                gap:10px;
+                margin-top:18px;
+            ">
+                <div class="kpi-box"><div class="kpi-label">Model Win</div><div class="kpi-value green">{model_txt}</div></div>
+                <div class="kpi-box"><div class="kpi-label">Market</div><div class="kpi-value">{implied_txt}</div></div>
+                <div class="kpi-box"><div class="kpi-label">ML Edge</div><div class="kpi-value" style="color:{edge_color};">{edge_txt}</div></div>
+                <div class="kpi-box"><div class="kpi-label">Confidence</div><div class="kpi-value">{confidence}%</div></div>
+            </div>
+
+            <div style="
+                margin-top:18px;
+                background:rgba(15,23,42,.70);
+                border:1px solid rgba(34,197,94,.24);
+                border-radius:18px;
+                padding:15px 16px;
+                display:flex;
+                justify-content:space-between;
+                align-items:center;
+                gap:14px;
+                flex-wrap:wrap;
+            ">
+                <div>
+                    <div style="color:#94a3b8;font-size:12px;font-weight:900;text-transform:uppercase;">Best Play</div>
+                    <div style="font-size:24px;font-weight:950;color:{left_color};margin-top:4px;">{html.escape(str(pick))} ML</div>
+                </div>
+                <div style="
+                    padding:10px 14px;
+                    border-radius:14px;
+                    background:rgba(34,197,94,.12);
+                    border:1px solid rgba(34,197,94,.35);
+                    color:#86efac;
+                    font-weight:950;
+                ">{html.escape(best_label)}</div>
+            </div>
+
+            <div style="
+                border-left:5px solid {left_color};
+                background:rgba(2,6,23,.58);
+                border-radius:14px;
+                padding:13px 15px;
+                margin-top:14px;
+                color:#e5e7eb;
+                font-size:14px;
+            ">
+                <b>Flags:</b> {html.escape(flags)}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+def render_moneyline_tab(board, dates=None):
+    st.markdown("### 💰 Moneyline Picks")
+    st.caption("Sportsbook-style matchup cards. Separate team-level layer — does not change K projections or prop picks.")
+    df = build_moneyline_board(board)
+    if df is None or df.empty:
+        st.info("No moneyline board yet. Refresh live board first.")
+        return
+    playable = df[(df["Pick"] != "PASS") & (df["Flags"] == "Clean")]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Games/Teams", len(df))
+    c2.metric("Playable", len(playable))
+    c3.metric("Best ML Edge", "—" if df["ML Edge %"].dropna().empty else f"{df['ML Edge %'].dropna().max():.1f}%")
+    c4.metric("Odds Source", "OddsAPI")
+    render_moneyline_cards(df, max_cards=8)
+    st.dataframe(df.drop(columns=[], errors="ignore"), use_container_width=True, hide_index=True)
+
+tab_kproj, tab_edge_engine, tab_edge_analytics, tab_moneyline, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "EDGE ENGINE",
     "EDGE ANALYTICS",
+    "MONEYLINE PICKS",
     "TOP PLAYS",
     "BEST 4 BUILDER",
     "ALL PLAYERS",
@@ -7195,6 +7594,9 @@ with tab_edge_engine:
 
 with tab_edge_analytics:
     render_edge_analytics_tab(board, dates)
+
+with tab_moneyline:
+    render_moneyline_tab(board, dates)
 
 with tab1:
     st.markdown('<div class="section-title-pro">Top Plays</div>', unsafe_allow_html=True)
