@@ -10,6 +10,7 @@
 import os
 import json
 import math
+import html
 import difflib
 import io
 import unicodedata
@@ -20,7 +21,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.17 K PROJ UPSIDE TAB + REALISM + K SKILL ARCHETYPE"
+APP_VERSION = "v11.17 + EDGE ENGINE 9.5 SAFE FILTER — CORE K PROJ UNTOUCHED"
 
 try:
     import pytz
@@ -6849,8 +6850,303 @@ def render_kproj_tab(board):
     for p in priority[:20]:
         render_kproj_pitcher_card(p)
 
-tab_kproj, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+
+# =========================
+# EDGE ENGINE 9.5 SAFE LAYER
+# Display/ranking/filtering only. Does NOT change projections, Underdog, OF2, grading, or learning.
+# =========================
+def _ee_fmt(v, nd=2):
+    try:
+        if v is None or v == "":
+            return "—"
+        f = float(v)
+        if abs(f - round(f)) < 1e-9:
+            return str(int(round(f)))
+        return f"{f:.{nd}f}"
+    except Exception:
+        return str(v) if v not in [None, ""] else "—"
+
+def _ee_get(row, keys, default=None):
+    try:
+        for k in keys:
+            if hasattr(row, "get") and row.get(k) not in [None, ""]:
+                return row.get(k)
+    except Exception:
+        pass
+    return default
+
+def ee_side(proj, line):
+    proj = safe_float(proj, None)
+    line = safe_float(line, None)
+    if proj is None or line is None:
+        return "NO LINE"
+    return "OVER" if proj > line else "UNDER"
+
+def ee_line_difficulty_tax(line, side="OVER"):
+    line = safe_float(line, None)
+    if line is None:
+        return 12, "No live line"
+    side = str(side).upper()
+    if side == "OVER" and line >= 7.5:
+        return 9, "High K line"
+    if side == "OVER" and line >= 6.5:
+        return 5, "Medium-high K line"
+    if side == "UNDER" and line <= 3.5:
+        return 7, "Low under line"
+    return 0, "Normal line difficulty"
+
+def ee_clv_score(row, side):
+    delta = safe_float(_ee_get(row, ["CLV Δ", "CLV", "clv_delta", "Line Delta", "line_delta", "line_movement"]), None)
+    if delta is None:
+        return 0, "No CLV yet"
+    side = str(side).upper()
+    good = (side == "OVER" and delta > 0) or (side == "UNDER" and delta < 0)
+    bad = (side == "OVER" and delta < 0) or (side == "UNDER" and delta > 0)
+    if good:
+        return 6, f"Positive CLV {delta:+.2f}"
+    if bad:
+        return -7, f"Line moved against {delta:+.2f}"
+    return 0, f"Flat CLV {delta:+.2f}"
+
+def ee_volatility_tax(row):
+    vol = safe_float(_ee_get(row, ["Volatility", "volatility", "Sim Std", "std"]), None)
+    risk = str(_ee_get(row, ["risk_label", "Risk", "leash_risk", "Leash Risk"], "")).upper()
+    tax = 0
+    notes = []
+    if vol is not None:
+        if vol >= 2.3:
+            tax += 9; notes.append("High volatility")
+        elif vol >= 1.7:
+            tax += 5; notes.append("Medium volatility")
+    if any(x in risk for x in ["HIGH", "EXTREME", "STRICT", "SHORT"]):
+        tax += 8; notes.append("Role/leash risk")
+    elif any(x in risk for x in ["MILD", "MEDIUM"]):
+        tax += 4; notes.append("Mild risk")
+    return tax, ", ".join(notes) if notes else "Volatility normal"
+
+def ee_recent_bonus(row):
+    val = safe_float(_ee_get(row, ["Recent Conv %", "recent_conversion", "Hit Rate %", "hit_rate", "recent_hit_rate"]), None)
+    if val is None:
+        return 0, "No recent conversion"
+    if val <= 1:
+        val *= 100
+    if val >= 70:
+        return 6, f"Strong recent conversion {val:.0f}%"
+    if val >= 60:
+        return 3, f"Solid recent conversion {val:.0f}%"
+    if val < 48:
+        return -7, f"Weak recent conversion {val:.0f}%"
+    return 0, f"Neutral recent conversion {val:.0f}%"
+
+def ee_grade_row(row):
+    proj = safe_float(_ee_get(row, ["Projection", "K PROJ", "projection", "Proj"]), None)
+    line = safe_float(_ee_get(row, ["Line", "UD/Line", "line", "active_line", "underdog_line"]), None)
+    conf = safe_float(_ee_get(row, ["Confidence %", "Hit Rate %", "fair_probability", "Fair Prob"]), None)
+    if conf is not None and conf <= 1:
+        conf *= 100
+    tier = str(_ee_get(row, ["Tier", "action_tier"], "")).upper()
+    decision = str(_ee_get(row, ["Decision", "Pick", "bet_action", "Main Engine Action"], "")).upper()
+    source = str(_ee_get(row, ["Line Source", "line_source", "Source", "price_source"], "")).upper()
+    lineup = str(_ee_get(row, ["Lineup", "lineup_status"], "")).upper()
+    edge = safe_float(_ee_get(row, ["Edge Gap", "edge_ks", "Lean Gap", "Model Gap", "abs_edge"]), None)
+    if edge is None and proj is not None and line is not None:
+        edge = abs(proj - line)
+
+    side = ee_side(proj, line)
+    score = 50.0
+    if edge is not None:
+        score += min(abs(edge), 3.75) * 9.0
+    if conf is not None:
+        score += (conf - 58) * 0.95
+    if tier == "A":
+        score += 12
+    elif tier == "B":
+        score += 6
+    elif tier == "C":
+        score -= 3
+    elif tier == "PASS":
+        score -= 30
+    if "UNDERDOG" in source or "UD" in source:
+        score += 6
+    if "TRUE" in lineup or "CONFIRMED" in lineup:
+        score += 5
+    elif "FALLBACK" in lineup:
+        score -= 7
+
+    line_tax, line_note = ee_line_difficulty_tax(line, side)
+    vol_tax, vol_note = ee_volatility_tax(row)
+    clv_bonus, clv_note = ee_clv_score(row, side)
+    recent_bonus, recent_note = ee_recent_bonus(row)
+
+    score -= line_tax
+    score -= vol_tax
+    score += clv_bonus
+    score += recent_bonus
+
+    flags = []
+    if line is None:
+        flags.append("NO LIVE LINE")
+    if "PASS" in decision or tier == "PASS":
+        flags.append("MODEL PASS")
+    if edge is not None and abs(edge) < 0.75:
+        flags.append("SMALL EDGE")
+    if conf is not None and conf < 63:
+        flags.append("LOW/BORDER CONF")
+    if proj is not None and line is not None and abs(proj - line) < 0.20:
+        flags.append("TOO CLOSE TO LINE")
+    if source and "UNDERDOG" not in source and "UD" not in source:
+        flags.append("LINE SOURCE CHECK")
+    if "FALLBACK" in lineup:
+        flags.append("FALLBACK LINEUP")
+
+    score -= min(len(flags) * 6, 30)
+    score = round(float(clamp(score, 0, 100)), 1)
+    if score >= 84 and not flags:
+        grade = "🔥 ELITE EDGE"
+    elif score >= 76:
+        grade = "✅ STRONG EDGE"
+    elif score >= 68:
+        grade = "⚠️ WATCH EDGE"
+    elif score >= 60:
+        grade = "🟡 LEAN ONLY"
+    else:
+        grade = "🚫 PASS EDGE"
+
+    notes = [line_note, vol_note, clv_note, recent_note]
+    notes = [n for n in notes if n and n not in ["Normal line difficulty", "Volatility normal", "No CLV yet", "No recent conversion"]]
+    return {
+        "Edge Pick": side,
+        "Edge Projection": proj,
+        "Edge Line": line,
+        "Edge Gap": None if edge is None else round(abs(edge), 2),
+        "Edge Engine Score": score,
+        "Edge Grade": grade,
+        "Edge Flags": "Clean" if not flags else " | ".join(dict.fromkeys(flags)),
+        "Edge Notes": "—" if not notes else " | ".join(dict.fromkeys(notes)),
+    }
+
+def edge_engine_build_board(board):
+    rows = []
+    for p in board or []:
+        fair = p.get("fair_probability")
+        fair_pct = round(float(fair) * 100, 1) if safe_float(fair) is not None and safe_float(fair) <= 1 else fair
+        r = {
+            "Prop": "K PROJ",
+            "Player": p.get("pitcher"),
+            "Pitcher": p.get("pitcher"),
+            "Matchup": p.get("matchup"),
+            "Projection": p.get("projection"),
+            "Line": p.get("line") or p.get("underdog_line"),
+            "Decision": p.get("bet_action") or p.get("signal") or p.get("pick_side"),
+            "Tier": p.get("action_tier"),
+            "Confidence %": fair_pct,
+            "Edge Gap": p.get("edge_ks"),
+            "Line Source": p.get("line_source"),
+            "Lineup": p.get("lineup_status"),
+            "Volatility": p.get("Volatility") or p.get("volatility"),
+            "Recent Conv %": p.get("Recent Conv %") or p.get("hit_rate"),
+            "leash_risk": p.get("leash_risk"),
+        }
+        r.update(ee_grade_row(r))
+        rows.append(r)
+    df = pd.DataFrame(rows)
+    if not df.empty and "Edge Engine Score" in df.columns:
+        df = df.sort_values("Edge Engine Score", ascending=False)
+    return df
+
+def render_edge_engine_cards(df, title="Top Edge Engine Cards", max_cards=8):
+    if df is None or df.empty:
+        return
+    st.markdown(f"<div class='section-title-pro'>{html.escape(title)}</div>", unsafe_allow_html=True)
+    for _, row in df.head(max_cards).iterrows():
+        player = html.escape(str(_ee_get(row, ["Player", "Pitcher"], "Unknown")))
+        matchup = html.escape(str(_ee_get(row, ["Matchup"], "")))
+        side = html.escape(str(_ee_get(row, ["Edge Pick"], "—")))
+        grade = html.escape(str(_ee_get(row, ["Edge Grade"], "—")))
+        proj = _ee_fmt(_ee_get(row, ["Edge Projection", "Projection"], None))
+        line = _ee_fmt(_ee_get(row, ["Edge Line", "Line"], None))
+        gap = _ee_fmt(_ee_get(row, ["Edge Gap"], None))
+        score = _ee_fmt(_ee_get(row, ["Edge Engine Score"], None), 1)
+        flags = html.escape(str(_ee_get(row, ["Edge Flags"], "—")))
+        notes = html.escape(str(_ee_get(row, ["Edge Notes"], "—")))
+        side_color = "#22c55e" if side == "OVER" else "#38bdf8" if side == "UNDER" else "#94a3b8"
+        st.markdown(f"""
+        <div style="background:linear-gradient(145deg,#101010,#190000);border:1px solid rgba(255,70,70,.34);border-radius:22px;padding:18px;margin:14px 0;box-shadow:0 0 22px rgba(255,0,0,.13);">
+            <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;">
+                <div><div style="font-size:28px;font-weight:950;color:#fff;line-height:1.05;">{player}</div><div style="font-size:14px;color:#cbd5e1;margin-top:6px;">{matchup}</div></div>
+                <div style="padding:9px 14px;border-radius:999px;border:1px solid {side_color};color:{side_color};font-weight:950;background:rgba(15,23,42,.72);">{side}</div>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;"><span class="badge good-badge">K PROJ</span><span class="badge yellow-badge">{grade}</span><span class="badge">Score {score}</span></div>
+            <div class="kpi-strip" style="grid-template-columns:repeat(4,minmax(0,1fr));margin-top:14px;">
+                <div class="kpi-box"><div class="kpi-label">Projection</div><div class="kpi-value green">{proj}</div></div>
+                <div class="kpi-box"><div class="kpi-label">Line</div><div class="kpi-value">{line}</div></div>
+                <div class="kpi-box"><div class="kpi-label">Edge</div><div class="kpi-value green">+{gap}</div></div>
+                <div class="kpi-box"><div class="kpi-label">Score</div><div class="kpi-value">{score}</div></div>
+            </div>
+            <div style="border-left:5px solid #22c55e;background:rgba(15,23,42,.58);border-radius:14px;padding:13px 15px;margin-top:12px;color:#e5e7eb;">
+                <b>Flags:</b> {flags}<br><b>Notes:</b> {notes}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+def render_edge_engine_tab(board, dates=None):
+    st.markdown("### ⚡ Edge Engine 9.5")
+    st.caption("Projection + live line + OVER/UNDER edge + safety score + false-edge warnings. Display layer only; K projection math is untouched.")
+    df = edge_engine_build_board(board)
+    if df is None or df.empty:
+        st.info("No Edge Engine board yet. Refresh the live board first.")
+        return
+    strong = df[df["Edge Grade"].astype(str).str.contains("ELITE|STRONG", regex=True, na=False)]
+    clean = df[df["Edge Flags"].astype(str).eq("Clean")]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Edges", len(df))
+    c2.metric("Elite/Strong", len(strong))
+    c3.metric("Clean", len(clean))
+    c4.metric("Best Score", f"{safe_float(df['Edge Engine Score'].max(), 0):.1f}")
+    render_edge_engine_cards(df, "Top Edge Engine Cards", max_cards=8)
+    keep = [c for c in ["Prop","Player","Matchup","Edge Pick","Edge Projection","Edge Line","Edge Gap","Decision","Tier","Confidence %","Edge Engine Score","Edge Grade","Edge Flags","Edge Notes"] if c in df.columns]
+    st.dataframe(df[keep].head(60), use_container_width=True, hide_index=True)
+
+def render_edge_analytics_tab(board, dates=None):
+    st.markdown("### 📊 Edge Analytics")
+    st.caption("Shows edge distribution and grading health. Display layer only.")
+    df = edge_engine_build_board(board)
+    results = load_json(RESULT_LOG, [])
+    finished = [r for r in results if r.get("actual") is not None and (r.get("graded_result") in ["WIN","LOSS"] or r.get("win") is not None)]
+    wins = sum(1 for r in finished if r.get("graded_result") == "WIN" or r.get("win") is True)
+    losses = sum(1 for r in finished if r.get("graded_result") == "LOSS" or r.get("win") is False)
+    total = wins + losses
+    wr = round((wins / total) * 100, 1) if total else 0
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Graded", total)
+    c2.metric("Record", f"{wins}-{losses}")
+    c3.metric("Win Rate", f"{wr}%")
+    c4.metric("Current Edges", 0 if df is None else len(df))
+    if df is not None and not df.empty:
+        st.dataframe(df.groupby("Edge Grade", dropna=False).size().reset_index(name="Count"), use_container_width=True, hide_index=True)
+        cols = [c for c in ["Player","Matchup","Edge Pick","Edge Projection","Edge Line","Edge Gap","Edge Engine Score","Edge Grade","Edge Flags"] if c in df.columns]
+        st.dataframe(df[cols].head(60), use_container_width=True, hide_index=True)
+
+EDGE_ENGINE_MOBILE_POLISH_CSS = """
+<style>
+@media(max-width:900px){
+    .block-container{padding-left:.65rem!important;padding-right:.65rem!important;}
+    .kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr))!important;}
+    [data-testid="stMetric"]{padding:10px!important;border-radius:14px!important;}
+    .stTabs [data-baseweb="tab"]{height:38px!important;padding:7px 10px!important;font-size:12px!important;}
+}
+</style>
+"""
+try:
+    st.markdown(EDGE_ENGINE_MOBILE_POLISH_CSS, unsafe_allow_html=True)
+except Exception:
+    pass
+
+
+tab_kproj, tab_edge_engine, tab_edge_analytics, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
+    "EDGE ENGINE",
+    "EDGE ANALYTICS",
     "TOP PLAYS",
     "BEST 4 BUILDER",
     "ALL PLAYERS",
@@ -6862,6 +7158,12 @@ tab_kproj, tab1, tab_best4, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 
 with tab_kproj:
     render_kproj_tab(board)
+
+with tab_edge_engine:
+    render_edge_engine_tab(board, dates)
+
+with tab_edge_analytics:
+    render_edge_analytics_tab(board, dates)
 
 with tab1:
     st.markdown('<div class="section-title-pro">Top Plays</div>', unsafe_allow_html=True)
