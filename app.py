@@ -5774,8 +5774,7 @@ def kproj_recent_form_projection(p, expected_bf=None):
         blended = (matchup_projection * 0.70) + (k9_projection * 0.20) + ((matchup_projection + opportunity) * 0.10)
 
     # Do not let this layer create absurd projections on low-skill arms.
-    cap = 10.25 if pk >= 0.300 or k9 >= 10.0 else 
-9.25 if pk >= 0.270 or k9 >= 9.0 else 8.25 if pk >= 0.245 else 7.15
+    cap = 10.25 if pk >= 0.300 or k9 >= 10.0 else 9.25 if pk >= 0.270 or k9 >= 9.0 else 8.25 if pk >= 0.245 else 7.15
     return round(float(clamp(blended, 0.0, cap)), 2)
 
 def kproj_upside_projection(p):
