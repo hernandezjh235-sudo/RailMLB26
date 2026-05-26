@@ -20,7 +20,7 @@ import streamlit as st
 from math import exp, factorial
 from datetime import datetime, timedelta
 
-APP_VERSION = "v11.17 K PROJ UPSIDE TAB + RECENT FORM TRUE TALENT"
+APP_VERSION = "v11.17 K PROJ UPSIDE TAB + REALISM + K SKILL ARCHETYPE"
 
 try:
     import pytz
@@ -5883,6 +5883,13 @@ def kproj_upside_projection(p):
     if leash in ["SHORT_RECENT_STARTS", "HIGH_PITCH_COUNT", "HIGH_RECENT_WORKLOAD"] and ceiling_risk < 45 and upside < 55:
         proj -= 0.10
 
+    # v11.18 K Skill Stability / pitcher archetype refinement.
+    # Small, capped projection correction: prevents matchup-only arms from being
+    # over-amplified, while protecting volatile under-spike arms from fake UNDER confidence.
+    if globals().get("KPROJ_ARCHETYPE_ENABLED", True):
+        archetype_profile = kproj_pitcher_archetype_profile(p, projected_ks=proj, expected_bf=expected_bf)
+        proj = kproj_apply_archetype_projection_adjustment(proj, p, archetype_profile)
+
     true_floor, _floor_note = kproj_true_projection_floor(p)
     if true_floor is not None and proj < true_floor:
         proj += min(true_floor - proj, KPROJ_MAX_PROJECTION_LIFT)
@@ -5904,6 +5911,224 @@ KPROJ_MIN_LEAN_GAP_OVER = 0.55
 KPROJ_MIN_LEAN_GAP_UNDER = 1.15
 KPROJ_MIN_OFFICIAL_HIT_RATE = 0.62
 KPROJ_MIN_LEAN_HIT_RATE = 0.56
+
+# Small official-play filter tweak: projections still decide direction,
+# but official OVERs need stronger edge + simulation + volume/role context.
+# This does NOT change K PROJ math. It only downgrades medium OVERS to OL/PASS.
+KPROJ_STRICT_OVER_EDGE = 1.00
+KPROJ_STRICT_OVER_HIT_RATE = 0.65
+KPROJ_STRICT_OVER_MIN_BF = 21.0
+KPROJ_STRICT_OVER_MIN_ROLE = 60
+
+# =========================
+# v11.18 K SKILL STABILITY / ARCHETYPE SETTINGS
+# =========================
+# Small correction layer only. It does NOT rewrite the engine.
+# Goal: avoid fake matchup-driven overs on non-elite arms and avoid fake UNDER
+# confidence on volatile arms that can spike Ks.
+KPROJ_ARCHETYPE_ENABLED = True
+KPROJ_MATCHUP_TRAP_SCORE = 70
+KPROJ_HIDDEN_SPIKE_BLOCK_UNDER = 62
+KPROJ_ARCHETYPE_MAX_HAIRCUT = 0.38
+KPROJ_ARCHETYPE_MAX_SPIKE_LIFT = 0.22
+
+
+def kproj_pitcher_archetype_profile(p, projected_ks=None, expected_bf=None):
+    """K UPSIDE TAB ONLY: classify whether a pitcher truly creates Ks or is matchup-assisted.
+
+    This is intentionally conservative and capped. It helps the app distinguish:
+    - true strikeout creators who deserve full matchup boosts
+    - mid-tier arms whose projection is mostly created by opponent K%
+    - volatile/unknown arms that should not be trusted for aggressive UNDERs
+    """
+    pk = safe_float(p.get("pitcher_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
+    ok = safe_float(p.get("opp_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
+    bf = safe_float(expected_bf, safe_float(p.get("expected_bf"), DEFAULT_BF)) or DEFAULT_BF
+    k9 = kproj_historical_k9(p)
+    putaway, put_label = kproj_putaway_value(p)
+    putaway = safe_float(putaway)
+    recent_max, recent_avg, recent_n = kproj_recent_ceiling_stats(p)
+    line, _src = kproj_line_for_display(p)
+    proj = safe_float(projected_ks, safe_float(p.get("projection"), 0.0)) or 0.0
+    role_score = 60
+    starter_score = 60
+    try:
+        role_score = kproj_role_stability_score(p)[0]
+        starter_score = kproj_starter_confirmation_score(p)[0]
+    except Exception:
+        pass
+    leash = str(p.get("leash_risk") or "").upper()
+    lineup_status = str(p.get("lineup_status") or "").upper()
+
+    score = 20.0
+    if pk >= 0.300:
+        score += 30
+    elif pk >= 0.270:
+        score += 24
+    elif pk >= 0.245:
+        score += 18
+    elif pk >= 0.225:
+        score += 12
+    elif pk >= 0.205:
+        score += 6
+
+    if putaway is not None:
+        if putaway >= 31:
+            score += 22
+        elif putaway >= 28:
+            score += 17
+        elif putaway >= 24:
+            score += 10
+        elif putaway >= 21:
+            score += 5
+        else:
+            score -= 3
+
+    if k9 >= 10.0:
+        score += 16
+    elif k9 >= 9.0:
+        score += 12
+    elif k9 >= 8.0:
+        score += 7
+    elif k9 and k9 < 7.0:
+        score -= 4
+
+    if bf >= 25:
+        score += 10
+    elif bf >= 22:
+        score += 7
+    elif bf >= 20:
+        score += 3
+    elif bf <= 18:
+        score -= 8
+
+    if recent_n:
+        if recent_max >= 8:
+            score += 10
+        elif recent_max >= 6:
+            score += 6
+        if recent_avg >= 5.5:
+            score += 8
+        elif recent_avg >= 4.5:
+            score += 4
+
+    if role_score >= 75:
+        score += 7
+    elif role_score < 50:
+        score -= 7
+    if starter_score >= 75:
+        score += 5
+    elif starter_score < 50:
+        score -= 5
+    if leash in ["SHORT_RECENT_STARTS", "HIGH_PITCH_COUNT", "HIGH_RECENT_WORKLOAD"]:
+        score -= 6
+    if "FALLBACK" in lineup_status:
+        score -= 3
+
+    stability = int(clamp(round(score), 0, 100))
+    if stability >= 74:
+        archetype = "TRUE_K_CREATOR"
+    elif stability >= 62:
+        archetype = "STABLE_STRIKEOUT_ARM"
+    elif stability >= 45:
+        archetype = "MATCHUP_ASSISTED"
+    else:
+        archetype = "VOLATILE_UNKNOWN"
+
+    # Matchup-trap score: opponent K% is doing too much work for a pitcher whose
+    # own bat-missing skill is not strong enough to deserve a full boost.
+    matchup_trap = 0.0
+    if ok >= 0.235:
+        matchup_trap += 28
+    elif ok >= 0.225:
+        matchup_trap += 16
+    if pk < 0.235:
+        matchup_trap += 28
+    elif pk < 0.245:
+        matchup_trap += 15
+    if putaway is not None and putaway < 24:
+        matchup_trap += 22
+    if bf < 22:
+        matchup_trap += 12
+    if role_score < 60:
+        matchup_trap += 12
+    if line is not None and proj > line:
+        matchup_trap += min(14, max(0, (proj - line) * 4))
+    matchup_trap = int(clamp(round(matchup_trap), 0, 100))
+
+    # Hidden spike score: protects against fake UNDERs on volatile arms/unknowns
+    # with enough strikeout path to jump over despite a median under projection.
+    hidden_spike = 0.0
+    if recent_max >= 6:
+        hidden_spike += 22
+    if putaway is not None and putaway >= 24:
+        hidden_spike += 16
+    if ok >= 0.230:
+        hidden_spike += 16
+    if bf >= 21:
+        hidden_spike += 12
+    if pk >= 0.215:
+        hidden_spike += 10
+    if k9 >= 8.0:
+        hidden_spike += 10
+    if role_score >= 55:
+        hidden_spike += 8
+    if line is not None and proj < line and abs(line - proj) <= 1.25:
+        hidden_spike += 10
+    hidden_spike = int(clamp(round(hidden_spike), 0, 100))
+
+    return {
+        "stability_score": stability,
+        "archetype": archetype,
+        "matchup_trap_score": matchup_trap,
+        "hidden_spike_score": hidden_spike,
+        "putaway": putaway,
+        "putaway_label": put_label,
+    }
+
+
+def kproj_apply_archetype_projection_adjustment(proj, p, profile=None):
+    """Small projection adjustment for pitcher archetype.
+
+    It trims only matchup-inflated non-elite overs and gives only a tiny lift
+    to under-spike-risk arms. Elite/stable K creators are left alone.
+    """
+    if not KPROJ_ARCHETYPE_ENABLED:
+        return proj
+    proj = safe_float(proj, 0.0) or 0.0
+    line, _src = kproj_line_for_display(p)
+    pk = safe_float(p.get("pitcher_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
+    ok = safe_float(p.get("opp_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
+    bf = safe_float(p.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF
+    profile = profile or kproj_pitcher_archetype_profile(p, projected_ks=proj, expected_bf=bf)
+    stability = safe_float(profile.get("stability_score"), 50) or 50
+    trap = safe_float(profile.get("matchup_trap_score"), 0) or 0
+    spike = safe_float(profile.get("hidden_spike_score"), 0) or 0
+    putaway = safe_float(profile.get("putaway"))
+
+    # Soft haircut: only matchup-assisted/non-elite OVER projections.
+    if line is not None and proj > line and trap >= KPROJ_MATCHUP_TRAP_SCORE and stability < 62:
+        haircut = 0.12
+        if pk < 0.235:
+            haircut += 0.08
+        if putaway is not None and putaway < 24:
+            haircut += 0.07
+        if bf < 22:
+            haircut += 0.05
+        if ok >= 0.235:
+            haircut += 0.04
+        # Bigger projected edges can keep most of their edge; cap the correction.
+        proj -= min(KPROJ_ARCHETYPE_MAX_HAIRCUT, haircut)
+
+    # Hidden over-spike guard: tiny lift only when an UNDER is close enough and
+    # real strikeout indicators say it can jump. This is NOT a forced over.
+    if line is not None and proj < line and spike >= KPROJ_HIDDEN_SPIKE_BLOCK_UNDER:
+        gap_to_line = line - proj
+        if gap_to_line <= 1.35:
+            lift = min(KPROJ_ARCHETYPE_MAX_SPIKE_LIFT, 0.06 + (spike - KPROJ_HIDDEN_SPIKE_BLOCK_UNDER) * 0.004)
+            proj += lift
+
+    return round(float(clamp(proj, 0.0, 15.0)), 2)
 
 
 # =========================
@@ -6166,46 +6391,131 @@ def kproj_probable_innings_floor(p):
     return round(float(clamp(floor_ip, 0.0, 8.0)), 2)
 
 
-def kproj_sim_hit_rate(proj, line, side, p):
-    """Conservative hit-rate proxy. Uses no extra dependencies and does not change projection."""
-    proj = safe_float(proj, 0) or 0
-    line = safe_float(line)
-    if line is None:
-        return None
+def kproj_distribution_profile(proj, line, p):
+    """K UPSIDE TAB ONLY: true distribution layer.
 
+    Returns floor / median / ceiling plus OVER and UNDER probabilities.
+    This is not a forced over boost. It widens outcomes for volatile strikeout
+    arms and makes UNDER confidence softer when the pitcher has real ceiling.
+    """
+    mean = safe_float(proj, 0.0) or 0.0
+    line = safe_float(line)
+    pk = safe_float(p.get("pitcher_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
+    ok = safe_float(p.get("opp_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
+    bf = safe_float(p.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF
+    p90 = safe_float(p.get("p90"))
+    upside = safe_float(p.get("elite_upside_score"), 0.0) or 0.0
     role_score, _, _ = kproj_role_stability_score(p)
     starter_score, _ = kproj_starter_confirmation_score(p)
     ip_floor = kproj_probable_innings_floor(p)
-    upside = safe_float(p.get("elite_upside_score"), 0) or 0
+    ceiling_risk, _ = kproj_ceiling_risk_score(p)
 
-    std = 1.20
-    if role_score < 60:
-        std += 0.35
-    if starter_score < 65:
+    recent_vals = [safe_float(x, None) for x in (p.get("last_10_ks") or [])[:10]]
+    recent_vals = [float(x) for x in recent_vals if x is not None]
+    recent_sd = 0.0
+    recent_max = 0.0
+    recent_avg = 0.0
+    if recent_vals:
+        recent_avg = float(np.mean(recent_vals))
+        recent_sd = float(np.std(recent_vals)) if len(recent_vals) >= 3 else 1.15
+        recent_max = max(recent_vals)
+
+    # Base spread: strikeouts are discrete and volatile. Higher talent/ceiling
+    # expands the upside tail; poor role stability expands uncertainty both ways.
+    std = 1.05
+    std += min(0.75, max(0.0, recent_sd * 0.22))
+    if pk >= 0.285:
         std += 0.25
-    if ip_floor < 4.0:
-        std += 0.30
-    if upside >= 60:
+    elif pk >= 0.255:
         std += 0.15
+    if ok >= 0.240:
+        std += 0.10
+    if ceiling_risk >= 70:
+        std += 0.28
+    elif ceiling_risk >= 55:
+        std += 0.16
+    if upside >= 70:
+        std += 0.20
+    elif upside >= 55:
+        std += 0.12
+    if bf >= 26:
+        std += 0.10
+    if role_score < 60:
+        std += 0.25
+    if starter_score < 60:
+        std += 0.18
+    if ip_floor is not None and ip_floor < 4.0:
+        std += 0.18
 
-    z = (proj - line) / max(std, 0.65)
-    over_prob = 0.5 * (1 + math.erf(z / math.sqrt(2)))
+    # Keep probabilities realistic; do not allow fake 99% unless the edge is enormous.
+    std = float(clamp(std, 0.95, 2.45))
 
+    # Distribution anchors. p90 from the main simulation can inform the ceiling,
+    # but cannot drag the current median around.
+    floor = max(0.0, mean - 1.15 * std)
+    median = mean
+    ceiling = mean + 1.25 * std
+    if p90 is not None and p90 > 0:
+        ceiling = max(ceiling, (mean * 0.70) + (p90 * 0.30))
+    if recent_max >= 8:
+        ceiling = max(ceiling, mean + 1.45)
+    elif recent_max >= 6:
+        ceiling = max(ceiling, mean + 0.95)
+
+    # Normal CDF approximation with continuity correction for strikeout counts.
+    def norm_cdf(x):
+        return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+    if line is None:
+        over_prob = None
+        under_prob = None
+    else:
+        over_needed = required_ks_for_over(line)
+        # P(K >= over_needed) ~= P(X > over_needed - 0.5)
+        threshold = over_needed - 0.5
+        z = (threshold - mean) / max(std, 0.50)
+        over_prob = 1 - norm_cdf(z)
+        under_prob = 1 - over_prob
+
+        # Soft UNDER protection: high-ceiling pitchers should rarely show extreme
+        # UNDER confidence unless the projection gap is very large.
+        if mean < line and ceiling_risk >= 60:
+            under_prob = min(under_prob, 0.68 if ceiling_risk >= 75 else 0.72)
+            over_prob = 1 - under_prob
+
+        # Fallback lineups are uncertain; pull extreme probabilities slightly toward 50.
+        lineup_status = str(p.get("lineup_status") or "").upper()
+        if "FALLBACK" in lineup_status:
+            over_prob = 0.50 + ((over_prob - 0.50) * 0.88)
+            under_prob = 1 - over_prob
+
+        over_prob = float(clamp(over_prob, 0.03, 0.97))
+        under_prob = float(clamp(under_prob, 0.03, 0.97))
+
+    return {
+        "floor": round(float(floor), 2),
+        "median": round(float(median), 2),
+        "ceiling": round(float(ceiling), 2),
+        "volatility": round(float(std), 2),
+        "recent_avg": round(float(recent_avg), 2),
+        "recent_max": round(float(recent_max), 2),
+        "over_prob": None if over_prob is None else round(float(over_prob), 3),
+        "under_prob": None if under_prob is None else round(float(under_prob), 3),
+    }
+
+
+def kproj_sim_hit_rate(proj, line, side, p):
+    """Distribution-aware hit-rate proxy for the K PROJ / Upside tab."""
+    line = safe_float(line)
+    if line is None:
+        return None
+    dist = kproj_distribution_profile(proj, line, p)
     side_str = str(side).upper()
     if side_str.startswith("OVER"):
-        prob = over_prob
-    elif side_str.startswith("UNDER"):
-        prob = 1 - over_prob
-        if upside >= 60:
-            prob -= 0.04
-        if role_score < 60:
-            prob -= 0.03
-    else:
-        prob = 0.50
-
-    prob += ((role_score - 70) / 1000.0) + ((starter_score - 70) / 1200.0)
-    return round(float(clamp(prob, 0.01, 0.99)), 3)
-
+        return dist.get("over_prob")
+    if side_str.startswith("UNDER"):
+        return dist.get("under_prob")
+    return 0.50
 
 def kproj_confidence_tier(conf, hit_rate, gap, role_score):
     conf = safe_float(conf, 0.50) or 0.50
@@ -6222,13 +6532,23 @@ def kproj_confidence_tier(conf, hit_rate, gap, role_score):
 
 
 def kproj_decision(p):
+    """
+    Projection-first decision logic for the K PROJ / Upside tab.
+
+    Philosophy:
+    1) Build the true K projection first.
+    2) Use sim probability second.
+    3) PASS only when data/role is bad or edge is truly too thin.
+    4) Always keep directional output: PASS — OVER / PASS — UNDER.
+    """
     line, line_source = kproj_line_for_display(p)
     proj = kproj_upside_projection(p)
 
     if line is None:
         return {
             "line": None, "line_source": line_source, "projection": proj,
-            "side": "NO LINE", "confidence": None, "decision": "🚫 NO UD LINE", "over_needed": None,
+            "side": "NO LINE", "lean_side": "NO LINE", "lean_gap": None,
+            "confidence": None, "decision": "🚫 NO UD LINE", "over_needed": None,
             "under_max": None, "line_edge": None, "edge_display": "—", "edge_class": "yellow-badge",
             "hit_rate": None, "tier": "NO LINE", "role_score": None, "starter_score": None,
             "ip_floor": None, "edge_gap": None,
@@ -6238,9 +6558,15 @@ def kproj_decision(p):
     over_needed = required_ks_for_over(line)
     under_max = max_ks_for_under(line)
 
-    # Half-point cash logic: over must reach the required cash number.
-    diff_to_over = proj - over_needed
-    diff_to_under = under_max - proj
+    # True line edge: this drives model direction. Cash-number logic is still displayed.
+    line_edge = round(float(proj - line), 2)
+    abs_edge = abs(line_edge)
+    model_side = "OVER" if proj >= line else "UNDER"
+
+    # Cash-number edge: useful for explaining half-point lines.
+    diff_to_over_cash = proj - over_needed
+    diff_to_under_cash = under_max - proj
+    pass_direction_gap = line_edge if model_side == "OVER" else -line_edge
 
     upside = safe_float(p.get("elite_upside_score"), 0.0) or 0.0
     pk = safe_float(p.get("pitcher_k"), LEAGUE_AVG_K) or LEAGUE_AVG_K
@@ -6249,99 +6575,102 @@ def kproj_decision(p):
     role_score, role_note, _ = kproj_role_stability_score(p)
     starter_score, starter_note = kproj_starter_confirmation_score(p)
     ip_floor = kproj_probable_innings_floor(p)
+    ceiling_risk, ceiling_note = kproj_ceiling_risk_score(p)
+    true_floor, true_floor_note = kproj_true_projection_floor(p)
+    archetype_profile = kproj_pitcher_archetype_profile(p, projected_ks=proj, expected_bf=safe_float(p.get("expected_bf"), DEFAULT_BF))
+    matchup_trap_score = safe_float(archetype_profile.get("matchup_trap_score"), 0) or 0
+    hidden_spike_score = safe_float(archetype_profile.get("hidden_spike_score"), 0) or 0
+    k_stability_score = safe_float(archetype_profile.get("stability_score"), 50) or 50
 
-    # Always keep the model's preferred direction, even if strict gates say PASS.
-    # This lets the UI show PASS — OVER / PASS — UNDER without making it an official play.
-    if diff_to_over > diff_to_under:
-        pass_direction = "OVER"
-        pass_direction_gap = diff_to_over
-    elif diff_to_under > diff_to_over:
-        pass_direction = "UNDER"
-        pass_direction_gap = diff_to_under
-    else:
-        pass_direction = "OVER" if proj >= line else "UNDER"
-        pass_direction_gap = max(diff_to_over, diff_to_under)
+    # Sim probability comes after projection direction.
+    hit_rate = kproj_sim_hit_rate(proj, line, model_side, p)
+    hit_rate_val = safe_float(hit_rate, 0.50) or 0.50
+
+    # PASS should mean data/role problem or no meaningful edge, not fear of a good projection.
+    bad_data = False
+    bad_data_reasons = []
+    if role_score < 45:
+        bad_data = True; bad_data_reasons.append(f"bad role score {role_score}/100")
+    if starter_score < 45:
+        bad_data = True; bad_data_reasons.append(f"bad starter score {starter_score}/100")
+    if ip_floor is not None and ip_floor < 2.6:
+        bad_data = True; bad_data_reasons.append(f"bad IP floor {ip_floor}")
 
     side = "PASS"
-    conf = 0.50
-    gap = 0.0
-
-    # Official OVER: keep v11.17 strength, but require real edge.
-    if diff_to_over >= KPROJ_MIN_OFFICIAL_GAP_OVER:
-        side = "OVER"
-        gap = diff_to_over
-        conf = clamp(0.60 + min(diff_to_over, 2.5) * 0.055 + upside / 1000.0, 0.50, 0.80)
-
-    # Official UNDER: intentionally stricter after the bad under spike day.
-    elif diff_to_under >= KPROJ_MIN_OFFICIAL_GAP_UNDER and upside < 50 and role_score >= 70:
-        side = "UNDER"
-        gap = diff_to_under
-        conf = clamp(0.60 + min(diff_to_under, 2.5) * 0.045 - max(0, upside - 45) / 1000.0, 0.50, 0.77)
-
-    # Lean-only OVER.
-    elif diff_to_over >= KPROJ_MIN_LEAN_GAP_OVER and pk >= 0.25 and ok >= 0.225:
-        side = "OVER LEAN"
-        gap = diff_to_over
-        conf = 0.56
-
-    # Lean-only UNDER. No high-upside under leans.
-    elif diff_to_under >= KPROJ_MIN_LEAN_GAP_UNDER and upside <= 38 and role_score >= 70:
-        side = "UNDER LEAN"
-        gap = diff_to_under
-        conf = 0.55
-
-    # Old near-number upside lean preserved, but only as a weak lean.
-    elif pk >= 0.27 and ok >= 0.235 and upside >= 55 and diff_to_over > 0.25:
-        side = "OVER LEAN"
-        gap = diff_to_over
-        conf = 0.55
-
-    hit_rate = kproj_sim_hit_rate(proj, line, side, p)
-    tier = kproj_confidence_tier(conf, hit_rate, gap, role_score)
+    conf = hit_rate_val
+    gap = abs_edge
     reasons = []
 
-    if side in ["OVER", "UNDER"] and hit_rate is not None and hit_rate < KPROJ_MIN_OFFICIAL_HIT_RATE:
-        side = f"{side} LEAN"
-        reasons.append("downgraded: hit-rate below official gate")
-
-    ceiling_risk, ceiling_note = kproj_ceiling_risk_score(p)
-
-    # Hard under block: if a pitcher has real strikeout ceiling, do not trust UNDER.
-    if "UNDER" in side and (upside >= 50 or ceiling_risk >= KPROJ_CEILING_RISK_BLOCK_UNDER or pk >= 0.255):
+    if bad_data:
         side = "PASS"
-        reasons.append(f"blocked under: K ceiling/talent risk {ceiling_risk}/100")
-    elif "UNDER" in side and ceiling_risk >= KPROJ_CEILING_RISK_WARN_UNDER:
-        side = "UNDER LEAN" if side == "UNDER" else side
-        reasons.append(f"downgraded under: ceiling warning {ceiling_risk}/100")
+        reasons.extend(bad_data_reasons)
+    else:
+        if model_side == "OVER":
+            # Official OVER: projection edge + sim probability + usable volume/role context.
+            # This is intentionally stricter than before to improve win rate by cutting
+            # medium-edge overs, while keeping projection math unchanged.
+            expected_bf_gate = safe_float(p.get("expected_bf"), DEFAULT_BF) or DEFAULT_BF
+            strong_over_setup = (
+                abs_edge >= KPROJ_STRICT_OVER_EDGE
+                and hit_rate_val >= KPROJ_STRICT_OVER_HIT_RATE
+                and expected_bf_gate >= KPROJ_STRICT_OVER_MIN_BF
+                and role_score >= KPROJ_STRICT_OVER_MIN_ROLE
+                and not (matchup_trap_score >= KPROJ_MATCHUP_TRAP_SCORE and k_stability_score < 62 and abs_edge < 1.75)
+            )
 
-    # Do not make official UNDERs when the cash edge is thin.
-    if side == "UNDER" and diff_to_under < KPROJ_MIN_UNDER_EDGE_NO_CEILING:
-        side = "UNDER LEAN"
-        reasons.append(f"downgraded under: edge below {KPROJ_MIN_UNDER_EDGE_NO_CEILING:.1f} Ks")
+            if strong_over_setup:
+                side = "OVER"
+            elif abs_edge >= 0.30 and hit_rate_val >= 0.54:
+                side = "OVER LEAN"
+                if matchup_trap_score >= KPROJ_MATCHUP_TRAP_SCORE and k_stability_score < 62:
+                    reasons.append(f"downgraded: matchup-assisted pitcher profile (K stability {int(k_stability_score)}/100)")
+                elif abs_edge >= KPROJ_STRICT_OVER_EDGE and hit_rate_val >= KPROJ_STRICT_OVER_HIT_RATE:
+                    reasons.append("downgraded: official over needs stronger BF/role context")
+            else:
+                side = "PASS"
+                reasons.append("thin over edge / low sim probability")
 
-    if side == "OVER" and (role_score < 58 or starter_score < 58 or ip_floor < 3.7):
-        side = "OVER LEAN"
-        reasons.append("downgraded: role/IP floor risk")
+            # Role/IP risk downgrades but does not erase direction.
+            if side == "OVER" and (role_score < 58 or starter_score < 58 or (ip_floor is not None and ip_floor < 3.7)):
+                side = "OVER LEAN"
+                reasons.append("downgraded: role/IP floor risk")
 
-    if side == "UNDER" and role_score < 70:
-        side = "UNDER LEAN"
-        reasons.append("downgraded: under needs stable role")
+        else:
+            # Official UNDER is stricter because ceiling arms have been nuking unders.
+            dangerous_under = (
+                ceiling_risk >= KPROJ_CEILING_RISK_BLOCK_UNDER
+                or hidden_spike_score >= KPROJ_HIDDEN_SPIKE_BLOCK_UNDER
+                or upside >= 55
+                or (pk >= 0.255 and ok >= 0.220)
+            )
 
-    # Re-score tier after possible downgrade.
+            if dangerous_under:
+                side = "PASS"
+                reasons.append(f"blocked under: ceiling/talent/spike risk {max(int(ceiling_risk), int(hidden_spike_score))}/100")
+            elif abs_edge >= 1.25 and hit_rate_val >= 0.62 and role_score >= 62:
+                side = "UNDER"
+            elif abs_edge >= 0.45 and hit_rate_val >= 0.55:
+                side = "UNDER LEAN"
+            else:
+                side = "PASS"
+                reasons.append("thin under edge / low sim probability")
+
+    # Tier is informational. It should not override a valid projection+sim pick.
     tier = kproj_confidence_tier(conf, hit_rate, gap, role_score)
+    if side in ["OVER", "UNDER"] and tier == "PASS":
+        tier = "C"
 
     if side == "OVER":
-        decision = "🔥 OVER" if tier in ["A", "B"] else "⚠️ OVER LEAN"
+        decision = "🔥 OVER" if hit_rate_val >= 0.64 and abs_edge >= 1.00 else "✅ OVER"
     elif side == "UNDER":
-        decision = "🔥 UNDER" if tier in ["A", "B"] else "⚠️ UNDER LEAN"
+        decision = "🔥 UNDER" if hit_rate_val >= 0.65 and abs_edge >= 1.50 else "✅ UNDER"
     elif side == "OVER LEAN":
         decision = "⚠️ OVER LEAN"
     elif side == "UNDER LEAN":
         decision = "⚠️ UNDER LEAN"
     else:
-        decision = f"🚫 PASS — {pass_direction}"
+        decision = f"🚫 PASS — {model_side}"
 
-    line_edge = round(float(proj - line), 2)
     edge_display = f"{line_edge:+.2f} K"
     if line_edge >= 1.5 or line_edge <= -1.25:
         edge_class = "good-badge"
@@ -6351,21 +6680,23 @@ def kproj_decision(p):
         edge_class = "red-badge"
 
     note_parts = [
+        f"Projection-first decision",
+        f"Archetype {archetype_profile.get('archetype')} | K stability {int(k_stability_score)}/100 | trap {int(matchup_trap_score)}/100 | spike {int(hidden_spike_score)}/100",
         f"Over needs {over_needed}+",
         f"Under wins {under_max} or fewer",
-        f"gap={round(gap, 2)}",
-        f"model lean={pass_direction}",
-        f"lean gap={round(pass_direction_gap, 2)}",
-        f"hit={None if hit_rate is None else round(hit_rate * 100, 1)}%",
+        f"line edge={line_edge:+.2f}",
+        f"model lean={model_side}",
+        f"hit={round(hit_rate_val * 100, 1)}%",
         f"tier={tier}",
         f"role={role_score}/100",
         f"starter={starter_score}/100",
         f"IP floor={ip_floor}",
         f"ceiling risk={ceiling_risk}/100",
+        f"cash over edge={round(diff_to_over_cash, 2)}",
+        f"cash under edge={round(diff_to_under_cash, 2)}",
     ]
     if ceiling_note:
         note_parts.append(ceiling_note)
-    true_floor, true_floor_note = kproj_true_projection_floor(p)
     if true_floor_note:
         note_parts.append(true_floor_note)
     if role_note:
@@ -6377,7 +6708,7 @@ def kproj_decision(p):
 
     return {
         "line": line, "line_source": line_source, "projection": proj,
-        "side": side, "lean_side": pass_direction, "lean_gap": round(pass_direction_gap, 2),
+        "side": side, "lean_side": model_side, "lean_gap": round(pass_direction_gap, 2),
         "confidence": round(conf, 3), "decision": decision,
         "over_needed": over_needed, "under_max": under_max,
         "line_edge": line_edge, "edge_display": edge_display, "edge_class": edge_class,
@@ -6400,6 +6731,7 @@ def kproj_bar_html(vals):
 
 def render_kproj_pitcher_card(p):
     d = kproj_decision(p)
+    dist = kproj_distribution_profile(d.get("projection"), d.get("line"), p)
     putaway, put_label = kproj_putaway_value(p)
     put_display = "—" if putaway is None else f"{putaway:.1f}%"
     pk = safe_float(p.get("pitcher_k"), 0.0) or 0.0
@@ -6407,6 +6739,7 @@ def render_kproj_pitcher_card(p):
     bf = safe_float(p.get("expected_bf"), 0.0) or 0.0
     line_display = "NO LINE" if d["line"] is None else f"{d['line']:.1f}"
     conf_display = "—" if d["confidence"] is None else f"{d['confidence']*100:.0f}%"
+    dist_display = f"F {dist.get('floor')} | M {dist.get('median')} | C {dist.get('ceiling')}"
     edge_display = d.get("edge_display", "—")
     edge_class = d.get("edge_class", "yellow-badge")
     needs_display = "—" if d.get("over_needed") is None else f"{d.get('over_needed')}+"
@@ -6430,10 +6763,11 @@ def render_kproj_pitcher_card(p):
         <div><div class="small-muted">Decision</div><div class="big-number green" style="font-size:32px;">{d['decision']}</div><div class="small-muted">Confidence {conf_display}</div></div>
       </div>
       <div class="hr-soft"></div>
-      <div class="kpi-strip" style="grid-template-columns:repeat(4,minmax(0,1fr));">
+      <div class="kpi-strip" style="grid-template-columns:repeat(5,minmax(0,1fr));">
         <div class="kpi-box"><div class="kpi-label">{put_label}</div><div class="kpi-value">{put_display}</div><div class="kpi-sub">Putaway/stuff proxy</div></div>
         <div class="kpi-box"><div class="kpi-label">Pitcher K%</div><div class="kpi-value">{pk*100:.1f}%</div><div class="kpi-sub">Season/recent blend</div></div>
         <div class="kpi-box"><div class="kpi-label">Opp K%</div><div class="kpi-value">{ok*100:.1f}%</div><div class="kpi-sub">Lineup/team matchup</div></div>
+        <div class="kpi-box"><div class="kpi-label">Distribution</div><div class="kpi-value" style="font-size:17px;">{dist_display}</div><div class="kpi-sub">Floor | Median | Ceiling</div></div>
         <div class="kpi-box"><div class="kpi-label">Last 10 Starts</div>{recent_html}</div>
       </div>
     </div>
@@ -6458,10 +6792,17 @@ def build_kproj_table(board):
     rows = []
     for p in board or []:
         d = kproj_decision(p)
+        dist = kproj_distribution_profile(d.get("projection"), d.get("line"), p)
         rows.append({
             "Pitcher": p.get("pitcher"),
             "Matchup": p.get("matchup"),
             "K PROJ": d.get("projection"),
+            "Floor": dist.get("floor"),
+            "Median": dist.get("median"),
+            "Ceiling": dist.get("ceiling"),
+            "Volatility": dist.get("volatility"),
+            "Over Sim %": None if dist.get("over_prob") is None else round(dist.get("over_prob") * 100, 1),
+            "Under Sim %": None if dist.get("under_prob") is None else round(dist.get("under_prob") * 100, 1),
             "UD/Line": d.get("line"),
             "Line Source": d.get("line_source"),
             "Decision": d.get("decision"),
@@ -6489,7 +6830,7 @@ def build_kproj_table(board):
 
 def render_kproj_tab(board):
     st.markdown('<div class="section-title-pro">K PROJ / Pure Upside Model</div>', unsafe_allow_html=True)
-    st.caption("Built to mirror the K-projection style: raw K ceiling, batter matchup, expected BF, recent Ks, and Underdog line. Display-only; main BET/LEAN/PASS engine stays unchanged.")
+    st.caption("K Upside now uses true-talent projection + distribution simulation: floor, median, ceiling, volatility, recent Ks, BF, matchup, and Underdog line. Main engine stays separate.")
     if not board:
         st.info("Click 🔄 Refresh Live Board first.")
         return
