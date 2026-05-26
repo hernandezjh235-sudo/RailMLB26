@@ -23,6 +23,10 @@ from datetime import datetime, timedelta
 
 APP_VERSION = "v11.17 + EDGE ENGINE 9.5 SAFE FILTER — CORE K PROJ UNTOUCHED"
 
+
+# Manual/fake line entry disabled. Use real market lines only.
+MANUAL_LINES_ENABLED = False
+
 try:
     import pytz
 except Exception:
@@ -6938,6 +6942,30 @@ def ee_recent_bonus(row):
         return -7, f"Weak recent conversion {val:.0f}%"
     return 0, f"Neutral recent conversion {val:.0f}%"
 
+
+def ee_real_line_status(row):
+    """Edge Engine real-line guard.
+
+    Keeps Edge Engine from treating fallback/default/manual values as official market lines.
+    Does not alter core projections.
+    """
+    line = safe_float(_ee_get(row, ["Line", "UD/Line", "line", "active_line", "underdog_line"]), None)
+    source = str(_ee_get(row, ["Line Source", "line_source", "Source", "price_source"], "")).upper()
+    decision = str(_ee_get(row, ["Decision", "Pick", "bet_action", "Main Engine Action"], "")).upper()
+
+    if line is None:
+        return False, "NO LIVE LINE"
+    if "NO LINE" in decision:
+        return False, "NO LINE DECISION"
+    # Underdog is primary; sportsbook/odds sources allowed only if app already supplied them.
+    if source and any(x in source for x in ["UNDERDOG", "UD", "ODDS", "SPORTSBOOK", "PRIZE", "OPTIC"]):
+        return True, "REAL MARKET LINE"
+    # If source is blank but the base board already has a line, allow but flag source check.
+    if not source:
+        return True, "LINE SOURCE BLANK"
+    return False, "NON-MARKET/FALLBACK LINE"
+
+
 def ee_grade_row(row):
     proj = safe_float(_ee_get(row, ["Projection", "K PROJ", "projection", "Proj"]), None)
     line = safe_float(_ee_get(row, ["Line", "UD/Line", "line", "active_line", "underdog_line"]), None)
@@ -6953,6 +6981,7 @@ def ee_grade_row(row):
         edge = abs(proj - line)
 
     side = ee_side(proj, line)
+    real_line_ok, real_line_note = ee_real_line_status(row)
     score = 50.0
     if edge is not None:
         score += min(abs(edge), 3.75) * 9.0
@@ -6986,6 +7015,8 @@ def ee_grade_row(row):
     flags = []
     if line is None:
         flags.append("NO LIVE LINE")
+    if not real_line_ok:
+        flags.append(real_line_note)
     if "PASS" in decision or tier == "PASS":
         flags.append("MODEL PASS")
     if edge is not None and abs(edge) < 0.75:
@@ -7012,7 +7043,7 @@ def ee_grade_row(row):
     else:
         grade = "🚫 PASS EDGE"
 
-    notes = [line_note, vol_note, clv_note, recent_note]
+    notes = [line_note, vol_note, clv_note, recent_note, real_line_note]
     notes = [n for n in notes if n and n not in ["Normal line difficulty", "Volatility normal", "No CLV yet", "No recent conversion"]]
     return {
         "Edge Pick": side,
@@ -7041,7 +7072,7 @@ def edge_engine_build_board(board):
             "Tier": p.get("action_tier"),
             "Confidence %": fair_pct,
             "Edge Gap": p.get("edge_ks"),
-            "Line Source": p.get("line_source"),
+            "Line Source": p.get("line_source") or p.get("source") or "Underdog" if (p.get("line") or p.get("underdog_line")) is not None else "NO LINE",
             "Lineup": p.get("lineup_status"),
             "Volatility": p.get("Volatility") or p.get("volatility"),
             "Recent Conv %": p.get("Recent Conv %") or p.get("hit_rate"),
