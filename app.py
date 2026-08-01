@@ -25,7 +25,7 @@ from math import exp, factorial
 from datetime import datetime, timedelta
 from pathlib import Path
 
-APP_VERSION = "ONE WAY PICKZ MASTER PO MERGE V2.2 PRESERVE-WINS TEST 2026-08-01"
+APP_VERSION = "ONE WAY PICKZ MASTER PO MERGE V2.2 PRESERVE-WINS + BOARD FIX 2026-08-01"
 FULL_APP_UPDATE_MARKER = "FULL_APP_CANONICAL_K_PIPELINE_2026_07_30"
 # =========================
 # STABLE PROJECTION SEEDING
@@ -11695,7 +11695,7 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
     # Preserve-first final: Current PO remains the baseline; corrected math wins
     # only outside the deadband or through a three-signal upward recovery.
     mean, sims, preserve_first_info = build_preserve_first_merge_projection(
-        legacy_po_projection=legacy_po_projection,
+        legacy_projection=legacy_po_projection,
         legacy_sims=legacy_po_sims,
         corrected_projection=mean,
         corrected_sims=sims,
