@@ -25,7 +25,7 @@ from math import exp, factorial
 from datetime import datetime, timedelta
 from pathlib import Path
 
-APP_VERSION = "ONE WAY PICKZ MASTER PO MERGE V2.3 TRUE PROJECTION + THREE-PILLAR GUARD 2026-08-05"
+APP_VERSION = "ONE WAY PICKZ MASTER PO MERGE V2.4 PROTECTED + ROLE/BF + EXACT-LINE GUARD 2026-08-05"
 FULL_APP_UPDATE_MARKER = "FULL_APP_CANONICAL_K_PIPELINE_2026_07_30"
 # =========================
 # STABLE PROJECTION SEEDING
@@ -283,7 +283,7 @@ MASTER_KBF_SANITY_REVIEW_RATIO = 0.78
 MASTER_KBF_SANITY_SEVERE_RATIO = 0.68
 MASTER_KBF_SANITY_HIGH_RATIO = 1.42
 MASTER_KBF_SANITY_MIN_RATE_GAP = 0.035
-HYBRID_MODEL_VERSION = "MASTER_PO_MERGE_V2_3_TRUE_PROJECTION_2026_08_05"
+HYBRID_MODEL_VERSION = "MASTER_PO_MERGE_V2_4_PROTECTED_2026_08_05"
 # V2.1 preserve-first calibration. Current PO remains the baseline; corrected
 # single-LOG5 math must clear a meaningful, line-independent evidence gate.
 MERGE_V21_LEGACY_DEADBAND_K = 0.40
@@ -322,6 +322,24 @@ MERGE_V23_FLIP_MIN_EDGE_K = 0.45
 MERGE_V23_STRONG_ARCH_FLIP_DELTA_K = 0.90
 MERGE_V23_STRONG_ARCH_FLIP_EDGE_K = 0.55
 MERGE_V23_MODEL_SPLIT_PASS_EDGE_K = 0.40
+
+# MERGE V2.4 protected-challenger safeguards.
+# These rules are general, pregame, and player-agnostic.
+MERGE_V24_OG_OUTLIER_GAP_K = 0.85
+MERGE_V24_MASTER_ANCHOR_AGREE_K = 0.45
+MERGE_V24_LARGE_MOVE_REVIEW_K = 1.25
+MERGE_V24_RECENT_KBF_MIN_SAMPLE = 4
+MERGE_V24_RECENT_KBF_MIN_RATE_GAP = 0.020
+MERGE_V24_RECENT_KBF_MAX_UP_SHIFT_K = 0.50
+MERGE_V24_RECENT_KBF_MAX_DOWN_SHIFT_K = 0.15
+MERGE_V24_SCENARIO_SPLIT_PASS_EDGE_K = 0.75
+MERGE_V24_RECENT_CONFLICT_PASS_EDGE_K = 0.65
+MERGE_V24_THIN_SUPPORTED_FLIP_EDGE_K = 0.10
+MERGE_V24_OPENER_MAX_BF = 14.0
+MERGE_V24_STRICT_CAP_MAX_BF = 18.0
+MERGE_V24_SHORT_HISTORY_MAX_BF = 18.0
+MERGE_V24_BULK_MAX_BF = 22.0
+MERGE_V24_SHORT_ROLE_BF_BUFFER = 1.50
 
 
 LEAGUE_AVG_WHIFF_BY_PITCH_TYPE = {
@@ -6401,13 +6419,14 @@ def apply_targeted_ip_bf_safety_v11_18(expected_bf, recent_rows, profile=None, r
     return bf, label, " | ".join(notes) if notes else "Targeted IP/BF patch neutral"
 
 
-def build_workload_opportunity_v23(expected_bf, recent_rows, profile=None, row=None, pitch_count_profile=None, game_script_risk=None):
-    """Role-aware starter workload floor plus low/base/high opportunity range.
 
-    This layer fixes repeated starter under-projection without assuming every arm
-    reaches six innings. It uses starter-only recent IP/BF/pitch counts, requires
-    repeated evidence before classifying an opener/bulk role, and never consumes
-    a sportsbook line or final result. It only raises clearly stacked-low BF.
+def build_workload_opportunity_v23(expected_bf, recent_rows, profile=None, row=None, pitch_count_profile=None, game_script_risk=None):
+    """V2.4 role-aware workload range with both floors and short-role caps.
+
+    Normal starters receive a conservative BF floor when recent starter-only
+    evidence supports it. Openers, strict caps, repeated short roles, and bulk
+    roles receive an evidence-based upper cap so a short appearance cannot carry
+    a full-starter strikeout opportunity. Sportsbook lines are never used.
     """
     bf0 = safe_float(expected_bf, DEFAULT_BF) or DEFAULT_BF
     profile = profile or {}
@@ -6431,11 +6450,8 @@ def build_workload_opportunity_v23(expected_bf, recent_rows, profile=None, row=N
         vals = vals[:count] if count else vals
         return float(np.mean(vals)) if vals else None
 
-    def _median(vals):
-        return float(np.median(vals)) if vals else None
-
-    med_ip = _median(ip_vals)
-    med_bf = _median(bf_vals)
+    med_ip = float(np.median(ip_vals)) if ip_vals else None
+    med_bf = float(np.median(bf_vals)) if bf_vals else None
     l5_ip = _avg(ip_vals, 5)
     l5_bf = _avg(bf_vals, 5)
     l5_pc = _avg(pc_vals, 5)
@@ -6446,12 +6462,19 @@ def build_workload_opportunity_v23(expected_bf, recent_rows, profile=None, row=N
 
     pc_label = str((pitch_count_profile or {}).get("label") or "").upper()
     confirmed = row.get("pitcher_confirmed") is not False
-    explicit_short = pc_label in {"STRICT_CAP", "OPENER", "BULK_ROLE"}
-    history_short = bool(n >= MERGE_V23_WORKLOAD_MIN_STARTS and med_ip is not None and med_bf is not None and med_ip < 3.35 and med_bf < 15.5)
-    starter_like = bool(confirmed and not explicit_short and not history_short)
+    explicit_short = pc_label in {"STRICT_CAP", "OPENER"}
+    bulk_role = pc_label == "BULK_ROLE"
+    history_short = bool(
+        n >= MERGE_V23_WORKLOAD_MIN_STARTS
+        and med_ip is not None and med_bf is not None
+        and med_ip < 3.35 and med_bf < 15.5
+    )
+    starter_like = bool(confirmed and not explicit_short and not bulk_role and not history_short)
 
     if explicit_short:
         role_label = f"EXPLICIT_SHORT_ROLE_{pc_label}"
+    elif bulk_role:
+        role_label = "BULK_ROLE"
     elif history_short:
         role_label = "REPEATED_SHORT_ROLE"
     elif starter_like:
@@ -6461,13 +6484,39 @@ def build_workload_opportunity_v23(expected_bf, recent_rows, profile=None, row=N
 
     if starter_like and n >= 5 and len(pc_vals) >= 3:
         confidence = "HIGH"
-    elif starter_like and n >= 3:
+    elif (starter_like or bulk_role or explicit_short or history_short) and n >= 3:
         confidence = "MEDIUM"
     else:
         confidence = "LOW"
 
+    adjusted_bf = float(bf0)
     floor_bf = 14.0
+    cap_bf = 31.0
     notes = []
+
+    # Hard short-role opportunity caps: the central K projection must respect
+    # the number of batters the pitcher is realistically expected to face.
+    if explicit_short:
+        evidence_cap = (med_bf + MERGE_V24_SHORT_ROLE_BF_BUFFER) if med_bf is not None else bf0
+        if pc_label == "OPENER":
+            cap_bf = min(MERGE_V24_OPENER_MAX_BF, max(7.0, evidence_cap))
+        else:
+            cap_bf = min(MERGE_V24_STRICT_CAP_MAX_BF, max(9.0, evidence_cap))
+        notes.append(f"{pc_label} BF cap {cap_bf:.1f}")
+    elif history_short:
+        evidence_cap = (med_bf + MERGE_V24_SHORT_ROLE_BF_BUFFER) if med_bf is not None else bf0
+        cap_bf = min(MERGE_V24_SHORT_HISTORY_MAX_BF, max(8.0, evidence_cap))
+        notes.append(f"repeated short-role BF cap {cap_bf:.1f}")
+    elif bulk_role:
+        evidence_cap = (med_bf + MERGE_V24_SHORT_ROLE_BF_BUFFER) if med_bf is not None else bf0
+        cap_bf = min(MERGE_V24_BULK_MAX_BF, max(13.0, evidence_cap))
+        notes.append(f"bulk-role BF cap {cap_bf:.1f}")
+
+    if cap_bf < 31.0 and adjusted_bf > cap_bf:
+        notes.append(f"V2.4 short-role BF repair {adjusted_bf:.1f}->{cap_bf:.1f}")
+        adjusted_bf = cap_bf
+
+    # Normal-starter opportunity floor.
     if starter_like:
         if n < MERGE_V23_WORKLOAD_MIN_STARTS:
             floor_bf = MERGE_V23_WORKLOAD_THIN_STARTER_FLOOR_BF
@@ -6484,7 +6533,6 @@ def build_workload_opportunity_v23(expected_bf, recent_rows, profile=None, row=N
 
         if l5_ip is not None and l5_ip >= 5.0:
             floor_bf = max(floor_bf, MERGE_V23_WORKLOAD_NORMAL_STARTER_FLOOR_BF)
-            notes.append(f"L5 starter IP {l5_ip:.2f}")
         if (l5_ip is not None and l5_ip >= 5.5) or (l5_pc is not None and l5_pc >= 88):
             floor_bf = max(floor_bf, MERGE_V23_WORKLOAD_WORKHORSE_FLOOR_BF)
             notes.append("recent workhorse leash")
@@ -6503,34 +6551,29 @@ def build_workload_opportunity_v23(expected_bf, recent_rows, profile=None, row=N
             floor_bf = min(floor_bf, 20.75)
             notes.append(f"{gs_label} game-script cap")
 
-    adjusted_bf = float(bf0)
-    if starter_like and adjusted_bf < floor_bf:
-        # Repeated, high-confidence starter evidence is allowed to repair a much
-        # larger stacked workload cut than a thin sample. This specifically
-        # addresses cases where a normal six-inning starter was left near
-        # opener-level BF, while still requiring at least five paired starts.
-        if confidence == "HIGH" and n >= 5 and med_bf is not None and med_bf >= 21.0:
-            max_add = 6.00
-            notes.append("high-confidence starter recovery cap +6.00 BF")
-        elif n >= 3:
-            max_add = 4.75
-            notes.append("repeated starter recovery cap +4.75 BF")
-        else:
-            max_add = MERGE_V23_WORKLOAD_MAX_BF_ADD
-            notes.append(f"thin-sample recovery cap +{max_add:.2f} BF")
-        target = min(float(floor_bf), float(bf0) + max_add)
-        adjusted_bf = max(adjusted_bf, target)
-        notes.append(f"V2.3 BF floor {bf0:.1f}->{adjusted_bf:.1f}")
+        if adjusted_bf < floor_bf:
+            if confidence == "HIGH" and n >= 5 and med_bf is not None and med_bf >= 21.0:
+                max_add = 6.00
+            elif n >= 3:
+                max_add = 4.75
+            else:
+                max_add = MERGE_V23_WORKLOAD_MAX_BF_ADD
+            target = min(float(floor_bf), float(adjusted_bf) + max_add)
+            notes.append(f"V2.4 starter BF floor {adjusted_bf:.1f}->{target:.1f}")
+            adjusted_bf = max(adjusted_bf, target)
 
-    adjusted_bf = float(clamp(adjusted_bf, 14, 31))
+    adjusted_bf = float(clamp(adjusted_bf, 6, 31))
     if q1_bf is not None:
-        low_bf = max(14.0, q1_bf - 0.50)
+        low_bf = max(6.0, q1_bf - 0.50)
     else:
-        low_bf = max(14.0, adjusted_bf - (2.25 if confidence == "LOW" else 1.75))
+        low_bf = max(6.0, adjusted_bf - (2.25 if confidence == "LOW" else 1.75))
     if q3_bf is not None:
         high_bf = min(31.0, q3_bf + 0.75)
     else:
         high_bf = min(31.0, adjusted_bf + (2.50 if confidence == "LOW" else 2.00))
+    if cap_bf < 31.0:
+        low_bf = min(low_bf, adjusted_bf)
+        high_bf = min(high_bf, cap_bf)
     low_bf = min(low_bf, adjusted_bf)
     high_bf = max(high_bf, adjusted_bf)
 
@@ -6546,14 +6589,27 @@ def build_workload_opportunity_v23(expected_bf, recent_rows, profile=None, row=N
             base_ip_floor = 5.0
         if pc_label in {"SHORT_LEASH", "MONITOR"}:
             base_ip_floor = min(base_ip_floor, 4.15)
+    elif explicit_short or history_short:
+        base_ip_floor = min(base_ip_from_bf, 3.25)
+    elif bulk_role:
+        base_ip_floor = min(max(base_ip_from_bf, 3.0), 4.75)
 
-    workload_supported = bool(starter_like and adjusted_bf >= MERGE_V23_SUPPRESSION_MIN_BF and max(base_ip_from_bf, base_ip_floor) >= 4.5)
-    note = "; ".join(notes) if notes else "V2.3 workload opportunity neutral"
+    workload_supported = bool(
+        starter_like and adjusted_bf >= MERGE_V23_SUPPRESSION_MIN_BF
+        and max(base_ip_from_bf, base_ip_floor) >= 4.5
+    )
+    role_consistency = "ALIGNED"
+    if (explicit_short or history_short) and adjusted_bf > cap_bf + 0.01:
+        role_consistency = "SHORT_ROLE_BF_CONFLICT"
+    elif starter_like and adjusted_bf < 18.5:
+        role_consistency = "STARTER_BF_LOW_REVIEW"
+
     return adjusted_bf, {
-        "version": "MERGE_V23_WORKLOAD_OPPORTUNITY",
+        "version": "MERGE_V24_WORKLOAD_OPPORTUNITY",
         "role_label": role_label,
         "starter_like": starter_like,
         "explicit_short_role": explicit_short,
+        "bulk_role": bulk_role,
         "history_short_role": history_short,
         "confidence": confidence,
         "sample_n": n,
@@ -6569,6 +6625,7 @@ def build_workload_opportunity_v23(expected_bf, recent_rows, profile=None, row=N
         "input_bf": round(float(bf0), 2),
         "adjusted_bf": round(float(adjusted_bf), 2),
         "bf_shift": round(float(adjusted_bf - bf0), 2),
+        "bf_cap": None if cap_bf >= 31 else round(float(cap_bf), 2),
         "low_bf": round(float(low_bf), 2),
         "base_bf": round(float(adjusted_bf), 2),
         "high_bf": round(float(high_bf), 2),
@@ -6577,7 +6634,8 @@ def build_workload_opportunity_v23(expected_bf, recent_rows, profile=None, row=N
         "high_ip": round(float(high_ip), 2),
         "base_ip_floor": round(float(base_ip_floor), 2),
         "workload_supported": workload_supported,
-        "note": note,
+        "role_consistency": role_consistency,
+        "note": "; ".join(notes) if notes else "V2.4 workload opportunity neutral",
     }
 
 
@@ -10912,17 +10970,30 @@ def build_master_kbf_sanity_guard(projection, expected_bf, pitcher_k, opponent_k
         "note": f"{status}: implied {implied*100:.1f}% vs single-LOG5 {expected_rate*100:.1f}% K/BF (ratio {ratio:.2f})",
     }
 
-def build_legacy_po_shadow_hybrid(master_mean, master_sims, og_mean=None):
-    """Reproduce the proven Current-PO hybrid as a line-independent shadow."""
+
+def build_legacy_po_shadow_hybrid(master_mean, master_sims, og_mean=None, anchor_mean=None):
+    """Reproduce Current-PO while blocking a lone OG outlier.
+
+    The clean one-time K/BF anchor is used only to identify which architecture is
+    isolated. When MASTER and anchor agree, a distant OG number cannot drag the
+    protected baseline across a line by itself.
+    """
     master = _hybrid_num(master_mean, None)
     og = _hybrid_num(og_mean, None)
+    anchor = _hybrid_num(anchor_mean, None)
     sims = np.asarray(master_sims, dtype=float).copy()
     if master is None or sims.size == 0:
         return master_mean, sims, {"status": "NO_LEGACY_MASTER", "shift": 0.0}
     if og is None:
         return float(master), sims, {"status": "LEGACY_MASTER_ONLY", "shift": 0.0, "master_projection": master, "og_projection": None}
+
     spread = abs(float(master) - float(og))
-    if spread <= 1.15:
+    master_anchor_agree = bool(anchor is not None and abs(float(anchor) - float(master)) <= MERGE_V24_MASTER_ANCHOR_AGREE_K)
+    og_outlier = bool(master_anchor_agree and spread >= MERGE_V24_OG_OUTLIER_GAP_K)
+    if og_outlier:
+        raw = 0.92 * float(master) + 0.08 * float(anchor)
+        status = "LEGACY_OG_OUTLIER_BLOCKED"
+    elif spread <= 1.15:
         raw = 0.50 * float(master) + 0.50 * float(og)
         status = "LEGACY_AGREE" if spread <= 0.35 else "LEGACY_CONTROLLED_BLEND"
     elif spread <= 1.75:
@@ -10936,7 +11007,9 @@ def build_legacy_po_shadow_hybrid(master_mean, master_sims, og_mean=None):
     return final, np.clip(sims + shift, 0, None), {
         "status": status, "spread": round(spread, 3), "shift": round(shift, 3),
         "master_projection": round(float(master), 3), "og_projection": round(float(og), 3),
-        "note": f"Current PO shadow MASTER {master:.2f} / OG {og:.2f}; shift {shift:+.2f}",
+        "anchor_projection": None if anchor is None else round(float(anchor), 3),
+        "og_outlier_blocked": og_outlier,
+        "note": f"Current PO shadow MASTER {master:.2f} / OG {og:.2f} / anchor {anchor if anchor is not None else 'NA'}; shift {shift:+.2f}",
     }
 
 
@@ -10973,23 +11046,143 @@ def reconcile_projection_to_kbf_anchor(projection, sims, anchor_projection, sani
     }
 
 
+
+def build_recent_kbf_support_v24(projection, recent_rows, expected_bf, pitcher_k=None, opponent_k=None, whiff=None, workload_context=None):
+    """Small line-independent correction when recent starter K/BF exposes hidden suppression.
+
+    Recent form never forces a side. It can only make a capped projection repair
+    when role, BF, pitcher skill, and opponent opportunity are also credible.
+    """
+    proj = _hybrid_num(projection, None)
+    bf = _hybrid_num(expected_bf, None)
+    pk = _hybrid_num(pitcher_k, None)
+    ok = _hybrid_num(opponent_k, None)
+    wf = _hybrid_num(whiff, None)
+    workload = workload_context if isinstance(workload_context, dict) else {}
+    rows = list(recent_rows or [])[:10]
+    samples = []
+    for r in rows:
+        ks = _hybrid_num((r or {}).get("Ks", (r or {}).get("SO", (r or {}).get("strikeOuts"))), None)
+        rbf = _hybrid_num((r or {}).get("BF", (r or {}).get("battersFaced")), None)
+        if ks is not None and rbf is not None and rbf > 0:
+            samples.append((float(ks), float(rbf)))
+    if proj is None or bf is None or bf <= 0 or len(samples) < MERGE_V24_RECENT_KBF_MIN_SAMPLE:
+        return {"active": False, "status": "RECENT_KBF_DATA_GAP", "shift": 0.0, "sample_n": len(samples), "note": "Recent K/BF repair unavailable"}
+
+    l5 = samples[:5]
+    l10 = samples[:10]
+    l5_rate = sum(k for k, _ in l5) / max(1.0, sum(b for _, b in l5))
+    l10_rate = sum(k for k, _ in l10) / max(1.0, sum(b for _, b in l10))
+    recent_rate = 0.65 * l5_rate + 0.35 * l10_rate
+    l5_avg_k = float(np.mean([k for k, _ in l5]))
+    model_rate = float(proj) / float(bf)
+    rate_gap = recent_rate - model_rate
+
+    capability = bool((pk is not None and pk >= 0.215) or (wf is not None and wf >= 0.250) or recent_rate >= 0.220)
+    matchup = bool(ok is not None and ok >= 0.210)
+    workload_ok = bool(
+        workload.get("starter_like", True)
+        and not workload.get("explicit_short_role", False)
+        and not workload.get("history_short_role", False)
+        and bf >= 20.0
+    )
+    supports_up = bool(
+        rate_gap >= MERGE_V24_RECENT_KBF_MIN_RATE_GAP
+        and l5_avg_k >= float(proj) + 0.45
+        and capability and matchup and workload_ok
+    )
+    supports_down = bool(
+        rate_gap <= -0.045 and l5_avg_k <= float(proj) - 1.0
+        and workload_ok and len(samples) >= 5
+    )
+    shift = 0.0
+    status = "RECENT_KBF_NEUTRAL"
+    if supports_up:
+        raw = rate_gap * float(bf) * 0.45 + max(0.0, l5_avg_k - float(proj)) * 0.08
+        shift = float(clamp(raw, 0.0, MERGE_V24_RECENT_KBF_MAX_UP_SHIFT_K))
+        status = "RECENT_KBF_SUPPRESSION_SUPPORT"
+    elif supports_down:
+        raw = rate_gap * float(bf) * 0.15
+        shift = float(clamp(raw, -MERGE_V24_RECENT_KBF_MAX_DOWN_SHIFT_K, 0.0))
+        status = "RECENT_KBF_HIGH_REVIEW"
+
+    return {
+        "active": abs(shift) >= 0.04, "status": status, "shift": round(shift, 3),
+        "sample_n": len(samples), "model_rate": round(model_rate, 5),
+        "recent_l5_rate": round(l5_rate, 5), "recent_l10_rate": round(l10_rate, 5),
+        "recent_blended_rate": round(recent_rate, 5), "rate_gap": round(rate_gap, 5),
+        "l5_avg_k": round(l5_avg_k, 2), "supports_up": supports_up,
+        "supports_down": supports_down, "capability_supported": capability,
+        "matchup_supported": matchup, "workload_supported": workload_ok,
+        "note": f"{status}: model {model_rate*100:.1f}% vs recent {recent_rate*100:.1f}% K/BF; L5 {l5_avg_k:.2f}; shift {shift:+.2f} K",
+    }
+
+
+def build_workload_scenario_guard_v24(projection, line, workload_context=None, recent_rows=None):
+    """Exact-line decision audit across low/base/high workload scenarios."""
+    proj = _hybrid_num(projection, None)
+    line_val = _hybrid_num(line, None)
+    ctx = workload_context if isinstance(workload_context, dict) else {}
+    base_bf = _hybrid_num(ctx.get("base_bf", ctx.get("adjusted_bf")), None)
+    low_bf = _hybrid_num(ctx.get("low_bf"), base_bf)
+    high_bf = _hybrid_num(ctx.get("high_bf"), base_bf)
+    if proj is None or line_val is None or base_bf is None or base_bf <= 0:
+        return {"available": False, "force_pass": False, "status": "SCENARIO_DATA_GAP", "note": "Workload scenarios unavailable"}
+
+    low_proj = float(proj) * float(low_bf) / float(base_bf)
+    base_proj = float(proj)
+    high_proj = float(proj) * float(high_bf) / float(base_bf)
+    def side(v):
+        return "OVER" if v > line_val else "UNDER" if v < line_val else "PUSH"
+    scenario_sides = [side(low_proj), side(base_proj), side(high_proj)]
+    scenario_straddle = len(set(x for x in scenario_sides if x != "PUSH")) > 1 or "PUSH" in scenario_sides
+
+    ks = []
+    for r in list(recent_rows or [])[:10]:
+        val = _hybrid_num((r or {}).get("Ks", (r or {}).get("SO", (r or {}).get("strikeOuts"))), None)
+        if val is not None:
+            ks.append(float(val))
+    over_rate = None if not ks else sum(1 for k in ks if k > line_val) / len(ks)
+    recent_side = "NEUTRAL"
+    if over_rate is not None and len(ks) >= 5:
+        if over_rate >= 0.70:
+            recent_side = "OVER"
+        elif over_rate <= 0.30:
+            recent_side = "UNDER"
+
+    base_side = side(base_proj)
+    edge = abs(base_proj - line_val)
+    recent_conflict = recent_side in {"OVER", "UNDER"} and recent_side != base_side
+    force_pass = bool(
+        (scenario_straddle and edge < MERGE_V24_SCENARIO_SPLIT_PASS_EDGE_K)
+        or (recent_conflict and edge < MERGE_V24_RECENT_CONFLICT_PASS_EDGE_K)
+    )
+    all_same = len(set(scenario_sides)) == 1 and scenario_sides[0] in {"OVER", "UNDER"}
+    strong_support = bool(all_same and (recent_side in {"NEUTRAL", base_side}))
+    status = "SCENARIO_FORCE_PASS" if force_pass else "SCENARIO_STRONG_SUPPORT" if strong_support else "SCENARIO_TRACK"
+    return {
+        "available": True, "force_pass": force_pass, "status": status,
+        "low_projection": round(low_proj, 2), "base_projection": round(base_proj, 2),
+        "high_projection": round(high_proj, 2), "low_side": scenario_sides[0],
+        "base_side": scenario_sides[1], "high_side": scenario_sides[2],
+        "scenario_straddle": scenario_straddle, "all_same_side": all_same,
+        "strong_support": strong_support, "recent_over_rate": None if over_rate is None else round(over_rate, 3),
+        "recent_side": recent_side, "recent_conflict": recent_conflict,
+        "sample_n": len(ks), "over_needed": required_ks_for_over(line_val),
+        "note": f"{status}: low/base/high {low_proj:.2f}/{base_proj:.2f}/{high_proj:.2f}; recent over {None if over_rate is None else round(over_rate*100)}%",
+    }
+
+
 def apply_three_pillar_suppression_escape_v23(
     projection, sims, legacy_projection=None, og_projection=None, anchor_projection=None,
     pitcher_k=None, opponent_k=None, whiff=None, expected_bf=None,
-    workload_context=None, lineup_locked=False,
+    workload_context=None, lineup_locked=False, recent_kbf_support=None,
 ):
-    """Controlled upward escape from hidden K/BF suppression.
-
-    The projection can move upward only when pitcher capability, matchup
-    opportunity, and workload opportunity all agree and at least two independent
-    projection references sit materially above the corrected projection. No line
-    or final result is visible.
-    """
+    """Controlled upward escape from hidden K/BF suppression."""
     proj = _hybrid_num(projection, None)
     arr = np.asarray(sims, dtype=float).copy()
     if proj is None or arr.size == 0:
         return projection, arr, {"active": False, "status": "NO_PROJECTION", "shift": 0.0}
-
     legacy = _hybrid_num(legacy_projection, None)
     og = _hybrid_num(og_projection, None)
     anchor = _hybrid_num(anchor_projection, None)
@@ -10998,23 +11191,19 @@ def apply_three_pillar_suppression_escape_v23(
     wf = _hybrid_num(whiff, None)
     bf = _hybrid_num(expected_bf, None)
     workload = workload_context if isinstance(workload_context, dict) else {}
+    recent = recent_kbf_support if isinstance(recent_kbf_support, dict) else {}
 
-    capability = bool(
-        (pk is not None and pk >= MERGE_V23_SUPPRESSION_MIN_PITCHER_K)
-        or (wf is not None and wf >= MERGE_V23_SUPPRESSION_MIN_WHIFF)
-    )
-    matchup = bool(ok is not None and ok >= MERGE_V23_SUPPRESSION_MIN_OPP_K)
-    workload_ok = bool(
-        bf is not None and bf >= MERGE_V23_SUPPRESSION_MIN_BF
-        and workload.get("starter_like", True)
-        and not workload.get("explicit_short_role", False)
-        and workload.get("workload_supported", True)
-    )
+    capability = bool((pk is not None and pk >= MERGE_V23_SUPPRESSION_MIN_PITCHER_K) or (wf is not None and wf >= MERGE_V23_SUPPRESSION_MIN_WHIFF) or recent.get("supports_up"))
+    matchup = bool((ok is not None and ok >= MERGE_V23_SUPPRESSION_MIN_OPP_K) or (recent.get("matchup_supported") and ok is not None and ok >= 0.210))
+    workload_ok = bool(bf is not None and bf >= MERGE_V23_SUPPRESSION_MIN_BF and workload.get("starter_like", True) and not workload.get("explicit_short_role", False) and not workload.get("history_short_role", False) and workload.get("workload_supported", True))
 
     evidence = []
     for label, value in [("LEGACY_PO", legacy), ("OG", og), ("CLEAN_ANCHOR", anchor)]:
         if value is not None and value >= proj + MERGE_V23_SUPPRESSION_MIN_EVIDENCE_K:
             evidence.append((label, float(value)))
+    if recent.get("supports_up"):
+        recent_target = float(proj) + max(0.25, _hybrid_num(recent.get("shift"), 0.0) or 0.0)
+        evidence.append(("RECENT_KBF", recent_target))
     anchor_support = bool(anchor is not None and anchor >= proj + MERGE_V23_SUPPRESSION_MIN_EVIDENCE_K)
     independent_support = bool(anchor_support and len(evidence) >= 2)
     all_three = bool(capability and matchup and workload_ok)
@@ -11028,41 +11217,26 @@ def apply_three_pillar_suppression_escape_v23(
         cap = MERGE_V23_SUPPRESSION_MAX_SHIFT_K
         if str(workload.get("confidence") or "").upper() == "LOW":
             cap = min(cap, 0.45)
-        # Expected lineups still receive a useful but slightly smaller move.
         lineup_factor = 1.0 if lineup_locked else 0.90
-        shift = float(clamp(raw_gap * 0.70 * lineup_factor, 0.0, cap))
+        shift = float(clamp(raw_gap * 0.72 * lineup_factor, 0.0, cap))
         if shift >= 0.05:
-            status = "THREE_PILLAR_SUPPRESSION_ESCAPE"
+            status = "THREE_PILLAR_SUPPRESSION_ESCAPE_V24"
 
     final = max(0.0, float(proj) + shift)
     return final, np.clip(arr + shift, 0, None), {
-        "active": abs(shift) >= 0.05,
-        "status": status,
-        "shift": round(float(shift), 3),
-        "pre_projection": round(float(proj), 3),
-        "post_projection": round(float(final), 3),
+        "active": abs(shift) >= 0.05, "status": status, "shift": round(float(shift), 3),
+        "pre_projection": round(float(proj), 3), "post_projection": round(float(final), 3),
         "evidence_target": None if target is None else round(float(target), 3),
-        "evidence": [label for label, _ in evidence],
-        "capability_supported": capability,
-        "matchup_supported": matchup,
-        "workload_supported": workload_ok,
-        "all_three_pillars": all_three,
-        "note": (
-            f"{status}: capability={capability}, matchup={matchup}, workload={workload_ok}; "
-            f"evidence={','.join(label for label, _ in evidence) or 'none'}; shift {shift:+.2f} K"
-        ),
+        "evidence": [label for label, _ in evidence], "capability_supported": capability,
+        "matchup_supported": matchup, "workload_supported": workload_ok,
+        "recent_kbf_supported": bool(recent.get("supports_up")), "all_three_pillars": all_three,
+        "note": f"{status}: capability={capability}, matchup={matchup}, workload={workload_ok}; evidence={','.join(label for label, _ in evidence) or 'none'}; shift {shift:+.2f} K",
     }
 
 
-def build_preserve_first_merge_projection(legacy_projection, legacy_sims, corrected_projection, corrected_sims, og_projection=None, anchor_projection=None, pitcher_k=None, opponent_k=None, whiff=None, suppression_escape=None, workload_context=None):
-    """Use Current PO as baseline and accept corrections only with evidence.
 
-    No sportsbook line is visible. Small changes remain on the proven Current-PO
-    baseline. Larger corrected moves are accepted. A narrow upward recovery is
-    allowed only when corrected single-LOG5, OG, and the clean anchor all agree
-    above the legacy baseline and the underlying whiff/opponent environment is
-    credible.
-    """
+def build_preserve_first_merge_projection(legacy_projection, legacy_sims, corrected_projection, corrected_sims, og_projection=None, anchor_projection=None, pitcher_k=None, opponent_k=None, whiff=None, suppression_escape=None, workload_context=None, kbf_reconcile=None, recent_kbf_support=None, hybrid_model_info=None):
+    """Protected challenger: keep Current PO unless independent evidence clears."""
     legacy = _hybrid_num(legacy_projection, None)
     corrected = _hybrid_num(corrected_projection, None)
     og = _hybrid_num(og_projection, None)
@@ -11081,45 +11255,41 @@ def build_preserve_first_merge_projection(legacy_projection, legacy_sims, correc
     min_move = MERGE_V21_UPWARD_CONSENSUS_MIN_K
     workload = workload_context if isinstance(workload_context, dict) else {}
     escape = suppression_escape if isinstance(suppression_escape, dict) else {}
+    reconcile = kbf_reconcile if isinstance(kbf_reconcile, dict) else {}
+    recent = recent_kbf_support if isinstance(recent_kbf_support, dict) else {}
+    hybrid = hybrid_model_info if isinstance(hybrid_model_info, dict) else {}
+    outlier_conflict = bool(hybrid.get("og_outlier_blocked") or "OUTLIER" in str(hybrid.get("status") or "").upper())
 
-    upward_consensus = bool(
-        og is not None and anchor is not None
-        and corrected >= legacy + min_move
-        and og >= legacy + min_move
-        and anchor >= legacy + min_move
-        and (pk is None or pk >= 0.20)
-        and ((ok is not None and ok >= 0.215) or (wf is not None and wf >= 0.245))
-        and not workload.get("explicit_short_role", False)
-    )
+    upward_consensus = bool(og is not None and anchor is not None and corrected >= legacy + min_move and og >= legacy + min_move and anchor >= legacy + min_move and (pk is None or pk >= 0.20) and ((ok is not None and ok >= 0.215) or (wf is not None and wf >= 0.245)) and not workload.get("explicit_short_role", False))
     downward_consensus = bool(
         og is not None and anchor is not None
-        and corrected <= legacy - min_move
-        and og <= legacy - min_move
-        and anchor <= legacy - min_move
+        and corrected <= legacy - max(min_move, 0.45)
+        and og <= legacy - max(min_move, 0.45)
+        and anchor <= legacy - max(min_move, 0.45)
+        and not outlier_conflict
+        and str(workload.get("confidence") or "").upper() != "LOW"
     )
     escape_supported = bool(escape.get("active") and escape.get("all_three_pillars"))
+    repair_supported = bool(reconcile.get("active") and anchor is not None and corrected >= legacy + min_move and recent.get("supports_up"))
+    large_conflicted_move = bool(abs(delta) >= MERGE_V24_LARGE_MOVE_REVIEW_K and outlier_conflict)
 
     if abs(delta) < MERGE_V21_LEGACY_DEADBAND_K:
-        final = float(legacy)
-        arr = legacy_arr
-        status = "LEGACY_DEADBAND"
-    elif delta > 0 and (upward_consensus or escape_supported):
-        final = float(corrected)
-        arr = corrected_arr
-        status = "CORRECTED_UPWARD_EVIDENCE_ACCEPTED"
+        final, arr, status = float(legacy), legacy_arr, "LEGACY_DEADBAND"
+    elif large_conflicted_move:
+        final, arr, status = float(legacy), legacy_arr, "LEGACY_LARGE_OUTLIER_GUARD"
+    elif delta > 0 and (upward_consensus or escape_supported or repair_supported):
+        final, arr, status = float(corrected), corrected_arr, "CORRECTED_UPWARD_EVIDENCE_ACCEPTED"
     elif delta < 0 and downward_consensus:
-        final = float(corrected)
-        arr = corrected_arr
-        status = "CORRECTED_DOWNWARD_EVIDENCE_ACCEPTED"
+        # Downward corrections are capped because false suppression was the most
+        # damaging repeated miss profile. Larger moves remain diagnostics/PASS.
+        accepted = max(float(corrected), float(legacy) - 0.75)
+        shift = accepted - float(corrected)
+        final, arr = accepted, np.clip(corrected_arr + shift, 0, None)
+        status = "CORRECTED_DOWNWARD_EVIDENCE_ACCEPTED_CAPPED"
     else:
-        # Preserve Current PO when a large corrected move lacks independent
-        # architecture/anchor support. This is line-independent and prevents a
-        # single model branch from manufacturing a weak side flip.
-        final = float(legacy)
-        arr = legacy_arr
-        status = "LEGACY_EVIDENCE_GUARD"
+        final, arr, status = float(legacy), legacy_arr, "LEGACY_EVIDENCE_GUARD"
 
-    if upward_consensus or escape_supported:
+    if upward_consensus or escape_supported or repair_supported:
         evidence_values = [v for v in [corrected, og, anchor] if v is not None]
         evidence_target = max(float(corrected), min(max(evidence_values), float(corrected) + 0.25)) if evidence_values else float(corrected)
         recovery_target = min(float(legacy) + MERGE_V21_UPWARD_RECOVERY_CAP_K, evidence_target)
@@ -11127,54 +11297,44 @@ def build_preserve_first_merge_projection(legacy_projection, legacy_sims, correc
             shift = recovery_target - final
             final = recovery_target
             arr = np.clip(arr + shift, 0, None)
-        status = "THREE_SIGNAL_UPWARD_RECOVERY" if upward_consensus else "THREE_PILLAR_UPWARD_RECOVERY"
+        if repair_supported:
+            status = "KBF_RECENT_SUPPORTED_RECOVERY"
+        elif upward_consensus:
+            status = "THREE_SIGNAL_UPWARD_RECOVERY"
+        else:
+            status = "THREE_PILLAR_UPWARD_RECOVERY"
 
     return float(final), arr, {
-        "status": status,
-        "legacy_projection": round(float(legacy), 3),
+        "status": status, "legacy_projection": round(float(legacy), 3),
         "corrected_projection": round(float(corrected), 3),
         "og_projection": None if og is None else round(float(og), 3),
         "anchor_projection": None if anchor is None else round(float(anchor), 3),
         "delta_corrected_vs_legacy": round(delta, 3),
         "shift_vs_legacy": round(float(final - legacy), 3),
-        "upward_consensus": upward_consensus,
-        "downward_consensus": downward_consensus,
-        "suppression_escape_supported": escape_supported,
+        "upward_consensus": upward_consensus, "downward_consensus": downward_consensus,
+        "suppression_escape_supported": escape_supported, "kbf_recent_repair_supported": repair_supported,
+        "outlier_conflict": outlier_conflict, "large_conflicted_move": large_conflicted_move,
         "note": f"{status}: legacy {legacy:.2f}, corrected {corrected:.2f}, final {final:.2f}",
     }
 
 
-def build_hybrid_projection(master_mean, master_sims, og_mean=None, anchor_mean=None, enabled=True):
-    """Create a line-independent MASTER/OG/single-LOG5 consensus projection.
 
-    MASTER is primary. OG remains an independent architecture challenger. The
-    clean anchor is deliberately low-weight and exists to catch hidden K/BF math
-    compression. No sportsbook line is visible to this function.
-    """
+def build_hybrid_projection(master_mean, master_sims, og_mean=None, anchor_mean=None, enabled=True):
+    """Line-independent MASTER/OG/anchor consensus with outlier resistance."""
     master = _hybrid_num(master_mean, None)
     og = _hybrid_num(og_mean, None)
     anchor = _hybrid_num(anchor_mean, None)
     base_sims = np.asarray(master_sims, dtype=float).copy()
     if master is None or base_sims.size == 0:
-        return master_mean, base_sims, {
-            "active": False, "status": "NO_MASTER", "spread": None, "shift": 0.0,
-            "master_projection": master, "og_projection": og, "anchor_projection": anchor,
-            "note": "No MASTER projection"
-        }
+        return master_mean, base_sims, {"active": False, "status": "NO_MASTER", "spread": None, "shift": 0.0, "master_projection": master, "og_projection": og, "anchor_projection": anchor, "note": "No MASTER projection"}
     if not enabled:
-        return float(master), base_sims, {
-            "active": False, "status": "MASTER_ONLY", "spread": 0.0, "shift": 0.0,
-            "master_projection": round(master, 3), "og_projection": og, "anchor_projection": anchor,
-            "master_weight": 1.0, "og_weight": 0.0, "anchor_weight": 0.0,
-            "note": "Hybrid disabled; MASTER unchanged"
-        }
+        return float(master), base_sims, {"active": False, "status": "MASTER_ONLY", "spread": 0.0, "shift": 0.0, "master_projection": round(master, 3), "og_projection": og, "anchor_projection": anchor, "master_weight": 1.0, "og_weight": 0.0, "anchor_weight": 0.0, "note": "Hybrid disabled; MASTER unchanged"}
 
     profile = load_hybrid_model_learning_profile()
     mw = _hybrid_num(profile.get("master_weight"), HYBRID_MODEL_DEFAULT_MASTER_WEIGHT) or HYBRID_MODEL_DEFAULT_MASTER_WEIGHT
     ow = _hybrid_num(profile.get("og_weight"), HYBRID_MODEL_DEFAULT_OG_WEIGHT) or HYBRID_MODEL_DEFAULT_OG_WEIGHT
     total = max(1e-9, mw + ow)
     mw, ow = mw / total, ow / total
-
     anchor_w = MASTER_MERGE_ANCHOR_WEIGHT if anchor is not None else 0.0
     family_budget = 1.0 - anchor_w
     master_w = mw * family_budget
@@ -11182,15 +11342,14 @@ def build_hybrid_projection(master_mean, master_sims, og_mean=None, anchor_mean=
     if og is None:
         master_w = family_budget
     weights_sum = master_w + og_w + anchor_w
-    if weights_sum <= 0:
-        master_w, og_w, anchor_w = 1.0, 0.0, 0.0
-        weights_sum = 1.0
     master_w, og_w, anchor_w = master_w/weights_sum, og_w/weights_sum, anchor_w/weights_sum
 
     vals = [v for v in [master, og, anchor] if v is not None]
     spread = max(vals) - min(vals) if len(vals) >= 2 else 0.0
     og_gap = None if og is None else float(og - master)
     anchor_gap = None if anchor is None else float(anchor - master)
+    master_anchor_agree = bool(anchor is not None and abs(float(anchor) - float(master)) <= MERGE_V24_MASTER_ANCHOR_AGREE_K)
+    og_outlier = bool(og is not None and master_anchor_agree and abs(float(og) - float(master)) >= MERGE_V24_OG_OUTLIER_GAP_K)
     rescue = bool(
         og_gap is not None and anchor_gap is not None
         and abs(og_gap) >= MASTER_MERGE_RESCUE_MIN_GAP_K
@@ -11201,6 +11360,9 @@ def build_hybrid_projection(master_mean, master_sims, og_mean=None, anchor_mean=
 
     if og is None and anchor is None:
         raw, status = float(master), "MASTER_ONLY"
+    elif og_outlier:
+        raw = 0.92 * float(master) + 0.08 * float(anchor)
+        status = "OG_OUTLIER_BLOCKED_V24"
     elif spread <= HYBRID_MODEL_LOW_SPREAD_K:
         raw = master_w*master + (og_w*og if og is not None else 0.0) + (anchor_w*anchor if anchor is not None else 0.0)
         status = "AGREE"
@@ -11208,18 +11370,12 @@ def build_hybrid_projection(master_mean, master_sims, og_mean=None, anchor_mean=
         raw = master_w*master + (og_w*og if og is not None else 0.0) + (anchor_w*anchor if anchor is not None else 0.0)
         status = "CONTROLLED_BLEND"
     elif rescue:
-        # OG and the clean one-time matchup anchor independently point away from
-        # MASTER. Move toward them, but keep the global projection-shift cap.
         raw = master_w*master + og_w*og + anchor_w*anchor
         status = "TWO_SIGNAL_RESCUE"
-    elif anchor is not None and abs(float(anchor) - float(master)) <= 0.45 and og is not None:
-        # MASTER and clean math agree; treat a distant OG number as the outlier.
-        raw = 0.80*master + 0.10*anchor + 0.10*og
-        status = "OG_OUTLIER_CONFLICT"
     elif spread <= HYBRID_MODEL_HIGH_SPREAD_K:
         raw = float(master)
         if og is not None:
-            raw += 0.12 * (float(og) - float(master))
+            raw += 0.10 * (float(og) - float(master))
         if anchor is not None:
             raw += 0.10 * (float(anchor) - float(master))
         status = "HIGH_CONFLICT"
@@ -11227,17 +11383,14 @@ def build_hybrid_projection(master_mean, master_sims, og_mean=None, anchor_mean=
         raw = float(master)
         if anchor is not None:
             raw += 0.08 * (float(anchor) - float(master))
-        if og is not None:
-            raw += 0.05 * (float(og) - float(master))
+        if og is not None and not master_anchor_agree:
+            raw += 0.04 * (float(og) - float(master))
         status = "EXTREME_CONFLICT"
 
     shift = clamp(raw - float(master), -HYBRID_MODEL_MAX_PROJECTION_SHIFT_K, HYBRID_MODEL_MAX_PROJECTION_SHIFT_K)
     final = float(max(0.0, float(master) + shift))
     shifted_sims = np.clip(base_sims + shift, 0, None)
-    note = (
-        f"MASTER {master:.2f} | OG {og if og is not None else 'NA'} | clean anchor {anchor if anchor is not None else 'NA'} | "
-        f"spread {spread:.2f} | weights {master_w:.2f}/{og_w:.2f}/{anchor_w:.2f} | shift {shift:+.2f} | {status}"
-    )
+    note = f"MASTER {master:.2f} | OG {og if og is not None else 'NA'} | anchor {anchor if anchor is not None else 'NA'} | spread {spread:.2f} | shift {shift:+.2f} | {status}"
     return final, shifted_sims, {
         "active": True, "status": status, "spread": round(float(spread), 3),
         "shift": round(float(shift), 3), "master_projection": round(float(master), 3),
@@ -11245,10 +11398,9 @@ def build_hybrid_projection(master_mean, master_sims, og_mean=None, anchor_mean=
         "anchor_projection": None if anchor is None else round(float(anchor), 3),
         "master_weight": round(float(master_w), 3), "og_weight": round(float(og_w), 3),
         "anchor_weight": round(float(anchor_w), 3), "two_signal_rescue": rescue,
-        "learning_active": bool(profile.get("active_learning")),
-        "learning_samples_master": int((profile.get("master") or {}).get("samples", 0) or 0),
-        "learning_samples_og": int((profile.get("og") or {}).get("samples", 0) or 0),
-        "note": note, "version": HYBRID_MODEL_VERSION,
+        "og_outlier_blocked": og_outlier,
+        "learning_active": bool(profile.get("active_learning")), "learning_profile": profile,
+        "version": HYBRID_MODEL_VERSION, "note": note,
     }
 
 
@@ -11270,28 +11422,15 @@ def collect_available_k_lines(*sources):
     return sorted(set(round(v, 2) for v in values if 0.5 <= v <= 15.5))
 
 
-def build_hybrid_line_guard(
-    projection,
-    active_line,
-    master_projection=None,
-    og_projection=None,
-    anchor_projection=None,
-    available_lines=None,
-    kbf_sanity=None,
-    legacy_projection=None,
-    preserve_first=None,
-    kbf_reconcile=None,
-    workload_context=None,
-    suppression_escape=None,
-):
-    """Preserve-first line discipline for the corrected 3-signal merge.
 
-    Current PO is the baseline. Model-family disagreement is information, not an
-    automatic veto. A side flip away from the legacy baseline must be supported
-    by corrected architecture, clean-anchor agreement, a K/BF repair, or a large
-    line-independent projection correction. Thin edges and severe K/BF failures
-    still become PASS. This function never changes the baseball projection.
-    """
+def build_hybrid_line_guard(
+    projection, active_line, master_projection=None, og_projection=None,
+    anchor_projection=None, available_lines=None, kbf_sanity=None,
+    legacy_projection=None, preserve_first=None, kbf_reconcile=None,
+    workload_context=None, suppression_escape=None, workload_scenarios=None,
+    recent_line_context=None, hybrid_model_info=None,
+):
+    """V2.4 line-aware resolver: supported flips only; otherwise preserve PO side."""
     proj = _hybrid_num(projection, None)
     line = _hybrid_num(active_line, None)
     master = _hybrid_num(master_projection, proj)
@@ -11302,14 +11441,12 @@ def build_hybrid_line_guard(
     reconcile = kbf_reconcile if isinstance(kbf_reconcile, dict) else {}
     workload = workload_context if isinstance(workload_context, dict) else {}
     suppression = suppression_escape if isinstance(suppression_escape, dict) else {}
+    scenarios = workload_scenarios if isinstance(workload_scenarios, dict) else {}
+    recent_ctx = recent_line_context if isinstance(recent_line_context, dict) else scenarios
+    hybrid = hybrid_model_info if isinstance(hybrid_model_info, dict) else {}
     lines = sorted(set(float(x) for x in (available_lines or []) if _hybrid_num(x, None) is not None))
     if proj is None or line is None:
-        return {
-            "side": "NO LINE", "edge": None, "force_pass": True, "reason": "No active line",
-            "line_sensitive": False, "available_lines": lines, "model_straddle": False,
-            "robust_edge": None, "status": "NO_LINE", "vote_summary": "NO_LINE",
-            "legacy_side": "NO_LINE", "flip_supported": False,
-        }
+        return {"side": "NO LINE", "decision_side": "NO LINE", "edge": None, "force_pass": True, "reason": "No active line", "line_sensitive": False, "available_lines": lines, "model_straddle": False, "robust_edge": None, "status": "NO_LINE", "vote_summary": "NO_LINE", "legacy_side": "NO_LINE", "flip_supported": False}
 
     edge = float(proj) - float(line)
     side = "OVER" if edge > 0 else "UNDER" if edge < 0 else "PUSH"
@@ -11317,8 +11454,7 @@ def build_hybrid_line_guard(
     master_side = "OVER" if master is not None and master > line else "UNDER" if master is not None and master < line else "PUSH" if master is not None else "NA"
     anchor_side = "OVER" if anchor is not None and anchor > line else "UNDER" if anchor is not None and anchor < line else "PUSH" if anchor is not None else "NA"
 
-    named = [("MASTER", master), ("OG", og), ("ANCHOR", anchor), ("LEGACY_PO", legacy)]
-    named = [(n, v) for n, v in named if v is not None]
+    named = [(n, v) for n, v in [("MASTER", master), ("OG", og), ("ANCHOR", anchor), ("LEGACY_PO", legacy)] if v is not None]
     model_values = [v for _, v in named]
     model_min = min(model_values) if model_values else proj
     model_max = max(model_values) if model_values else proj
@@ -11326,7 +11462,6 @@ def build_hybrid_line_guard(
     model_spread = model_max - model_min
     robust_edge = min(abs(v - line) for v in model_values) if model_values else abs(edge)
     line_sensitive = bool(lines and min(lines) < proj < max(lines))
-
     votes = {"OVER": [], "UNDER": [], "PUSH": []}
     for n, v in named:
         votes["OVER" if v > line else "UNDER" if v < line else "PUSH"].append(n)
@@ -11335,78 +11470,55 @@ def build_hybrid_line_guard(
     unanimous = bool(named) and (over_n == len(named) or under_n == len(named))
     vote_summary = f"OVER:{','.join(votes['OVER']) or '-'} | UNDER:{','.join(votes['UNDER']) or '-'} | PUSH:{','.join(votes['PUSH']) or '-'}"
 
-    reasons = []
-    force_pass = False
-    flip_supported = False
-    flip_reason = ""
-
+    reasons, force_pass = [], False
+    flip_supported, flip_reason = False, ""
+    decision_side = side
+    preserve_legacy_side = False
     if side == "PUSH":
-        force_pass = True
-        reasons.append("projection equals line")
+        force_pass = True; reasons.append("projection equals line")
     if isinstance(kbf_sanity, dict) and kbf_sanity.get("force_pass"):
-        force_pass = True
-        reasons.append(str(kbf_sanity.get("status") or "K/BF sanity failure"))
+        force_pass = True; reasons.append(str(kbf_sanity.get("status") or "K/BF sanity failure"))
     if abs(edge) < HYBRID_MODEL_THIN_EDGE_K:
-        force_pass = True
-        reasons.append(f"edge below {HYBRID_MODEL_THIN_EDGE_K:.2f} K")
+        force_pass = True; reasons.append(f"edge below {HYBRID_MODEL_THIN_EDGE_K:.2f} K")
     if line_sensitive and abs(edge) < HYBRID_MODEL_LEAN_EDGE_K:
-        force_pass = True
-        reasons.append("direction flips across available real lines")
+        force_pass = True; reasons.append("direction flips across available real lines")
     if model_straddle and abs(edge) < MERGE_V23_MODEL_SPLIT_PASS_EDGE_K:
-        force_pass = True
-        reasons.append(f"model families straddle line with edge below {MERGE_V23_MODEL_SPLIT_PASS_EDGE_K:.2f} K")
+        force_pass = True; reasons.append(f"model families straddle line with edge below {MERGE_V23_MODEL_SPLIT_PASS_EDGE_K:.2f} K")
+    if scenarios.get("force_pass"):
+        force_pass = True; reasons.append(str(scenarios.get("note") or "low/base/high workload crosses line"))
 
     flips_legacy = bool(legacy is not None and legacy_side in {"OVER", "UNDER"} and side in {"OVER", "UNDER"} and side != legacy_side)
     if flips_legacy:
         delta_vs_legacy = abs(float(proj) - float(legacy))
         anchor_agrees = anchor_side == side
         master_agrees = master_side == side
-        preserve_up = bool(
-            preserve.get("upward_consensus")
-            or preserve.get("downward_consensus")
-            or preserve.get("suppression_escape_supported")
-            or str(preserve.get("status") or "").upper() in {"THREE_SIGNAL_UPWARD_RECOVERY", "THREE_PILLAR_UPWARD_RECOVERY"}
-        )
+        preserve_evidence = bool(preserve.get("upward_consensus") or preserve.get("downward_consensus") or preserve.get("suppression_escape_supported") or preserve.get("kbf_recent_repair_supported"))
         three_pillar_escape = bool(suppression.get("active") and suppression.get("all_three_pillars"))
-        repair_supported = bool(
-            reconcile.get("active") and anchor_agrees and master_agrees
-            and delta_vs_legacy >= MERGE_V23_FLIP_MIN_DELTA_K
-            and abs(edge) >= MERGE_V23_FLIP_MIN_EDGE_K
-        )
-        anchored_flip = bool(
-            anchor_agrees and master_agrees
-            and delta_vs_legacy >= MERGE_V23_FLIP_MIN_DELTA_K
-            and abs(edge) >= MERGE_V23_FLIP_MIN_EDGE_K
-        )
-        strong_architecture_flip = bool(
-            master_agrees
-            and delta_vs_legacy >= MERGE_V23_STRONG_ARCH_FLIP_DELTA_K
-            and abs(edge) >= MERGE_V23_STRONG_ARCH_FLIP_EDGE_K
-            and not (isinstance(kbf_sanity, dict) and kbf_sanity.get("force_pass"))
-        )
-        escape_flip = bool(three_pillar_escape and anchor_agrees and abs(edge) >= 0.35)
-        flip_supported = bool((preserve_up and abs(edge) >= MERGE_V23_FLIP_MIN_EDGE_K) or repair_supported or anchored_flip or strong_architecture_flip or escape_flip)
-        if escape_flip:
-            flip_reason = "three-pillar suppression escape"
-        elif preserve_up:
-            flip_reason = "preserve-first independent evidence"
-        elif repair_supported:
-            flip_reason = "clean-anchor K/BF repair"
-        elif anchored_flip:
-            flip_reason = "corrected MASTER and clean anchor agree"
-        elif strong_architecture_flip:
-            flip_reason = "large corrected-architecture move"
+        scenario_support = bool(scenarios.get("strong_support") and scenarios.get("base_side") == side)
+        recent_side = str(recent_ctx.get("recent_side") or "NEUTRAL").upper()
+        recent_support = recent_side in {"NEUTRAL", side}
+        outlier_conflict = bool(hybrid.get("og_outlier_blocked") or preserve.get("outlier_conflict") or "OUTLIER" in str(hybrid.get("status") or "").upper())
+
+        standard_flip = bool(anchor_agrees and master_agrees and delta_vs_legacy >= MERGE_V23_FLIP_MIN_DELTA_K and abs(edge) >= MERGE_V23_FLIP_MIN_EDGE_K and recent_support and not outlier_conflict)
+        thin_but_three_way = bool(master_agrees and anchor_agrees and scenario_support and recent_support and abs(edge) >= MERGE_V24_THIN_SUPPORTED_FLIP_EDGE_K and not outlier_conflict)
+        repair_flip = bool(reconcile.get("active") and anchor_agrees and master_agrees and scenario_support and recent_support)
+        escape_flip = bool(three_pillar_escape and anchor_agrees and scenario_support and recent_support and abs(edge) >= 0.25)
+        flip_supported = bool(standard_flip or thin_but_three_way or repair_flip or escape_flip or (preserve_evidence and scenario_support and recent_support and not outlier_conflict))
+        if escape_flip: flip_reason = "three-pillar suppression escape"
+        elif repair_flip: flip_reason = "K/BF repair plus workload scenarios"
+        elif thin_but_three_way: flip_reason = "thin edge but all three workload/architecture signals agree"
+        elif standard_flip: flip_reason = "MASTER and clean anchor agree"
+        elif flip_supported: flip_reason = "preserve-first independent evidence"
+
         if not flip_supported:
             force_pass = True
-            reasons.append(f"unsupported side flip vs Current PO ({legacy_side}->{side}; {vote_summary})")
+            decision_side = legacy_side
+            preserve_legacy_side = True
+            reasons.append(f"unsupported side flip; preserve Current PO {legacy_side} ({vote_summary})")
         else:
             reasons.append(f"supported side flip: {flip_reason}")
-    else:
-        # When the final side preserves Current PO, disagreement is diagnostic
-        # rather than an automatic veto. This prevents a distant OG shadow from
-        # deleting the baseline's proven winning direction.
-        if model_straddle:
-            reasons.append(f"model split retained on Current-PO side ({vote_summary})")
+    elif model_straddle:
+        reasons.append(f"model split retained on Current-PO side ({vote_summary})")
 
     if force_pass:
         status = "PASS_PRESERVE_FIRST_GUARD"
@@ -11422,7 +11534,8 @@ def build_hybrid_line_guard(
         status = "THIN_TRACK"
 
     return {
-        "side": side, "edge": round(edge, 3), "force_pass": bool(force_pass),
+        "side": side, "decision_side": decision_side, "preserve_legacy_side": preserve_legacy_side,
+        "edge": round(edge, 3), "force_pass": bool(force_pass),
         "reason": "; ".join(dict.fromkeys(reasons)) if reasons else "Current-PO side preserved with stable edge",
         "line_sensitive": line_sensitive, "available_lines": lines,
         "available_line_min": min(lines) if lines else None, "available_line_max": max(lines) if lines else None,
@@ -11431,7 +11544,8 @@ def build_hybrid_line_guard(
         "majority_side": majority_side, "unanimous": unanimous, "vote_summary": vote_summary,
         "legacy_side": legacy_side, "flips_legacy": flips_legacy,
         "flip_supported": flip_supported, "flip_reason": flip_reason,
-        "version": HYBRID_MODEL_VERSION,
+        "scenario_status": scenarios.get("status"), "scenario_straddle": scenarios.get("scenario_straddle"),
+        "recent_side": recent_ctx.get("recent_side"), "version": HYBRID_MODEL_VERSION,
     }
 
 
@@ -11669,7 +11783,7 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
             pitch_count_profile=pitch_count_profile if "pitch_count_profile" in locals() else {},
             game_script_risk=game_script_risk if "game_script_risk" in locals() else {},
         )
-        leash["expected_bf"] = float(clamp(workload_v23_bf, 14, 31))
+        leash["expected_bf"] = float(clamp(workload_v23_bf, 6, 31))
         leash["workload_v23"] = workload_v23_context
         leash["workload_v23_role"] = workload_v23_context.get("role_label")
         leash["workload_v23_confidence"] = workload_v23_context.get("confidence")
@@ -11679,7 +11793,7 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         leash["workload_v23_note"] = workload_v23_context.get("note")
     except Exception as _wv23_e:
         workload_v23_context = {
-            "version": "MERGE_V23_WORKLOAD_OPPORTUNITY",
+            "version": "MERGE_V24_WORKLOAD_OPPORTUNITY",
             "role_label": "WORKLOAD_V23_ERROR",
             "starter_like": bool(row.get("pitcher_confirmed") is not False),
             "explicit_short_role": False,
@@ -12043,6 +12157,7 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         legacy_po_master_mean,
         legacy_po_master_sims,
         og_mean=og_architecture_projection,
+        anchor_mean=rail_clean_anchor_projection,
     )
 
     # Corrected single-LOG5 Merge V2 branch.
@@ -12064,7 +12179,22 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         mean, sims, rail_clean_anchor_projection, sanity=final_kbf_sanity
     )
 
-    # Merge V2.3 controlled suppression escape. Requires pitcher capability,
+    # V2.4 recent starter K/BF support. This is line-independent and capped.
+    recent_kbf_support_v24 = build_recent_kbf_support_v24(
+        projection=mean,
+        recent_rows=workload_rows,
+        expected_bf=bf,
+        pitcher_k=pitcher_k,
+        opponent_k=lineup_exposure_k,
+        whiff=statcast_profile.get("whiff"),
+        workload_context=workload_v23_context if "workload_v23_context" in locals() else {},
+    )
+    if recent_kbf_support_v24.get("active"):
+        _recent_shift = safe_float(recent_kbf_support_v24.get("shift"), 0.0) or 0.0
+        mean = max(0.0, float(mean) + _recent_shift)
+        sims = np.clip(np.asarray(sims, dtype=float) + _recent_shift, 0, None)
+
+    # Merge V2.4 controlled suppression escape. Requires pitcher capability,
     # matchup opportunity, workload opportunity, and independent projection
     # evidence. It is calculated before sportsbook lines are considered.
     mean, sims, suppression_escape_info = apply_three_pillar_suppression_escape_v23(
@@ -12079,6 +12209,7 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         expected_bf=bf,
         workload_context=workload_v23_context if "workload_v23_context" in locals() else {},
         lineup_locked=lineup_locked,
+        recent_kbf_support=recent_kbf_support_v24 if "recent_kbf_support_v24" in locals() else {},
     )
 
     # Preserve-first final: Current PO remains the baseline; corrected math wins
@@ -12095,6 +12226,9 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         whiff=statcast_profile.get("whiff"),
         suppression_escape=suppression_escape_info if "suppression_escape_info" in locals() else {},
         workload_context=workload_v23_context if "workload_v23_context" in locals() else {},
+        kbf_reconcile=kbf_reconcile_info if "kbf_reconcile_info" in locals() else {},
+        recent_kbf_support=recent_kbf_support_v24 if "recent_kbf_support_v24" in locals() else {},
+        hybrid_model_info=hybrid_model_info if "hybrid_model_info" in locals() else {},
     )
     final_kbf_sanity = build_master_kbf_sanity_guard(
         projection=mean,
@@ -12255,6 +12389,12 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         market_model_side = _projection_side_from_projection_line(mean, active_line, pick_side)
         market_intel = build_market_odds_intelligence(priced_rows, active_line, market_model_side, fair_prob)
         line_history = build_line_history_audit(recent_rows, active_line, projection=mean)
+        workload_scenario_v24 = build_workload_scenario_guard_v24(
+            projection=mean,
+            line=active_line,
+            workload_context=workload_v23_context if "workload_v23_context" in locals() else {},
+            recent_rows=workload_rows,
+        )
         recent_form_engine = build_recent_vs_season_form_engine(recent_rows, season_k9=profile.get("K/9"), projection=mean)
         matching_priced = []
         for r in priced_rows:
@@ -12371,8 +12511,9 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
 
         risk_notes = (risk_notes + "; " if risk_notes else "") + "No-bet gate: " + "; ".join(no_bet_reasons)
 
-    # MASTER PO hybrid model/line guard. It never changes the projection or model lean.
-    # It only blocks an official play when the model families or available real lines are unstable.
+    # V2.4 protected-challenger line resolver. It never changes the baseball
+    # projection. Unsupported Merge side flips are displayed as the preserved
+    # Current-PO direction and remain PASS until stronger evidence exists.
     hybrid_line_guard = build_hybrid_line_guard(
         projection=mean,
         active_line=active_line,
@@ -12386,7 +12527,28 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         kbf_reconcile=kbf_reconcile_info if "kbf_reconcile_info" in locals() else None,
         workload_context=workload_v23_context if "workload_v23_context" in locals() else (leash if "leash" in locals() else None),
         suppression_escape=suppression_escape_info if "suppression_escape_info" in locals() else None,
+        workload_scenarios=workload_scenario_v24 if "workload_scenario_v24" in locals() else None,
+        recent_line_context=workload_scenario_v24 if "workload_scenario_v24" in locals() else None,
+        hybrid_model_info=hybrid_model_info if "hybrid_model_info" in locals() else None,
     )
+    _guard_decision_side = str(hybrid_line_guard.get("decision_side") or pick_side or "").upper()
+    if _guard_decision_side in {"OVER", "UNDER"} and _guard_decision_side != pick_side:
+        pick_side = _guard_decision_side
+        fair_prob = over_prob if pick_side == "OVER" else under_prob
+        # The previously selected price/EV belonged to the rejected Merge side.
+        # Preserve the direction for tracking, but keep the row a strict PASS.
+        ev = None
+        raw_kelly = 0.0
+        kelly = 0.0
+        edge_pct = None
+        bettable = False
+        if isinstance(final_decision, dict):
+            final_decision["model_side"] = pick_side
+            final_decision["fair_probability"] = fair_prob
+            final_decision["bet_action"] = "🚫 PASS"
+            final_decision["action_tier"] = "PASS"
+            final_decision["decision_note"] = (str(final_decision.get("decision_note") or "") + "; V2.4 preserved Current-PO side").strip("; ")
+
     if hybrid_line_guard.get("force_pass") and active_line is not None:
         bettable = False
         guard_reason = str(hybrid_line_guard.get("reason") or "hybrid model/line guard")
@@ -12725,6 +12887,10 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "suppression_escape_shift": (suppression_escape_info or {}).get("shift", 0.0) if "suppression_escape_info" in locals() else 0.0,
         "suppression_escape_all_three": (suppression_escape_info or {}).get("all_three_pillars", False) if "suppression_escape_info" in locals() else False,
         "suppression_escape_note": (suppression_escape_info or {}).get("note", "") if "suppression_escape_info" in locals() else "",
+        "recent_kbf_v24_status": (recent_kbf_support_v24 or {}).get("status") if "recent_kbf_support_v24" in locals() else None,
+        "recent_kbf_v24_shift": (recent_kbf_support_v24 or {}).get("shift", 0.0) if "recent_kbf_support_v24" in locals() else 0.0,
+        "recent_kbf_v24_rate_gap": (recent_kbf_support_v24 or {}).get("rate_gap") if "recent_kbf_support_v24" in locals() else None,
+        "recent_kbf_v24_note": (recent_kbf_support_v24 or {}).get("note", "") if "recent_kbf_support_v24" in locals() else "",
         "workload_v23_role": (workload_v23_context or {}).get("role_label") if "workload_v23_context" in locals() else None,
         "workload_v23_confidence": (workload_v23_context or {}).get("confidence") if "workload_v23_context" in locals() else None,
         "workload_v23_shift_bf": (workload_v23_context or {}).get("bf_shift", 0.0) if "workload_v23_context" in locals() else 0.0,
@@ -12748,6 +12914,14 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "hybrid_model_version": HYBRID_MODEL_VERSION,
         "hybrid_og_shadow_source": "EXACT_OG_CODE_PRE_MARKET" if HYBRID_EXACT_OG_SHADOW_ENABLED else "FALLBACK_ONLY",
         "hybrid_line_guard_status": hybrid_line_guard.get("status") if "hybrid_line_guard" in locals() else "NO_LINE",
+        "hybrid_decision_side": hybrid_line_guard.get("decision_side") if "hybrid_line_guard" in locals() else None,
+        "hybrid_preserved_legacy_side": hybrid_line_guard.get("preserve_legacy_side") if "hybrid_line_guard" in locals() else False,
+        "workload_scenario_v24_status": (workload_scenario_v24 or {}).get("status") if "workload_scenario_v24" in locals() else None,
+        "workload_scenario_v24_low_k": (workload_scenario_v24 or {}).get("low_projection") if "workload_scenario_v24" in locals() else None,
+        "workload_scenario_v24_base_k": (workload_scenario_v24 or {}).get("base_projection") if "workload_scenario_v24" in locals() else None,
+        "workload_scenario_v24_high_k": (workload_scenario_v24 or {}).get("high_projection") if "workload_scenario_v24" in locals() else None,
+        "workload_scenario_v24_recent_side": (workload_scenario_v24 or {}).get("recent_side") if "workload_scenario_v24" in locals() else None,
+        "workload_scenario_v24_note": (workload_scenario_v24 or {}).get("note", "") if "workload_scenario_v24" in locals() else "",
         "hybrid_line_guard_reason": hybrid_line_guard.get("reason") if "hybrid_line_guard" in locals() else "",
         "hybrid_line_sensitive": hybrid_line_guard.get("line_sensitive") if "hybrid_line_guard" in locals() else False,
         "hybrid_vote_summary": hybrid_line_guard.get("vote_summary") if "hybrid_line_guard" in locals() else "",
