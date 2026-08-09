@@ -25,7 +25,7 @@ from math import exp, factorial
 from datetime import datetime, timedelta
 from pathlib import Path
 
-APP_VERSION = "ONE WAY PICKZ MASTER PO MERGE V2.5.3 PRESERVE-FIRST + RESOLVED K PIPELINE 2026-08-09"
+APP_VERSION = "ONE WAY PICKZ MASTER PO MERGE V2.5.4 PRESERVE-FIRST + DATA RELIABILITY 2026-08-09"
 FULL_APP_UPDATE_MARKER = "FULL_APP_CANONICAL_K_PIPELINE_2026_07_30"
 # =========================
 # STABLE PROJECTION SEEDING
@@ -376,6 +376,19 @@ MERGE_V252_ENABLE_EARLY_K_PROJECTION = False
 MERGE_V252_ENABLE_UMPIRE_PROJECTION = False
 MERGE_V252_ENABLE_UNDERDOG_LINEUP_DIAGNOSTICS = True
 MERGE_V252_ENABLE_UNDERDOG_LINEUP_PROJECTION = False
+
+# V2.5.4 reliability layer. New external-data modules begin as diagnostics or
+# tightly capped gates; the protected PO resolver remains unchanged.
+MERGE_V254_ENABLE_DATA_QUALITY_GATE = True
+MERGE_V254_ENABLE_AUTO_LINEUP_REFRESH = True
+MERGE_V254_ENABLE_PREGAME_FIXTURES = True
+MERGE_V254_ENABLE_MODULE_GRADING = True
+MERGE_V254_OFFICIAL_LINEUP_CHECK_INTERVAL_SEC = 90
+MERGE_V254_MIN_RESOLVED_HITTERS = 5
+MERGE_V254_TARGET_RESOLVED_HITTERS = 7
+MERGE_V254_MAX_EXPECTED_LINEUP_AGE_MIN = 120
+MERGE_V254_HARD_STALE_LINEUP_AGE_MIN = 240
+MERGE_V254_MIN_DATA_SCORE = 60
 
 
 LEAGUE_AVG_WHIFF_BY_PITCH_TYPE = {
@@ -13083,6 +13096,40 @@ def build_movement_attribution_v252(
 
 def extract_underdog_mlb_hitter_pool_v252(payload):
     """Extract participation names/team only; prop values and directions are ignored."""
+    payload = payload if isinstance(payload, dict) else {}
+    # Current Underdog schema uses opaque team_id values on player objects. Resolve
+    # those IDs only from MLB game titles; never inspect prop values or directions.
+    team_by_id = {}
+    for game in payload.get("games") or []:
+        if not isinstance(game, dict) or str(game.get("sport_id") or "").upper() != "MLB":
+            continue
+        title = str(game.get("abbreviated_title") or game.get("title") or "")
+        parts = [part.strip() for part in re.split(r"\s+@\s+", title, maxsplit=1, flags=re.I)]
+        if len(parts) == 2:
+            if game.get("away_team_id"):
+                team_by_id[str(game.get("away_team_id"))] = parts[0]
+            if game.get("home_team_id"):
+                team_by_id[str(game.get("home_team_id"))] = parts[1]
+
+    current_rows = []
+    for player in payload.get("players") or []:
+        if not isinstance(player, dict) or str(player.get("sport_id") or "").upper() != "MLB":
+            continue
+        position = str(player.get("position_name") or player.get("position") or "").upper().strip()
+        if position in {"P", "SP", "RP", "LHP", "RHP"}:
+            continue
+        first = str(player.get("first_name") or "").strip()
+        last = str(player.get("last_name") or "").strip()
+        name = f"{first} {last}".strip()
+        team = team_by_id.get(str(player.get("team_id") or ""), "")
+        if name and team:
+            current_rows.append({
+                "player": name,
+                "team": team,
+                "position": position or None,
+                "evidence": "UNDERDOG_ACTIVE_MLB_PARTICIPATION",
+            })
+
     objects = []
 
     def walk(value, parent_key=""):
@@ -13098,7 +13145,7 @@ def extract_underdog_mlb_hitter_pool_v252(payload):
                 walk(nested, parent_key)
 
     walk(payload)
-    rows = []
+    rows = list(current_rows)
     for obj in objects:
         attrs = obj.get("attributes") if isinstance(obj.get("attributes"), dict) else {}
         merged = dict(obj)
@@ -13106,7 +13153,7 @@ def extract_underdog_mlb_hitter_pool_v252(payload):
         object_type = str(obj.get("type") or obj.get("_parent_key") or "").lower()
         text = " ".join(str(merged.get(key) or "") for key in (
             "sport", "sport_name", "league", "league_name", "title", "description",
-            "market", "stat", "stat_type", "position",
+            "market", "stat", "stat_type", "position", "sport_id", "position_name",
         ))
         text_upper = text.upper()
         if any(token in text_upper for token in ("NBA", "NFL", "NHL", "WNBA", "SOCCER", "GOLF", "TENNIS")):
@@ -13118,7 +13165,7 @@ def extract_underdog_mlb_hitter_pool_v252(payload):
         player_object = any(token in object_type for token in ("PLAYER", "ATHLETE", "APPEARANCE"))
         if not (mlb_context or batter_market or player_object):
             continue
-        position = str(merged.get("position") or merged.get("pos") or "").upper().strip()
+        position = str(merged.get("position") or merged.get("position_name") or merged.get("pos") or "").upper().strip()
         if position in {"P", "SP", "RP", "LHP", "RHP"}:
             continue
         name = ""
@@ -13137,6 +13184,8 @@ def extract_underdog_mlb_hitter_pool_v252(payload):
         team_value = merged.get("team_abbr") or merged.get("team_abbreviation") or merged.get("team") or merged.get("team_name")
         if isinstance(team_value, dict):
             team_value = team_value.get("abbr") or team_value.get("abbreviation") or team_value.get("name")
+        if not team_value and merged.get("team_id"):
+            team_value = team_by_id.get(str(merged.get("team_id")))
         team = str(team_value or "").strip()
         if not team:
             continue
@@ -14892,6 +14941,8 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
     out = {
         "pick_id": pick_id,
         "created_at": now_iso(),
+        "projection_generated_at": now_iso(),
+        "lineup_last_refresh": now_iso(),
         "date": row["date"],
         "game_pk": row["game_pk"],
         "game_time": row["game_time"],
@@ -14909,6 +14960,8 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "away_team": row["away_team"],
         "pitcher_confirmed": bool(row.get("pitcher_confirmed")),
         "lineup_locked": bool(lineup_locked),
+        "official_lineup_available": bool(official_lineup_v252),
+        "lineup_freshness_status": "FRESH_CONFIRMED" if official_lineup_v252 else "FRESH_EXPECTED",
         "lineup_note": lineup_msg,
         "projection_source": proj_source_label,
         "lineup_status": lineup_status_label,
@@ -14998,6 +15051,8 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "model_missing_from_underdog": (underdog_lineup_v252 or {}).get("model_missing_from_underdog", []) if "underdog_lineup_v252" in locals() else [],
         "underdog_pull_time": (underdog_lineup_v252 or {}).get("pull_time") if "underdog_lineup_v252" in locals() else None,
         "underdog_lineup_projection_effect_k": (underdog_lineup_v252 or {}).get("projection_effect_k", 0.0) if "underdog_lineup_v252" in locals() else 0.0,
+        "underdog_lineup_suggested_effect_k": (underdog_lineup_v252 or {}).get("suggested_projection_effect_k", 0.0) if "underdog_lineup_v252" in locals() else 0.0,
+        "underdog_lineup_projection_enabled": bool(MERGE_V252_ENABLE_UNDERDOG_LINEUP_PROJECTION),
         "underdog_lineup_note": (underdog_lineup_v252 or {}).get("note", "") if "underdog_lineup_v252" in locals() else "",
         "ip_bf_patch_label": leash.get("ip_bf_patch_label"),
         "ip_bf_patch_note": leash.get("ip_bf_patch_note"),
@@ -17183,6 +17238,304 @@ def render_calibration_audit_tab():
 
 
 # =========================
+# MERGE V2.5.4 LIVE RELIABILITY / FROZEN-SLATE SUPPORT
+# =========================
+_V254_OUTCOME_KEYS = {
+    "actual", "actual_k", "actual_ip", "final_result", "win_loss",
+    "hit/miss", "graded_result", "result", "outcome", "postgame",
+}
+
+
+def _v254_parse_timestamp(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def _v254_age_minutes(value, now_value=None):
+    stamp = _v254_parse_timestamp(value)
+    if stamp is None:
+        return None
+    now_dt = now_value if isinstance(now_value, datetime) else datetime.now()
+    try:
+        return max(0.0, (now_dt.replace(tzinfo=None) - stamp).total_seconds() / 60.0)
+    except Exception:
+        return None
+
+
+def evaluate_data_quality_v254(p, now_value=None):
+    """Evaluate pregame source sufficiency without changing projection math."""
+    p = p if isinstance(p, dict) else {}
+    hard_reasons = []
+    cautions = []
+    hand = str(p.get("hand") or "").upper().strip()
+    lineup_count = safe_int(p.get("expected_lineup_batter_count"), 0) or 0
+    underdog_count = safe_int(p.get("underdog_player_count"), 0) or 0
+    resolved_hitter_count = max(lineup_count, underdog_count)
+    data_score = safe_float(p.get("data_score"), None)
+    lineup_locked = bool(p.get("lineup_locked") or p.get("official_lineup_available"))
+    refresh_stamp = p.get("lineup_last_refresh") or p.get("projection_generated_at") or p.get("created_at")
+    lineup_age = _v254_age_minutes(refresh_stamp, now_value=now_value)
+
+    if hand not in {"L", "R", "LHP", "RHP"}:
+        hard_reasons.append("pitcher handedness unresolved")
+    if data_score is not None and data_score < MERGE_V254_MIN_DATA_SCORE:
+        hard_reasons.append(f"data score {data_score:.0f} below {MERGE_V254_MIN_DATA_SCORE}")
+    if resolved_hitter_count < MERGE_V254_MIN_RESOLVED_HITTERS:
+        hard_reasons.append(
+            f"only {resolved_hitter_count} hitter K profiles resolved; need {MERGE_V254_MIN_RESOLVED_HITTERS}"
+        )
+    elif resolved_hitter_count < MERGE_V254_TARGET_RESOLVED_HITTERS:
+        cautions.append(
+            f"{resolved_hitter_count}/{MERGE_V254_TARGET_RESOLVED_HITTERS} target hitter profiles resolved"
+        )
+    if not bool(p.get("pitcher_confirmed")):
+        cautions.append("probable starter not yet confirmed")
+    if not lineup_locked:
+        cautions.append("official batting order not posted")
+    if lineup_age is None:
+        cautions.append("lineup refresh timestamp unavailable")
+    elif not lineup_locked and lineup_age > MERGE_V254_HARD_STALE_LINEUP_AGE_MIN:
+        hard_reasons.append(f"expected lineup is {lineup_age:.0f} minutes old")
+    elif not lineup_locked and lineup_age > MERGE_V254_MAX_EXPECTED_LINEUP_AGE_MIN:
+        cautions.append(f"expected lineup is {lineup_age:.0f} minutes old")
+    if not bool(p.get("statcast_available")):
+        cautions.append("Savant pitcher profile unavailable")
+    if not bool(p.get("pitch_type_matchup_available")):
+        cautions.append("automatic pitch-type matchup unavailable")
+    ud_status = str(p.get("underdog_lineup_status") or "UNDERDOG_NOT_CHECKED")
+    if "SUPPORTED" not in ud_status and "OVERRIDES" not in ud_status:
+        cautions.append("Underdog names-only pool unavailable or partial")
+
+    status = "PASS_DATA_QUALITY" if hard_reasons else ("CAUTION" if cautions else "READY")
+    score = 100
+    score -= 35 * len(hard_reasons)
+    score -= min(40, 7 * len(cautions))
+    return {
+        "status": status,
+        "score": int(max(0, score)),
+        "hard_reasons": hard_reasons,
+        "cautions": cautions,
+        "resolved_hitter_count": int(resolved_hitter_count),
+        "lineup_age_minutes": None if lineup_age is None else round(lineup_age, 1),
+        "lineup_freshness": (
+            "CONFIRMED" if lineup_locked else
+            "STALE" if lineup_age is not None and lineup_age > MERGE_V254_MAX_EXPECTED_LINEUP_AGE_MIN else
+            "EXPECTED_FRESH"
+        ),
+    }
+
+
+def apply_data_quality_gate_v254(p, now_value=None):
+    out = dict(p or {})
+    quality = evaluate_data_quality_v254(out, now_value=now_value)
+    out["data_quality_gate_status"] = quality["status"]
+    out["data_quality_gate_score"] = quality["score"]
+    out["data_quality_hard_reasons"] = quality["hard_reasons"]
+    out["data_quality_cautions"] = quality["cautions"]
+    out["resolved_hitter_count"] = quality["resolved_hitter_count"]
+    out["lineup_age_minutes"] = quality["lineup_age_minutes"]
+    out["lineup_freshness_status"] = quality["lineup_freshness"]
+    if MERGE_V254_ENABLE_DATA_QUALITY_GATE and quality["status"] == "PASS_DATA_QUALITY":
+        out["pre_data_quality_action_tier"] = out.get("action_tier")
+        out["pre_data_quality_bet_action"] = out.get("bet_action")
+        out["action_tier"] = "PASS"
+        out["bet_action"] = "PASS — DATA QUALITY"
+    return out
+
+
+def official_lineup_transition_v254(picks, force=False):
+    """Detect newly posted MLB batting orders; called at most once per interval."""
+    if not MERGE_V254_ENABLE_AUTO_LINEUP_REFRESH:
+        return {"refresh": False, "games": [], "status": "DISABLED"}
+    now_epoch = datetime.now().timestamp()
+    last_epoch = safe_float(st.session_state.get("v254_last_lineup_check_epoch"), 0.0) or 0.0
+    if not force and now_epoch - last_epoch < MERGE_V254_OFFICIAL_LINEUP_CHECK_INTERVAL_SEC:
+        return {"refresh": False, "games": [], "status": "THROTTLED"}
+    st.session_state.v254_last_lineup_check_epoch = now_epoch
+    game_pks = sorted({str(p.get("game_pk")) for p in (picks or []) if p.get("game_pk") and not p.get("lineup_locked")})
+    transitioned = []
+    for game_pk in game_pks:
+        try:
+            box = safe_get_json(f"{MLB_BASE}/game/{game_pk}/boxscore", timeout=12) or {}
+            teams = box.get("teams") or {}
+            counts = {}
+            for side in ("away", "home"):
+                players = ((teams.get(side) or {}).get("players") or {}).values()
+                counts[side] = sum(1 for player in players if player.get("battingOrder"))
+            if max(counts.values() or [0]) >= 8:
+                transitioned.append({"game_pk": game_pk, "away_hitters": counts.get("away", 0), "home_hitters": counts.get("home", 0)})
+        except Exception:
+            continue
+    return {"refresh": bool(transitioned), "games": transitioned, "status": "OFFICIAL_LINEUP_FOUND" if transitioned else "NO_TRANSITION"}
+
+
+def _v254_pregame_value(value):
+    if isinstance(value, dict):
+        return {
+            str(key): _v254_pregame_value(item)
+            for key, item in value.items()
+            if str(key).lower() not in _V254_OUTCOME_KEYS
+        }
+    if isinstance(value, (list, tuple)):
+        return [_v254_pregame_value(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.integer, np.floating)):
+        return value.item()
+    if isinstance(value, (datetime, pd.Timestamp)):
+        return value.isoformat()
+    if pd.isna(value) if not isinstance(value, (str, bytes)) else False:
+        return None
+    return value
+
+
+def save_frozen_pregame_snapshot_v254(picks, base_dir=None):
+    """Write a pregame-only JSON fixture and flat CSV; outcome keys are removed."""
+    if not MERGE_V254_ENABLE_PREGAME_FIXTURES:
+        return {"status": "DISABLED", "count": 0}
+    root = Path(base_dir or "validation/pregame_live")
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+    clean_rows = [_v254_pregame_value(dict(p)) for p in (picks or []) if isinstance(p, dict)]
+    settings = {
+        "po_protection": True,
+        "workload_repair": MERGE_V252_ENABLE_WORKLOAD_REPAIR,
+        "elite_escape": MERGE_V252_ENABLE_ELITE_ESCAPE,
+        "exact_line_guard": MERGE_V252_ENABLE_EXACT_LINE_GUARD,
+        "early_k_projection": MERGE_V252_ENABLE_EARLY_K_PROJECTION,
+        "umpire_projection": MERGE_V252_ENABLE_UMPIRE_PROJECTION,
+        "underdog_projection": MERGE_V252_ENABLE_UNDERDOG_LINEUP_PROJECTION,
+        "data_quality_gate": MERGE_V254_ENABLE_DATA_QUALITY_GATE,
+    }
+    payload = {
+        "schema": "MERGE_V254_PREGAME_ONLY",
+        "snapshot_timestamp": now_iso(),
+        "app_version": APP_VERSION,
+        "settings": settings,
+        "rows": clean_rows,
+    }
+    json_path = root / f"merge_v254_pregame_{stamp}.json"
+    csv_path = root / f"merge_v254_pregame_{stamp}.csv"
+    json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    flat_rows = []
+    for row in clean_rows:
+        flat_rows.append({key: json.dumps(value, ensure_ascii=True) if isinstance(value, (dict, list)) else value for key, value in row.items()})
+    pd.DataFrame(flat_rows).to_csv(csv_path, index=False)
+    return {"status": "SAVED", "count": len(clean_rows), "json_path": str(json_path), "csv_path": str(csv_path)}
+
+
+def build_live_source_health_v254(picks):
+    rows = []
+    for p in picks or []:
+        if not isinstance(p, dict):
+            continue
+        quality = evaluate_data_quality_v254(p)
+        pitch_rows = [row for row in (p.get("pitch_type_rows") or []) if isinstance(row, dict)]
+        rows.append({
+            "Pitcher": p.get("pitcher"),
+            "Hand": p.get("hand"),
+            "Starter": "CONFIRMED" if p.get("pitcher_confirmed") else "PROBABLE",
+            "Lineup": "OFFICIAL" if p.get("lineup_locked") else "EXPECTED",
+            "Hitters": quality["resolved_hitter_count"],
+            "Lineup Age Min": quality["lineup_age_minutes"],
+            "Underdog": p.get("underdog_lineup_status"),
+            "UD Hitters": safe_int(p.get("underdog_player_count"), 0),
+            "UD K%": p.get("underdog_expected_lineup_k_pct"),
+            "Savant": "READY" if p.get("statcast_available") else "MISSING",
+            "Arsenal Rows": len(pitch_rows),
+            "Pitch Matchup": "READY" if p.get("pitch_type_matchup_available") else "FALLBACK",
+            "Data Gate": quality["status"],
+            "Gate Score": quality["score"],
+            "Reason": "; ".join(quality["hard_reasons"] or quality["cautions"][:2]),
+        })
+    return pd.DataFrame(rows)
+
+
+def _v254_side_won(side, actual_k, line):
+    side = str(side or "").upper()
+    actual = safe_float(actual_k, None)
+    threshold = safe_float(line, None)
+    if actual is None or threshold is None or actual == threshold or side not in {"OVER", "UNDER"}:
+        return None
+    return actual > threshold if side == "OVER" else actual < threshold
+
+
+def build_module_grading_v254(results=None):
+    """Observed model comparison plus module usage; no fabricated counterfactuals."""
+    graded = [row for row in (results if results is not None else load_json(RESULT_LOG, [])) if isinstance(row, dict)]
+    model_specs = [
+        ("CURRENT_PO", ["current_po_side", "PO Side", "po_direction"], ["current_po_projection", "PO Projection", "po_projection"]),
+        ("MERGE_RAW", ["merge_raw_side", "Merge Raw Side", "merge_direction"], ["hybrid_consensus_projection", "Merge Raw Projection", "merge_projection"]),
+        ("FINAL_PROTECTED", ["pick_side", "Final Resolved Side", "final_side"], ["decision_projection", "projection", "Final Resolved Projection"]),
+    ]
+    metrics = []
+    normalized = []
+    for row in graded:
+        actual = next((safe_float(row.get(key), None) for key in ("actual", "actual_k", "Actual K", "strikeouts") if safe_float(row.get(key), None) is not None), None)
+        line = next((safe_float(row.get(key), None) for key in ("line", "UD/Line", "Line") if safe_float(row.get(key), None) is not None), None)
+        if actual is None or line is None:
+            continue
+        normalized.append((row, actual, line))
+    for name, side_keys, projection_keys in model_specs:
+        wins = losses = 0
+        errors = []
+        for row, actual, line in normalized:
+            side = next((row.get(key) for key in side_keys if str(row.get(key) or "").upper() in {"OVER", "UNDER"}), None)
+            won = _v254_side_won(side, actual, line)
+            if won is True:
+                wins += 1
+            elif won is False:
+                losses += 1
+            projection = next((safe_float(row.get(key), None) for key in projection_keys if safe_float(row.get(key), None) is not None), None)
+            if projection is not None:
+                errors.append(abs(projection - actual))
+        plays = wins + losses
+        metrics.append({
+            "Model": name,
+            "Wins": wins,
+            "Losses": losses,
+            "Win Rate": None if not plays else round(wins / plays * 100.0, 1),
+            "Projection MAE": None if not errors else round(float(np.mean(errors)), 3),
+            "Graded Plays": plays,
+        })
+    rescued = surrendered = comparable = 0
+    for row, actual, line in normalized:
+        po_side = str(row.get("current_po_side") or row.get("PO Side") or "").upper()
+        final_side = str(row.get("pick_side") or row.get("Final Resolved Side") or "").upper()
+        if po_side not in {"OVER", "UNDER"} or final_side not in {"OVER", "UNDER"} or po_side == final_side:
+            continue
+        comparable += 1
+        po_win = _v254_side_won(po_side, actual, line)
+        final_win = _v254_side_won(final_side, actual, line)
+        rescued += int(po_win is False and final_win is True)
+        surrendered += int(po_win is True and final_win is False)
+    module_rows = []
+    module_specs = [
+        ("PO protection", True, "resolver_decision", "PRESERVE_PO"),
+        ("Workload V2", MERGE_V252_ENABLE_WORKLOAD_REPAIR, "workload_repair_v252_applied", True),
+        ("Suppression escape", MERGE_V252_ENABLE_ELITE_ESCAPE, "elite_escape_v252_applied", True),
+        ("Exact-line guard", MERGE_V252_ENABLE_EXACT_LINE_GUARD, "exact_line_v252_force_pass", True),
+        ("Early-K projection", MERGE_V252_ENABLE_EARLY_K_PROJECTION, "early_k_projection_enabled", True),
+        ("Umpire projection", MERGE_V252_ENABLE_UMPIRE_PROJECTION, "umpire_projection_enabled", True),
+        ("Underdog lineup projection", MERGE_V252_ENABLE_UNDERDOG_LINEUP_PROJECTION, "underdog_lineup_projection_enabled", True),
+        ("Data-quality gate", MERGE_V254_ENABLE_DATA_QUALITY_GATE, "data_quality_gate_status", "PASS_DATA_QUALITY"),
+    ]
+    for module, enabled, field, active_value in module_specs:
+        active = sum(1 for row, _actual, _line in normalized if row.get(field) == active_value)
+        module_rows.append({"Module": module, "Projection Enabled": bool(enabled), "Observed Activations": active, "Evaluation": "OBSERVED ONLY — use frozen replay for causal A/B"})
+    return {
+        "metrics": pd.DataFrame(metrics),
+        "modules": pd.DataFrame(module_rows),
+        "net_gain": {"rescued_po_losses": rescued, "surrendered_po_wins": surrendered, "net": rescued - surrendered, "flip_attempts": comparable},
+        "graded_rows": len(normalized),
+    }
+
+
+# =========================
 # APP
 # =========================
 st.markdown("""
@@ -17243,6 +17596,16 @@ with col_refresh:
 with col_save:
     save_btn = st.button("💾 SAVE OFFICIAL BEFORE-GAME SNAPSHOT", use_container_width=True)
 
+# On the next app interaction, detect an MLB batting order that posted after the
+# last projection and reuse the normal full refresh path. The check is throttled.
+_lineup_transition = official_lineup_transition_v254(st.session_state.get("loaded_picks", []))
+if _lineup_transition.get("refresh") and not refresh_btn:
+    refresh_btn = True
+    st.info(
+        f"Official lineup detected for {len(_lineup_transition.get('games') or [])} game(s). "
+        "Refreshing every affected projection from the official batting orders."
+    )
+
 if refresh_btn:
     all_rows = []
     for d in dates:
@@ -17274,6 +17637,7 @@ if refresh_btn:
         progress.progress((i + 1) / max(1, len(all_rows)))
 
     projections = apply_systematic_direction_bias_guard_v25(projections)
+    projections = [apply_data_quality_gate_v254(p) for p in projections]
     st.session_state.loaded_picks = projections
     st.session_state.last_refresh_time = now_iso()
     st.session_state.pop("saved_manual_odds_auto_applied", None)
@@ -17284,8 +17648,13 @@ if save_btn:
         st.warning("Refresh the live board first, inspect the lines, then save the official before-game snapshot.")
     else:
         added = save_many_once(st.session_state.loaded_picks)
+        frozen = save_frozen_pregame_snapshot_v254(st.session_state.loaded_picks)
         st.session_state.last_saved_count = added
-        st.success(f"Saved official before-game snapshot. Added {added} new rows.")
+        st.session_state.last_frozen_snapshot = frozen
+        st.success(
+            f"Saved official before-game snapshot. Added {added} new rows. "
+            f"Frozen pregame fixture: {frozen.get('count', 0)} rows."
+        )
 
 
 # =========================
@@ -17465,6 +17834,26 @@ if only_strong:
 st.session_state.slate_quality_info = compute_slate_quality_score(board)
 
 st.info(f"{APP_VERSION} | {board_status} | Last refresh: {st.session_state.get('last_refresh_time') or 'Not refreshed this session'} | Last save added: {st.session_state.get('last_saved_count', 0)}")
+
+_health_source_board = st.session_state.get("loaded_picks") or board
+_live_health_v254 = build_live_source_health_v254(_health_source_board)
+with st.expander("Live Data Reliability — Lineups, Underdog, Savant and Arsenal", expanded=False):
+    if _live_health_v254.empty:
+        st.info("Refresh the live board to run source-health checks.")
+    else:
+        hc1, hc2, hc3, hc4 = st.columns(4)
+        hc1.metric("Pitchers Checked", len(_live_health_v254))
+        hc2.metric("Official Lineups", int((_live_health_v254["Lineup"] == "OFFICIAL").sum()))
+        hc3.metric("Underdog Pools", int(_live_health_v254["Underdog"].astype(str).str.contains("SUPPORTED|OVERRIDES", regex=True).sum()))
+        hc4.metric("Hard Data Passes", int((_live_health_v254["Data Gate"] == "PASS_DATA_QUALITY").sum()))
+        st.dataframe(_live_health_v254, use_container_width=True, hide_index=True)
+        st.caption(
+            "Underdog contributes hitter names and automatic MLB K percentages only. "
+            "Its prop lines, Higher/Lower direction and multipliers never enter the K projection."
+        )
+        if st.session_state.get("last_frozen_snapshot"):
+            snap = st.session_state.last_frozen_snapshot
+            st.caption(f"Latest frozen fixture: {snap.get('json_path')} | {snap.get('csv_path')}")
 
 render_kpis(board, bankroll)
 render_slate_quality_score(board)
@@ -49703,7 +50092,7 @@ def _kcard_arsenal_profile(row, p):
 def _kcard_arsenal_html(profile):
     rows = profile.get("rows") or []
     if not rows:
-        return '<div class="kc-empty">Pitch arsenal feed not matched yet. Upload pitch_mix_matchups.csv to fill top pitch and pitch-by-pitch whiff/K rows.</div>'
+        return '<div class="kc-empty">Automatic Savant arsenal data did not resolve. The projection uses its neutral fallback and the data gate records the missing source.</div>'
     def _pct(value, digits=0):
         v = _kclean_num(value, np.nan)
         if not np.isfinite(v):
@@ -49844,7 +50233,7 @@ def _kcard_opponent_pitch_arsenal_profile(row, p, arsenal):
 def _kcard_opponent_pitch_arsenal_html(profile):
     rows = (profile or {}).get("rows") or []
     if not rows:
-        return '<div class="kc-empty">Opponent-vs-pitch arsenal rows not matched yet. Upload pitch_mix_matchups.csv and true batter pitch-profile data to fill this section.</div>'
+        return '<div class="kc-empty">Opponent-vs-pitch rows did not resolve automatically. No manual upload is required; the matchup stays neutral until Savant data is available.</div>'
     def _fmt(value, digits=0, suffix="%"):
         v = _kclean_num(value, np.nan)
         if not np.isfinite(v):
@@ -50100,6 +50489,9 @@ def _kclean_render_player_cards(df, board=None, limit=None):
             recent_skill = html.escape(str(_kclean_pick(row, ["APP100 Recent Skill"], ""))[:24])
             pitch_mix_quality = html.escape(str(_kclean_pick(row, ["APP100 Pitch Mix Coverage"], ""))[:24])
             lineup_status = html.escape(str(_kclean_pick(row, ["APP97 Lineup Status", "Lineup", "Projection Source"], (p or {}).get("lineup_status", "")))[:34])
+            quality_gate = html.escape(str((p or {}).get("data_quality_gate_status") or _kclean_pick(row, ["Data Quality Gate"], "NOT_CHECKED"))[:24])
+            quality_gate_score = html.escape(str((p or {}).get("data_quality_gate_score") if (p or {}).get("data_quality_gate_score") is not None else _kclean_pick(row, ["Data Quality Score"], "—")))
+            resolved_hitters = html.escape(str((p or {}).get("resolved_hitter_count") if (p or {}).get("resolved_hitter_count") is not None else _kclean_pick(row, ["Resolved Hitter Profiles"], "—")))
             lineup_rows, lineup_src = _kcard_lineup_rows(row, p)
             lineup_table = _kcard_lineup_html(lineup_rows)
             _card_expected_bf = _kclean_num(
@@ -50188,6 +50580,9 @@ def _kclean_render_player_cards(df, board=None, limit=None):
                 <div class="kc-stat"><span>Model Spread</span><b>{hybrid_spread}</b></div>
                 <div class="kc-stat"><span>Hybrid Status</span><b>{hybrid_status}</b></div>
                 <div class="kc-stat"><span>Line Guard</span><b>{hybrid_line_status or '—'}</b></div>
+                <div class="kc-stat"><span>Data Gate</span><b>{quality_gate}</b></div>
+                <div class="kc-stat"><span>Gate Score</span><b>{quality_gate_score}</b></div>
+                <div class="kc-stat"><span>Hitter K Profiles</span><b>{resolved_hitters}</b></div>
               </div>
               {last10_html}
               <div class="kc-section">
@@ -55045,6 +55440,7 @@ def _canonical_k_decision(projection, line, board_row=None, row=None):
     ae = abs(edge)
     action_tier = str(board_row.get("action_tier") or "").upper()
     core_action = str(board_row.get("bet_action") or "").upper()
+    quality_gate_status = str(board_row.get("data_quality_gate_status") or "").upper()
     exact_line_pass = bool(board_row.get("exact_line_v252_force_pass"))
     resolved_projection_conflict = bool(
         side in {"OVER", "UNDER"}
@@ -55064,7 +55460,9 @@ def _canonical_k_decision(projection, line, board_row=None, row=None):
     )
     strong_conflict = bool((legacy_opposite or brain_opposite) and (slip_score is None or slip_score >= 70))
 
-    if projection_side == "PUSH":
+    if quality_gate_status == "PASS_DATA_QUALITY":
+        decision = f"🚫 PASS — {side} DATA QUALITY"
+    elif projection_side == "PUSH":
         decision = "🚫 PASS — PUSH"
     elif guard_status.startswith("PASS") or exact_line_pass:
         decision = f"🚫 PASS — {side} MODEL/LINE GUARD"
@@ -55158,6 +55556,10 @@ def _canonicalize_k_table(df, board=None, relock=False):
             "Final Resolved Side": side,
             "Resolver Decision": board_row.get("resolver_decision"),
             "Why Final Side": board_row.get("hybrid_line_guard_reason"),
+            "Data Quality Gate": board_row.get("data_quality_gate_status"),
+            "Data Quality Score": board_row.get("data_quality_gate_score"),
+            "Resolved Hitter Profiles": board_row.get("resolved_hitter_count"),
+            "Lineup Freshness": board_row.get("lineup_freshness_status"),
             "Reference Rescue Status": board_row.get("reference_rescue_v252_status"),
             "Reference Rescue Support": board_row.get("reference_rescue_v252_support_count"),
             "Internal Consistency": board_row.get("internal_consistency_v252_status"),
@@ -55252,6 +55654,8 @@ def _canonical_k_board_signature(board):
             _canonical_k_num(p.get("line"), _canonical_k_num(p.get("underdog_line"), None)),
             _canonical_k_num(p.get("expected_bf"), None),
             str(p.get("lineup_status") or ""),
+            str(p.get("data_quality_gate_status") or ""),
+            _canonical_k_num(p.get("data_quality_gate_score"), None),
         ))
     return tuple(rows)
 
@@ -55924,6 +56328,21 @@ with tab5:
             st.dataframe(build_projection_health_audit(board), use_container_width=True, hide_index=True)
         except Exception as _health_e:
             st.warning(f"Projection health audit failed: {_health_e}")
+
+    with st.expander("Merge V2.5.4 Module Grading + Net Gain", expanded=False):
+        _module_grade = build_module_grading_v254(load_json(RESULT_LOG, []))
+        _net = _module_grade.get("net_gain") or {}
+        mg1, mg2, mg3, mg4 = st.columns(4)
+        mg1.metric("PO Losses Rescued", _net.get("rescued_po_losses", 0))
+        mg2.metric("PO Wins Surrendered", _net.get("surrendered_po_wins", 0))
+        mg3.metric("Net Win Gain", _net.get("net", 0))
+        mg4.metric("Comparable Flips", _net.get("flip_attempts", 0))
+        st.dataframe(_module_grade.get("metrics"), use_container_width=True, hide_index=True)
+        st.dataframe(_module_grade.get("modules"), use_container_width=True, hide_index=True)
+        st.caption(
+            "Model rows use completed graded observations. Module activation counts are diagnostics, not causal A/B claims. "
+            "Causal ON/OFF decisions still require frozen-slate replay."
+        )
 
     st.markdown('<div class="section-title-pro">Manual Actual Results Import — Secure Fallback</div>', unsafe_allow_html=True)
     st.caption("Use this if automatic MLB grading returns 0 or if you want to verify outcomes manually. Save the official snapshot before games, then after games paste/upload actual results and grade.")
