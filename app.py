@@ -25,7 +25,7 @@ from math import exp, factorial
 from datetime import datetime, timedelta
 from pathlib import Path
 
-APP_VERSION = "ONE WAY PICKZ MASTER PO MERGE V2.6.1 DISCORD-SAFE PROTECTED EXPORT 2026-08-10"
+APP_VERSION = "ONE WAY PICKZ MASTER PO MERGE V2.6.2 HRR LINEUP RUNTIME FIX 2026-08-10"
 FULL_APP_UPDATE_MARKER = "FULL_APP_CANONICAL_K_PIPELINE_2026_07_30"
 # =========================
 # STABLE PROJECTION SEEDING
@@ -5016,20 +5016,34 @@ def _v255_score_candidate(candidate, total_projected_weight=1.0, underdog_exact_
         0.18 + 0.18 * recent_l3 + 0.34 * recent_l5 + 0.20 * recent_l10,
         0.18, 0.90,
     ))
-    underdog_probability = (0.80 if underdog_exact_nine else 0.74) if underdog else 0.35
+    # An exact active H+R+R team pool is strong, fresh participation evidence,
+    # but it is still not an official lineup. A player missing from that exact
+    # pool keeps non-zero probability so projected/recent evidence can prevail.
+    underdog_probability = (
+        (0.94 if underdog_exact_nine else 0.76)
+        if underdog else
+        (0.22 if underdog_exact_nine else 0.35)
+    )
     platoon_probability = float(clamp(0.35 + 0.55 * platoon, 0.35, 0.90))
     roster_probability = 1.0 if active is True else (0.55 if active is None else 0.0)
     probability = (
-        0.35 * projected_probability
-        + 0.30 * recent_probability
-        + 0.22 * underdog_probability
-        + 0.08 * platoon_probability
+        0.30 * projected_probability
+        + 0.28 * recent_probability
+        + 0.27 * underdog_probability
+        + 0.10 * platoon_probability
         + 0.05 * roster_probability
     )
     if active is False:
         probability -= 0.25
-    if projected_count and not underdog and recent_l5 < 0.35:
-        probability -= 0.04
+    if underdog_exact_nine and underdog and (recent_l5 >= 0.50 or platoon >= 0.55):
+        probability += 0.06
+    if projected_count and not underdog:
+        if underdog_exact_nine:
+            probability -= 0.06
+        if recent_l5 < 0.50 or platoon < 0.50:
+            probability -= 0.07
+        elif recent_l5 < 0.70 or platoon < 0.60:
+            probability -= 0.03
     probability = float(clamp(probability, 0.08, 0.995))
 
     participation_signals = {
@@ -5039,7 +5053,11 @@ def _v255_score_candidate(candidate, total_projected_weight=1.0, underdog_exact_
         "platoon": platoon >= 0.55,
     }
     support_count = sum(bool(v) for v in participation_signals.values())
-    conflict_count = int(active is False) + int(projected_count > 0 and not underdog and recent_l5 < 0.35)
+    conflict_count = (
+        int(active is False)
+        + int(projected_count > 0 and not underdog and recent_l5 < 0.50)
+        + int(underdog_exact_nine and projected_count > 0 and not underdog)
+    )
     freshness = safe_float(c.get("source_freshness_score"), 0.75) or 0.75
     candidate_score = (
         probability * 100.0
@@ -5439,6 +5457,9 @@ def _expected_lineup_consensus(game_pk, opp_side, pitcher_hand=None):
         k_vals = [v for v in k_vals if v is not None and 0.03 <= v <= 0.65]
         k_rate = float(np.mean(k_vals)) if k_vals else safe_float(rich.get("Raw_K_Rate"), None)
         order_conf = _slot_distribution_confidence(slot_probs)
+        expected_sources = sorted(rec["sources"])
+        if candidate.get("underdog_present"):
+            expected_sources.append("UNDERDOG_HRR")
         rich.update({
             "Order": int(assigned_slot),
             "Projected Order": round(float(avg_order), 2),
@@ -5446,8 +5467,8 @@ def _expected_lineup_consensus(game_pk, opp_side, pitcher_hand=None):
             "Raw_K_Rate": k_rate,
             "Used K%": None if k_rate is None else round(k_rate * 100, 1),
             "Expected Starter Confidence": round(starter_prob * 100.0, 1),
-            "Expected Lineup Sources": "+".join(sorted(rec["sources"])),
-            "Expected Lineup Source Count": len(rec["sources"]),
+            "Expected Lineup Sources": "+".join(expected_sources),
+            "Expected Lineup Source Count": len(expected_sources),
             "Lineup Source": "UNDERDOG_SUPPORTED_EXPECTED" if underdog_team_rows else "CONSENSUS_EXPECTED",
             "Slot Probabilities": [round(float(x), 6) for x in slot_probs],
             "Expected Order Confidence": round(order_conf, 1),
@@ -5512,7 +5533,7 @@ def _expected_lineup_consensus(game_pk, opp_side, pitcher_hand=None):
         base_row.update({
             "Batter": candidate.get("player_name"),
             "Player ID": candidate.get("player_id"),
-            "Lineup Source": "UNDERDOG_PARTICIPATION_NAMES_ONLY",
+            "Lineup Source": "UNDERDOG_HRR_PARTICIPATION_NAMES_ONLY",
         })
         underdog_k_rows.append(_v255_enrich_selected_row(base_row, team_abbr, pitcher_hand))
     underdog_k_values = [safe_float(r.get("Raw_K_Rate"), None) for r in underdog_k_rows]
@@ -5520,6 +5541,12 @@ def _expected_lineup_consensus(game_pk, opp_side, pitcher_hand=None):
     underdog_supported_k = float(np.mean(underdog_k_values)) if len(underdog_k_values) >= 5 else None
 
     final_ids = {safe_int(r.get("Player ID"), None) for r in output if safe_int(r.get("Player ID"), None)}
+    original_ids = {
+        safe_int(rec.get("Player ID"), None)
+        for _, _, _, rec, _, _ in original_selected
+        if safe_int(rec.get("Player ID"), None)
+    }
+    original_overlap_ids = original_ids.intersection(underdog_ids)
     overlap_ids = final_ids.intersection(underdog_ids)
     model_only = [r.get("Batter") for r in output if safe_int(r.get("Player ID"), None) not in underdog_ids]
     underdog_only = [x.get("underdog_name") for x in underdog_identity if x.get("mlb_id") not in final_ids]
@@ -5578,6 +5605,7 @@ def _expected_lineup_consensus(game_pk, opp_side, pitcher_hand=None):
         "candidates": trace_candidates,
         "original_expected_nine": [rec.get("Batter") for _, _, _, rec, _, _ in original_selected],
         "final_expected_nine": [r.get("Batter") for r in output],
+        "original_model_underdog_overlap": len(original_overlap_ids),
         "model_underdog_overlap": len(overlap_ids),
         "model_underdog_overlap_pct": round(len(overlap_ids) / max(1, min(9, underdog_unique_count)) * 100.0, 1) if underdog_unique_count else None,
         "model_underdog_overlap_state": overlap_state,
@@ -5780,20 +5808,31 @@ def calculate_lineup_k_rate(game_pk, opp_side, pitcher_hand=None):
         return float(lineup_k), rows[:9], f"MLB confirmed lineup; exact slot exposure; splits for {split_count}/{len(rows[:9])} hitters", True
 
     # Before the official lineup, use the probability-based consensus first.
+    resolver_errors = []
     try:
         ck, cr, cm, _ = _expected_lineup_consensus(game_pk, opp_side, pitcher_hand)
         if ck is not None and len(cr) >= 5:
             return ck, cr[:9], cm, False
-    except Exception:
-        pass
+    except Exception as exc:
+        resolver_errors.append(f"CONSENSUS: {type(exc).__name__}: {exc}"[:240])
+        LINEUP_RUNTIME_TRACE_V255[lineup_cache_key(game_pk, opp_side, pitcher_hand)] = {
+            "version": MERGE_V255_VERSION,
+            "team": team_abbr,
+            "pitcher_hand": pitcher_hand,
+            "lineup_source": "EXPECTED_RESOLVER_ERROR",
+            "lineup_last_rebuild": now_iso(),
+            "lineup_rebuild_reason": "CONSENSUS_RESOLVER_EXCEPTION",
+            "resolver_error": resolver_errors[-1],
+            "sportsbook_opinion_used": False,
+        }
 
     # Exact current source is now a fallback, not a blind overwrite of consensus.
     try:
         ek, er, em = _exact_expected_lineup_source(game_pk, opp_side, pitcher_hand)
         if ek is not None and len(er) >= 8:
             return ek, er[:9], em, False
-    except Exception:
-        pass
+    except Exception as exc:
+        resolver_errors.append(f"FALLBACK: {type(exc).__name__}: {exc}"[:240])
 
     cached_rows = get_cached_lineup_rows(game_pk, opp_side, pitcher_hand)
     valid_cached = [r.get("Raw_K_Rate") for r in cached_rows[:9] if r.get("Raw_K_Rate") is not None]
@@ -5801,7 +5840,8 @@ def calculate_lineup_k_rate(game_pk, opp_side, pitcher_hand=None):
         cached_k = _weighted_lineup_k_from_rows(cached_rows[:9], expected_bf=DEFAULT_BF)
         return float(cached_k), cached_rows[:9], "Using cached locked official lineup", True
 
-    return None, rows, "No usable confirmed or expected lineup", False
+    error_note = f"; resolver errors: {' | '.join(resolver_errors)}" if resolver_errors else ""
+    return None, rows, f"No usable confirmed or expected lineup{error_note}", False
 
 def team_k_vs_hand(team_id, hand):
     data = safe_get_json(f"{MLB_BASE}/teams/{team_id}/stats", params={"stats": "season", "group": "hitting"})
@@ -14413,10 +14453,8 @@ def build_movement_attribution_v252(
 
 
 def extract_underdog_mlb_hitter_pool_v252(payload):
-    """Extract participation names/team only; prop values and directions are ignored."""
+    """Extract MLB participation only from active Hits + Runs + RBIs markets."""
     payload = payload if isinstance(payload, dict) else {}
-    # Current Underdog schema uses opaque team_id values on player objects. Resolve
-    # those IDs only from MLB game titles; never inspect prop values or directions.
     team_by_id = {}
     for game in payload.get("games") or []:
         if not isinstance(game, dict) or str(game.get("sport_id") or "").upper() != "MLB":
@@ -14429,90 +14467,68 @@ def extract_underdog_mlb_hitter_pool_v252(payload):
             if game.get("home_team_id"):
                 team_by_id[str(game.get("home_team_id"))] = parts[1]
 
-    current_rows = []
-    for player in payload.get("players") or []:
+    appearances_by_id = {
+        str(item.get("id")): item for item in (payload.get("appearances") or [])
+        if isinstance(item, dict) and item.get("id") is not None
+    }
+    players_by_id = {
+        str(item.get("id")): item for item in (payload.get("players") or [])
+        if isinstance(item, dict) and item.get("id") is not None
+    }
+
+    def is_hrr_stat(value):
+        normalized = re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+        return normalized in {"hitsrunsrbis", "hitsrunsrbi", "hrr"}
+
+    def append_hrr_player(rows, player, team_id=None):
         if not isinstance(player, dict) or str(player.get("sport_id") or "").upper() != "MLB":
-            continue
+            return
         position = str(player.get("position_name") or player.get("position") or "").upper().strip()
         if position in {"P", "SP", "RP", "LHP", "RHP"}:
-            continue
-        first = str(player.get("first_name") or "").strip()
-        last = str(player.get("last_name") or "").strip()
-        name = f"{first} {last}".strip()
-        team = team_by_id.get(str(player.get("team_id") or ""), "")
+            return
+        name = f"{str(player.get('first_name') or '').strip()} {str(player.get('last_name') or '').strip()}".strip()
+        if not name:
+            name = str(player.get("full_name") or player.get("display_name") or player.get("name") or "").strip()
+        resolved_team_id = str(team_id or player.get("team_id") or "")
+        team = str(team_by_id.get(resolved_team_id) or player.get("team_abbr") or "").strip()
         if name and team:
-            current_rows.append({
+            rows.append({
                 "player": name,
                 "team": team,
                 "position": position or None,
-                "evidence": "UNDERDOG_ACTIVE_MLB_PARTICIPATION",
+                "evidence": "UNDERDOG_ACTIVE_HRR_PARTICIPATION",
+                "market": "HITS_RUNS_RBIS",
             })
 
-    objects = []
+    # Current v6 schema: active line -> appearance_stat -> appearance -> player.
+    # This path deliberately ignores line, direction, multiplier, and option data.
+    structured_schema = bool(payload.get("over_under_lines") is not None and appearances_by_id and players_by_id)
+    rows = []
+    if structured_schema:
+        for line in payload.get("over_under_lines") or []:
+            if not isinstance(line, dict) or str(line.get("status") or "active").lower() != "active":
+                continue
+            over_under = line.get("over_under") if isinstance(line.get("over_under"), dict) else {}
+            appearance_stat = over_under.get("appearance_stat") if isinstance(over_under.get("appearance_stat"), dict) else {}
+            if not (is_hrr_stat(appearance_stat.get("display_stat")) or is_hrr_stat(appearance_stat.get("stat"))):
+                continue
+            appearance = appearances_by_id.get(str(appearance_stat.get("appearance_id") or ""))
+            if not isinstance(appearance, dict):
+                continue
+            player = players_by_id.get(str(appearance.get("player_id") or ""))
+            append_hrr_player(rows, player, team_id=appearance.get("team_id"))
+    else:
+        # Compatibility for legacy/test payloads is still strict: an object must
+        # explicitly identify the HRR market and contain a resolvable MLB hitter.
+        for obj in payload.get("hrr_players") or payload.get("rows") or []:
+            if not isinstance(obj, dict):
+                continue
+            stat = obj.get("display_stat") or obj.get("stat") or obj.get("market")
+            if not is_hrr_stat(stat):
+                continue
+            player = obj.get("player") if isinstance(obj.get("player"), dict) else obj
+            append_hrr_player(rows, player, team_id=obj.get("team_id"))
 
-    def walk(value, parent_key=""):
-        if isinstance(value, dict):
-            item = dict(value)
-            item["_parent_key"] = parent_key
-            objects.append(item)
-            for key, nested in value.items():
-                if isinstance(nested, (dict, list)):
-                    walk(nested, key)
-        elif isinstance(value, list):
-            for nested in value:
-                walk(nested, parent_key)
-
-    walk(payload)
-    rows = list(current_rows)
-    for obj in objects:
-        attrs = obj.get("attributes") if isinstance(obj.get("attributes"), dict) else {}
-        merged = dict(obj)
-        merged.update(attrs)
-        object_type = str(obj.get("type") or obj.get("_parent_key") or "").lower()
-        text = " ".join(str(merged.get(key) or "") for key in (
-            "sport", "sport_name", "league", "league_name", "title", "description",
-            "market", "stat", "stat_type", "position", "sport_id", "position_name",
-        ))
-        text_upper = text.upper()
-        if any(token in text_upper for token in ("NBA", "NFL", "NHL", "WNBA", "SOCCER", "GOLF", "TENNIS")):
-            continue
-        mlb_context = "MLB" in text_upper or "BASEBALL" in text_upper
-        batter_market = any(token in text_upper for token in (
-            "BATTER", "HITS", "TOTAL BASES", "RUNS", "RBIS", "HOME RUN", "WALKS",
-        ))
-        player_object = any(token in object_type for token in ("PLAYER", "ATHLETE", "APPEARANCE"))
-        if not (mlb_context or batter_market or player_object):
-            continue
-        position = str(merged.get("position") or merged.get("position_name") or merged.get("pos") or "").upper().strip()
-        if position in {"P", "SP", "RP", "LHP", "RHP"}:
-            continue
-        name = ""
-        first = str(merged.get("first_name") or "").strip()
-        last = str(merged.get("last_name") or "").strip()
-        if first and last:
-            name = f"{first} {last}"
-        if not name:
-            for key in ("full_name", "display_name", "player_name", "name"):
-                candidate = merged.get(key)
-                if isinstance(candidate, str) and 2 <= len(candidate.split()) <= 6:
-                    name = candidate.strip()
-                    break
-        if not name or any(token in name.upper() for token in (" OVER ", " UNDER ", " O/U", " HIGHER", " LOWER")):
-            continue
-        team_value = merged.get("team_abbr") or merged.get("team_abbreviation") or merged.get("team") or merged.get("team_name")
-        if isinstance(team_value, dict):
-            team_value = team_value.get("abbr") or team_value.get("abbreviation") or team_value.get("name")
-        if not team_value and merged.get("team_id"):
-            team_value = team_by_id.get(str(merged.get("team_id")))
-        team = str(team_value or "").strip()
-        if not team:
-            continue
-        rows.append({
-            "player": name,
-            "team": team,
-            "position": position or None,
-            "evidence": "UNDERDOG_ACTIVE_MLB_PARTICIPATION",
-        })
     dedup = {}
     for item in rows:
         key = (normalize_name(item.get("player")), normalize_name(item.get("team")))
@@ -14524,7 +14540,7 @@ def extract_underdog_mlb_hitter_pool_v252(payload):
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_underdog_mlb_hitter_pool_v252():
     if not MERGE_V252_ENABLE_UNDERDOG_LINEUP_DIAGNOSTICS:
-        return {"status": "DIAGNOSTICS_OFF", "rows": [], "pull_time": now_iso(), "source": "UNDERDOG_NAMES_ONLY"}
+        return {"status": "DIAGNOSTICS_OFF", "rows": [], "pull_time": now_iso(), "source": "UNDERDOG_HRR_NAMES_ONLY"}
     errors = []
     for url in UNDERDOG_URLS:
         try:
@@ -14537,8 +14553,12 @@ def fetch_underdog_mlb_hitter_pool_v252():
                     "status": "FOUND",
                     "rows": rows,
                     "pull_time": now_iso(),
-                    "source": "UNDERDOG_NAMES_ONLY",
+                    "source": "UNDERDOG_HRR_NAMES_ONLY",
                     "url_version": url.rsplit("/", 1)[-1],
+                    "games_found": sum(
+                        1 for game in (payload.get("games") or [])
+                        if isinstance(game, dict) and str(game.get("sport_id") or "").upper() == "MLB"
+                    ),
                 }
         except Exception as exc:
             errors.append(str(exc)[:100])
@@ -14546,7 +14566,7 @@ def fetch_underdog_mlb_hitter_pool_v252():
         "status": "NO_DATA",
         "rows": [],
         "pull_time": now_iso(),
-        "source": "UNDERDOG_NAMES_ONLY",
+        "source": "UNDERDOG_HRR_NAMES_ONLY",
         "error": "; ".join(errors[:3]),
     }
 
@@ -51373,6 +51393,8 @@ def _kclean_copy_paste_slate(df, include_thin=False):
                 side = "OVER" if edge > 0 else "UNDER" if edge < 0 else "PUSH"
                 action = _kclean_display_decision(row)
                 action_kind = str(action).split(" ", 1)[0].upper()
+                if action_kind == "PASS":
+                    continue
                 if not include_thin and action_kind not in {"FIRE", "LEAN"}:
                     continue
                 prefix = "O" if side == "OVER" else "U" if side == "UNDER" else "PUSH"
@@ -52077,6 +52099,15 @@ def _kclean_render_player_cards(df, board=None, limit=None):
             d["UD/Line"] = d.get("Line")
         if "_owp_one_final_row_per_pitcher" in globals():
             d = _owp_one_final_row_per_pitcher(d)
+        d = d[
+            ~d.apply(
+                lambda rr: str(_kclean_display_decision(rr.to_dict())).upper().startswith("PASS"),
+                axis=1,
+            )
+        ].copy()
+        if d.empty:
+            st.info("No actionable K cards. PASS evaluations remain in the full audit table.")
+            return
         d["_edge_abs"] = [abs(_kclean_final_edge(r.to_dict(), 0.0) or 0.0) for _, r in d.iterrows()]
         d = d.sort_values("_edge_abs", ascending=False)
         if limit is not None:
@@ -52148,6 +52179,22 @@ def _kclean_render_player_cards(df, board=None, limit=None):
             recent_skill = html.escape(str(_kclean_pick(row, ["APP100 Recent Skill"], ""))[:24])
             pitch_mix_quality = html.escape(str(_kclean_pick(row, ["APP100 Pitch Mix Coverage"], ""))[:24])
             lineup_status = html.escape(str(_kclean_pick(row, ["APP97 Lineup Status", "Lineup", "Projection Source"], (p or {}).get("lineup_status", "")))[:34])
+            lineup_trace = (p or {}).get("lineup_runtime_trace_v255") or {}
+            lineup_trace_source = str(
+                lineup_trace.get("lineup_source")
+                or (p or {}).get("lineup_resolver_source")
+                or lineup_status
+                or "LINEUP_UNKNOWN"
+            )
+            ud_count = safe_int(lineup_trace.get("underdog_player_count"), 0) or 0
+            ud_overlap = safe_int(lineup_trace.get("model_underdog_overlap"), 0) or 0
+            if lineup_trace_source == "CONFIRMED_LINEUP":
+                lineup_display = "CONFIRMED_LINEUP · official 9/9"
+            elif ud_count:
+                lineup_display = f"{lineup_trace_source} · UD {ud_overlap}/{ud_count}"
+            else:
+                lineup_display = lineup_trace_source
+            lineup_display = html.escape(lineup_display[:72])
             quality_gate = html.escape(str((p or {}).get("data_quality_gate_status") or _kclean_pick(row, ["Data Quality Gate"], "NOT_CHECKED"))[:24])
             quality_gate_score = html.escape(str((p or {}).get("data_quality_gate_score") if (p or {}).get("data_quality_gate_score") is not None else _kclean_pick(row, ["Data Quality Score"], "—")))
             resolved_hitters = html.escape(str((p or {}).get("resolved_hitter_count") if (p or {}).get("resolved_hitter_count") is not None else _kclean_pick(row, ["Resolved Hitter Profiles"], "—")))
@@ -52245,7 +52292,7 @@ def _kclean_render_player_cards(df, board=None, limit=None):
               </div>
               {last10_html}
               <div class="kc-section">
-                <div class="kc-section-title"><span>Batter-by-batter K matchup</span><span class="kc-chip">{html.escape(lineup_status or 'lineup')} · exposure K {avg_lineup_k} · BF {_kclean_fmt(_card_expected_bf, 1)} · order {order_conf_card}% · high-K {high_bats} · low-K {low_bats}</span></div>
+                <div class="kc-section-title"><span>Batter-by-batter K matchup</span><span class="kc-chip">{lineup_display} · exposure K {avg_lineup_k} · BF {_kclean_fmt(_card_expected_bf, 1)} · order {order_conf_card}% · high-K {high_bats} · low-K {low_bats}</span></div>
                 {lineup_table}
               </div>
             </div>
@@ -52273,16 +52320,19 @@ def _impl_render_kproj_tab_08(board):
     if main.empty:
         st.info("No clean K rows available.")
         return
+    actionable = main[
+        ~main["Pick"].astype(str).str.upper().str.startswith("PASS")
+    ].copy()
 
     slate_text = _kclean_copy_paste_slate(df, include_thin=False)
     all_slate_text = _kclean_copy_paste_slate(df, include_thin=True)
-    st.subheader("Copy/Paste Slate")
+    st.subheader("Actionable Copy/Paste Slate")
     if all_slate_text:
-        st.text_area("All projections slate", all_slate_text, height=360, key="kclean_copy_paste_all_main")
+        st.text_area("Actionable projections", all_slate_text, height=360, key="kclean_copy_paste_all_main")
         st.download_button(
-            "Download all projections .txt",
+            "Download actionable projections .txt",
             all_slate_text,
-            file_name="k_all_projections_slate.txt",
+            file_name="k_actionable_projections_slate.txt",
             mime="text/plain",
             use_container_width=True,
             key="download_kclean_all_slate",
@@ -52298,24 +52348,23 @@ def _impl_render_kproj_tab_08(board):
         _kclean_render_app88_audit_helpers(df, board)
 
     try:
-        total = len(main)
-        fire = int(main["Pick"].astype(str).str.startswith("FIRE").sum())
-        lean = int(main["Pick"].astype(str).str.startswith("LEAN").sum())
-        track = int(main["Pick"].astype(str).str.startswith("TRACK").sum())
-        pass_ct = int(main["Pick"].astype(str).str.startswith("PASS").sum())
+        total = len(actionable)
+        fire = int(actionable["Pick"].astype(str).str.startswith("FIRE").sum())
+        lean = int(actionable["Pick"].astype(str).str.startswith("LEAN").sum())
+        track = int(actionable["Pick"].astype(str).str.startswith("TRACK").sum())
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Pitchers", total)
+        m1.metric("Actionable", total)
         m2.metric("Fire", fire)
         m3.metric("Lean", lean)
-        m4.metric("Track/Pass", track + pass_ct)
+        m4.metric("Track", track)
     except Exception:
         pass
 
-    st.dataframe(main, use_container_width=True, hide_index=True)
+    st.dataframe(actionable, use_container_width=True, hide_index=True)
     st.download_button(
         "Download Discord-safe protected K board CSV",
-        main.to_csv(index=False),
-        file_name="merge_v2_discord_safe_protected_k_board.csv",
+        actionable.to_csv(index=False),
+        file_name="merge_v2_discord_safe_actionable_k_board.csv",
         mime="text/csv",
         use_container_width=True,
         key="download_kclean_discord_safe_csv",
