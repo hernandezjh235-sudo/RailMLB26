@@ -25,7 +25,7 @@ from math import exp, factorial
 from datetime import datetime, timedelta
 from pathlib import Path
 
-APP_VERSION = "ONE WAY PICKZ MASTER PO MERGE V2.6.3 FULL UI RESTORE + HRR LINEUP FIX 2026-08-10"
+APP_VERSION = "ONE WAY PICKZ MASTER PO MERGE V2.6.4 DIRECTIONAL CARDS + HRR IDENTITY FIX 2026-08-10"
 FULL_APP_UPDATE_MARKER = "FULL_APP_CANONICAL_K_PIPELINE_2026_07_30"
 # =========================
 # STABLE PROJECTION SEEDING
@@ -397,7 +397,7 @@ MERGE_V255_CANDIDATE_LIMIT = 15
 MERGE_V255_MIN_SWAP_SCORE_MARGIN = 5.0
 MERGE_V255_MIN_SWAP_SUPPORT_SIGNALS = 2
 MERGE_V255_RECENT_LOOKBACK_GAMES = 10
-MERGE_V255_VERSION = "UNDERDOG_PRESELECTION_CONSENSUS_V255"
+MERGE_V255_VERSION = "UNDERDOG_PRESELECTION_CONSENSUS_V264_IDENTITY_FALLBACK"
 
 # V2.6 Phase 1-3 switches. Diagnostics can ship before a projection effect is
 # proven; mathematical effects stay OFF until multi-slate frozen replay passes.
@@ -5077,6 +5077,26 @@ def _v255_score_candidate(candidate, total_projected_weight=1.0, underdog_exact_
     return c
 
 
+def _v255_candidate_key_for_underdog(agg, player_name, player_id=None):
+    """Attach Underdog participation to an existing candidate when identity agrees."""
+    normalized = normalize_name(player_name)
+    id_key = f"id:{player_id}" if player_id else None
+    if id_key and id_key in agg:
+        return id_key
+    if normalized:
+        for existing_key, rec in (agg or {}).items():
+            if normalize_name((rec or {}).get("Batter")) == normalized:
+                return existing_key
+    return id_key or f"name:{normalized}"
+
+
+def _v255_pool_supports_row(row, pool_ids, pool_names):
+    """MLB ID is preferred; normalized name is the safe unresolved-ID fallback."""
+    player_id = safe_int((row or {}).get("Player ID"), None)
+    player_name = normalize_name((row or {}).get("Batter") or (row or {}).get("Name"))
+    return bool((player_id and player_id in (pool_ids or set())) or (player_name and player_name in (pool_names or set())))
+
+
 def _v255_select_expected_nine(candidates, original_keys, min_margin=None):
     """Select nine with controlled multi-signal swaps against the old consensus."""
     min_margin = float(MERGE_V255_MIN_SWAP_SCORE_MARGIN if min_margin is None else min_margin)
@@ -5360,16 +5380,21 @@ def _expected_lineup_consensus(game_pk, opp_side, pitcher_hand=None):
         if aliases.intersection(_team_alias_set(item.get("team")))
     ]
     underdog_ids = set()
+    underdog_names = set()
     underdog_identity = []
     for item in underdog_team_rows[:MERGE_V255_CANDIDATE_LIMIT]:
         underdog_name = str(item.get("player") or "").strip()
         normalized = normalize_name(underdog_name)
         player_id = roster_name_to_id.get(normalized) or _mlb_resolve_lineup_player_id(underdog_name, team_abbr)
-        key = f"id:{player_id}" if player_id else f"name:{normalized}"
         if not normalized:
             continue
+        key = _v255_candidate_key_for_underdog(agg, underdog_name, player_id=player_id)
+        existing = agg.get(key) or {}
+        if not player_id:
+            player_id = safe_int(existing.get("Player ID"), None)
         if player_id:
             underdog_ids.add(player_id)
+        underdog_names.add(normalized)
         rec = agg.setdefault(key, {
             "Batter": roster_by_id.get(player_id) or underdog_name, "Player ID": player_id,
             "sources": set(), "source_weight": 0.0, "rows": [],
@@ -5389,7 +5414,7 @@ def _expected_lineup_consensus(game_pk, opp_side, pitcher_hand=None):
             "identity_match_quality": "EXACT_ACTIVE_ROSTER" if roster_name_to_id.get(normalized) else ("MLB_ID_RESOLVED" if player_id else "UNRESOLVED"),
         })
 
-    underdog_unique_count = len({normalize_name(x.get("player")) for x in underdog_team_rows if normalize_name(x.get("player"))})
+    underdog_unique_count = len(underdog_names)
     underdog_exact_nine = underdog_unique_count == 9
     underdog_age = _v255_iso_age_minutes(underdog_payload.get("pull_time"))
     underdog_freshness = 1.0 if underdog_age is None else float(clamp(1.0 - underdog_age / 360.0, 0.35, 1.0))
@@ -5540,16 +5565,25 @@ def _expected_lineup_consensus(game_pk, opp_side, pitcher_hand=None):
     underdog_k_values = [v for v in underdog_k_values if v is not None]
     underdog_supported_k = float(np.mean(underdog_k_values)) if len(underdog_k_values) >= 5 else None
 
-    final_ids = {safe_int(r.get("Player ID"), None) for r in output if safe_int(r.get("Player ID"), None)}
-    original_ids = {
-        safe_int(rec.get("Player ID"), None)
+    final_supported = [r for r in output if _v255_pool_supports_row(r, underdog_ids, underdog_names)]
+    original_rows_for_overlap = [
+        {"Batter": rec.get("Batter"), "Player ID": rec.get("Player ID")}
         for _, _, _, rec, _, _ in original_selected
-        if safe_int(rec.get("Player ID"), None)
-    }
-    original_overlap_ids = original_ids.intersection(underdog_ids)
-    overlap_ids = final_ids.intersection(underdog_ids)
-    model_only = [r.get("Batter") for r in output if safe_int(r.get("Player ID"), None) not in underdog_ids]
-    underdog_only = [x.get("underdog_name") for x in underdog_identity if x.get("mlb_id") not in final_ids]
+    ]
+    original_supported = [
+        r for r in original_rows_for_overlap
+        if _v255_pool_supports_row(r, underdog_ids, underdog_names)
+    ]
+    final_ids = {safe_int(r.get("Player ID"), None) for r in output if safe_int(r.get("Player ID"), None)}
+    final_names = {normalize_name(r.get("Batter")) for r in output if normalize_name(r.get("Batter"))}
+    model_only = [r.get("Batter") for r in output if not _v255_pool_supports_row(r, underdog_ids, underdog_names)]
+    underdog_only = [
+        x.get("underdog_name") for x in underdog_identity
+        if not (
+            (x.get("mlb_id") and x.get("mlb_id") in final_ids)
+            or (x.get("normalized_name") and x.get("normalized_name") in final_names)
+        )
+    ]
     input_fingerprint = {
         "underdog": sorted((x.get("mlb_id"), x.get("normalized_name")) for x in underdog_identity),
         "roster": sorted(roster_by_id),
@@ -5575,7 +5609,7 @@ def _expected_lineup_consensus(game_pk, opp_side, pitcher_hand=None):
     trace_candidates = []
     for c in ranked_candidates[:MERGE_V255_CANDIDATE_LIMIT]:
         trace_candidates.append({k: v for k, v in c.items() if k != "aggregate"})
-    overlap_count = len(overlap_ids)
+    overlap_count = len(final_supported)
     if not underdog_unique_count:
         overlap_state = "NO_UNDERDOG_DATA"
     elif overlap_count == 9 and underdog_exact_nine:
@@ -5605,9 +5639,9 @@ def _expected_lineup_consensus(game_pk, opp_side, pitcher_hand=None):
         "candidates": trace_candidates,
         "original_expected_nine": [rec.get("Batter") for _, _, _, rec, _, _ in original_selected],
         "final_expected_nine": [r.get("Batter") for r in output],
-        "original_model_underdog_overlap": len(original_overlap_ids),
-        "model_underdog_overlap": len(overlap_ids),
-        "model_underdog_overlap_pct": round(len(overlap_ids) / max(1, min(9, underdog_unique_count)) * 100.0, 1) if underdog_unique_count else None,
+        "original_model_underdog_overlap": len(original_supported),
+        "model_underdog_overlap": overlap_count,
+        "model_underdog_overlap_pct": round(overlap_count / max(1, min(9, underdog_unique_count)) * 100.0, 1) if underdog_unique_count else None,
         "model_underdog_overlap_state": overlap_state,
         "model_only_players": model_only,
         "underdog_only_players": underdog_only,
@@ -5642,7 +5676,7 @@ def _expected_lineup_consensus(game_pk, opp_side, pitcher_hand=None):
     multi = sum(1 for r in output if safe_int(r.get("Expected Lineup Source Count"), 0) >= 2)
     msg = (
         f"V2.5.5 expected lineup {len(output)}/9 from {len(ranked_candidates)} candidates; "
-        f"Underdog overlap={len(overlap_ids)}/{underdog_unique_count or 0}; swaps={len(swaps)}; multi-source={multi}; "
+        f"Underdog overlap={overlap_count}/{underdog_unique_count or 0}; swaps={len(swaps)}; multi-source={multi}; "
         f"starter confidence={starter_conf:.0f}%; order confidence={order_conf:.0f}%; "
         f"top-5 confidence={top5_conf:.0f}%; sources={'+'.join(source_set)}"
     )
@@ -51130,7 +51164,7 @@ def _k_stage_43_app100_build_k(df, board):
     return _app100_apply_quality_pack(df, board)
 
 
-K_CLEAN_SINGLE_BOARD_UI_VERSION = "K_CLEAN_SINGLE_BOARD_UI_2026_07_26"
+K_CLEAN_SINGLE_BOARD_UI_VERSION = "K_CLEAN_DIRECTIONAL_CARDS_V264_2026_08_10"
 
 
 def _kclean_pick(row, keys, default=""):
@@ -51200,7 +51234,10 @@ def _impl_kclean_side_label_01(row):
             return "OVER"
         if proj < line:
             return "UNDER"
-        return "PASS"
+        # Half-strikeout props require the next integer to clear. At an exact
+        # mean/line tie, the projection remains directionally UNDER instead of
+        # turning a player card into a PASS.
+        return "UNDER"
     side = str(_kclean_pick(row, ["Elite Ace Clear-Line Side", "Winning File K Side", "APP97 Final Side", "APP88 Final Side", "APP98 Loss Target Side"], "")).upper()
     if side in {"OVER", "UNDER"}:
         return side
@@ -51221,18 +51258,18 @@ def _kclean_display_decision(row):
     official_filter = str(_kclean_pick(row, ["Official Filter"], "") or "").upper()
 
     if "PASS" in canonical or official_filter in {"PASS", "TRAP_PASS"}:
-        return f"PASS {side}" if side in {"OVER", "UNDER"} else "PASS"
+        return f"TRACK {side}" if side in {"OVER", "UNDER"} else "TRACK"
     if "LEAN" in canonical or official_filter == "LEAN_ONLY":
-        return f"LEAN {side}" if side in {"OVER", "UNDER"} else "PASS"
+        return f"LEAN {side}" if side in {"OVER", "UNDER"} else "TRACK"
     if "OFFICIAL" in canonical or "BET OVER" in canonical or "BET UNDER" in canonical or "🔥" in canonical:
-        return f"FIRE {side}" if side in {"OVER", "UNDER"} else "PASS"
+        return f"FIRE {side}" if side in {"OVER", "UNDER"} else "TRACK"
 
     reason = str(row.get("APP98 Loss Target Reason") or "").lower()
     gate = str(row.get("APP99 Right Wins Gate") or "").upper()
     if not side or side == "PASS":
-        return "PASS"
+        return "TRACK"
     if "RED" in gate:
-        return f"PASS {side}"
+        return f"TRACK {side}"
     if "ORANGE" in gate:
         return f"TRACK {side}"
     if np.isfinite(edge):
@@ -51245,7 +51282,7 @@ def _kclean_display_decision(row):
             return f"LEAN {side}"
         if abs_edge >= 0.15:
             return f"TRACK {side}"
-    return f"PASS {side}"
+    return f"TRACK {side}"
 
 
 def _kclean_main_df(df):
@@ -51382,20 +51419,11 @@ def _kclean_copy_paste_slate(df, include_thin=False):
                 edge = _kclean_final_edge(row, np.nan)
                 if not np.isfinite(edge):
                     edge = proj - line
-                side = "OVER" if edge > 0 else "UNDER" if edge < 0 else "PUSH"
-                action = _kclean_display_decision(row)
-                action_kind = str(action).split(" ", 1)[0].upper()
-                if not include_thin and action_kind not in {"FIRE", "LEAN"}:
+                side = "OVER" if edge > 0 else "UNDER"
+                abs_edge = abs(float(edge))
+                if not include_thin and abs_edge < 0.55:
                     continue
-                prefix = "O" if side == "OVER" else "U" if side == "UNDER" else "PUSH"
-                if action_kind == "FIRE":
-                    symbol = f"🔥 {prefix}"
-                elif action_kind == "LEAN":
-                    symbol = f"⚠️ {prefix} LEAN"
-                elif action_kind == "TRACK":
-                    symbol = f"TRACK {prefix}"
-                else:
-                    symbol = f"PASS {prefix}"
+                symbol = f"🔥 {side}" if abs_edge >= 1.00 else (f"⚠️ {side}" if abs_edge >= 0.55 else side)
                 ip = _kclean_num(_kclean_pick(row, ["IP Floor", "IP PROJ", "Projected IP", "IP Projection"], ""), np.nan)
                 ip_text = "—" if not np.isfinite(ip) else f"{ip:.2f}"
                 block.append(f"• {row.get('Pitcher')} — {symbol} {line:.1f} — {proj:.2f} K — IP {ip_text}")
@@ -51415,20 +51443,14 @@ def _kclean_card_decision(row):
     # above the line, show OVER; if it is below, show UNDER. Older side fields
     # can lag behind late blend/elite-gate changes.
     if np.isfinite(proj) and np.isfinite(line):
-        side = "OVER" if proj > line else "UNDER" if proj < line else "PASS"
+        side = "OVER" if proj > line else "UNDER"
         edge = round(float(proj - line), 2)
     else:
         edge = _kclean_final_edge(row, np.nan)
     prob = _kclean_num(_kclean_pick(row, ["K Sim Current Side Prob %", "K Sim True Prob %", "Sim Side %"], ""), np.nan)
     if np.isfinite(prob) and prob <= 1:
         prob *= 100.0
-    action = _kclean_display_decision(row)
-    action_kind = str(action).split(" ", 1)[0].upper()
-    if action_kind in {"PASS", "TRACK", "LEAN"}:
-        side = f"{action_kind} · {side}" if side in {"OVER", "UNDER"} else action_kind
-        tier = action_kind
-    else:
-        tier = "FIRE"
+    tier = "HIGH" if np.isfinite(prob) and prob >= 72 else "GOOD" if np.isfinite(prob) and prob >= 64 else "LEAN" if np.isfinite(prob) and prob >= 56 else "TRACK"
     return side, edge, prob, tier
 
 
@@ -52176,7 +52198,24 @@ def _kclean_render_player_cards(df, board=None, limit=None):
             else:
                 lineup_display = lineup_trace_source
             lineup_display = html.escape(lineup_display[:72])
-            quality_gate = html.escape(str((p or {}).get("data_quality_gate_status") or _kclean_pick(row, ["Data Quality Gate"], "NOT_CHECKED"))[:24])
+            quality_gate_raw = str(
+                (p or {}).get("data_quality_gate_status")
+                or _kclean_pick(row, ["Data Quality Gate"], "NOT_CHECKED")
+            ).upper()
+            # This is a data-integrity status, not a betting decision. Keep the
+            # internal PASS_DATA_QUALITY value for audits, but use an unambiguous
+            # public label so the player card never appears to recommend PASS.
+            if quality_gate_raw == "PASS_DATA_QUALITY":
+                quality_gate_public = "DATA VERIFIED"
+            elif quality_gate_raw in {"READY", "GREEN", "VERIFIED"}:
+                quality_gate_public = "DATA READY"
+            elif quality_gate_raw in {"CAUTION", "LOW_DATA_REVIEW"}:
+                quality_gate_public = "DATA CAUTION"
+            elif quality_gate_raw in {"", "NOT_CHECKED", "NONE", "NAN"}:
+                quality_gate_public = "NOT CHECKED"
+            else:
+                quality_gate_public = "DATA REVIEW"
+            quality_gate = html.escape(quality_gate_public)
             quality_gate_score = html.escape(str((p or {}).get("data_quality_gate_score") if (p or {}).get("data_quality_gate_score") is not None else _kclean_pick(row, ["Data Quality Score"], "—")))
             resolved_hitters = html.escape(str((p or {}).get("resolved_hitter_count") if (p or {}).get("resolved_hitter_count") is not None else _kclean_pick(row, ["Resolved Hitter Profiles"], "—")))
             lineup_rows, lineup_src = _kcard_lineup_rows(row, p)
@@ -52267,7 +52306,7 @@ def _kclean_render_player_cards(df, board=None, limit=None):
                 <div class="kc-stat"><span>Model Spread</span><b>{hybrid_spread}</b></div>
                 <div class="kc-stat"><span>Hybrid Status</span><b>{hybrid_status}</b></div>
                 <div class="kc-stat"><span>Line Guard</span><b>{hybrid_line_status or '—'}</b></div>
-                <div class="kc-stat"><span>Data Gate</span><b>{quality_gate}</b></div>
+                <div class="kc-stat"><span>Data Quality</span><b>{quality_gate}</b></div>
                 <div class="kc-stat"><span>Gate Score</span><b>{quality_gate_score}</b></div>
                 <div class="kc-stat"><span>Hitter K Profiles</span><b>{resolved_hitters}</b></div>
               </div>
@@ -57405,7 +57444,7 @@ def _impl_kclean_final_edge_02(row, default=np.nan):
 def _impl_kclean_side_label_02(row):
     proj, line = _kclean_final_proj_line(row)
     if np.isfinite(proj) and np.isfinite(line):
-        return "OVER" if proj > line else "UNDER" if proj < line else "PASS"
+        return "OVER" if proj > line else "UNDER"
     side = str(_kclean_pick(row, ["Canonical Side", "Model Lean"], "")).upper()
     return side if side in {"OVER", "UNDER"} else ""
 
