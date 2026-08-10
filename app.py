@@ -25,7 +25,7 @@ from math import exp, factorial
 from datetime import datetime, timedelta
 from pathlib import Path
 
-APP_VERSION = "ONE WAY PICKZ MASTER PO MERGE V2.6.2 HRR LINEUP RUNTIME FIX 2026-08-10"
+APP_VERSION = "ONE WAY PICKZ MASTER PO MERGE V2.6.3 FULL UI RESTORE + HRR LINEUP FIX 2026-08-10"
 FULL_APP_UPDATE_MARKER = "FULL_APP_CANONICAL_K_PIPELINE_2026_07_30"
 # =========================
 # STABLE PROJECTION SEEDING
@@ -51220,9 +51220,6 @@ def _kclean_display_decision(row):
     ], "") or "").upper()
     official_filter = str(_kclean_pick(row, ["Official Filter"], "") or "").upper()
 
-    # The clean/mobile board is an output surface, not another decision engine.
-    # Never promote a protected PASS into FIRE merely because the displayed
-    # projection has a large decimal edge.
     if "PASS" in canonical or official_filter in {"PASS", "TRAP_PASS"}:
         return f"PASS {side}" if side in {"OVER", "UNDER"} else "PASS"
     if "LEAN" in canonical or official_filter == "LEAN_ONLY":
@@ -51232,9 +51229,7 @@ def _kclean_display_decision(row):
 
     reason = str(row.get("APP98 Loss Target Reason") or "").lower()
     gate = str(row.get("APP99 Right Wins Gate") or "").upper()
-    if not side:
-        return "PASS"
-    if side == "PASS":
+    if not side or side == "PASS":
         return "PASS"
     if "RED" in gate:
         return f"PASS {side}"
@@ -51387,14 +51382,9 @@ def _kclean_copy_paste_slate(df, include_thin=False):
                 edge = _kclean_final_edge(row, np.nan)
                 if not np.isfinite(edge):
                     edge = proj - line
-                # Direction follows the final protected projection, while action
-                # strength must follow the canonical decision/filter. This prevents
-                # a PASS from being promoted into a Discord fire play by edge alone.
                 side = "OVER" if edge > 0 else "UNDER" if edge < 0 else "PUSH"
                 action = _kclean_display_decision(row)
                 action_kind = str(action).split(" ", 1)[0].upper()
-                if action_kind == "PASS":
-                    continue
                 if not include_thin and action_kind not in {"FIRE", "LEAN"}:
                     continue
                 prefix = "O" if side == "OVER" else "U" if side == "UNDER" else "PUSH"
@@ -52099,15 +52089,6 @@ def _kclean_render_player_cards(df, board=None, limit=None):
             d["UD/Line"] = d.get("Line")
         if "_owp_one_final_row_per_pitcher" in globals():
             d = _owp_one_final_row_per_pitcher(d)
-        d = d[
-            ~d.apply(
-                lambda rr: str(_kclean_display_decision(rr.to_dict())).upper().startswith("PASS"),
-                axis=1,
-            )
-        ].copy()
-        if d.empty:
-            st.info("No actionable K cards. PASS evaluations remain in the full audit table.")
-            return
         d["_edge_abs"] = [abs(_kclean_final_edge(r.to_dict(), 0.0) or 0.0) for _, r in d.iterrows()]
         d = d.sort_values("_edge_abs", ascending=False)
         if limit is not None:
@@ -52320,19 +52301,15 @@ def _impl_render_kproj_tab_08(board):
     if main.empty:
         st.info("No clean K rows available.")
         return
-    actionable = main[
-        ~main["Pick"].astype(str).str.upper().str.startswith("PASS")
-    ].copy()
-
     slate_text = _kclean_copy_paste_slate(df, include_thin=False)
     all_slate_text = _kclean_copy_paste_slate(df, include_thin=True)
-    st.subheader("Actionable Copy/Paste Slate")
+    st.subheader("Copy/Paste Slate")
     if all_slate_text:
-        st.text_area("Actionable projections", all_slate_text, height=360, key="kclean_copy_paste_all_main")
+        st.text_area("All projections slate", all_slate_text, height=360, key="kclean_copy_paste_all_main")
         st.download_button(
-            "Download actionable projections .txt",
+            "Download all projections .txt",
             all_slate_text,
-            file_name="k_actionable_projections_slate.txt",
+            file_name="k_all_projections_slate.txt",
             mime="text/plain",
             use_container_width=True,
             key="download_kclean_all_slate",
@@ -52348,23 +52325,24 @@ def _impl_render_kproj_tab_08(board):
         _kclean_render_app88_audit_helpers(df, board)
 
     try:
-        total = len(actionable)
-        fire = int(actionable["Pick"].astype(str).str.startswith("FIRE").sum())
-        lean = int(actionable["Pick"].astype(str).str.startswith("LEAN").sum())
-        track = int(actionable["Pick"].astype(str).str.startswith("TRACK").sum())
+        total = len(main)
+        fire = int(main["Pick"].astype(str).str.startswith("FIRE").sum())
+        lean = int(main["Pick"].astype(str).str.startswith("LEAN").sum())
+        track = int(main["Pick"].astype(str).str.startswith("TRACK").sum())
+        pass_ct = int(main["Pick"].astype(str).str.startswith("PASS").sum())
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Actionable", total)
+        m1.metric("Pitchers", total)
         m2.metric("Fire", fire)
         m3.metric("Lean", lean)
-        m4.metric("Track", track)
+        m4.metric("Track/Pass", track + pass_ct)
     except Exception:
         pass
 
-    st.dataframe(actionable, use_container_width=True, hide_index=True)
+    st.dataframe(main, use_container_width=True, hide_index=True)
     st.download_button(
-        "Download Discord-safe protected K board CSV",
-        actionable.to_csv(index=False),
-        file_name="merge_v2_discord_safe_actionable_k_board.csv",
+        "Download protected K board CSV",
+        main.to_csv(index=False),
+        file_name="merge_v2_protected_k_board.csv",
         mime="text/csv",
         use_container_width=True,
         key="download_kclean_discord_safe_csv",
