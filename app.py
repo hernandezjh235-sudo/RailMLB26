@@ -17,6 +17,7 @@ import re
 import unicodedata
 import html
 import hashlib
+import zipfile
 import requests
 import numpy as np
 import pandas as pd
@@ -25,7 +26,7 @@ from math import exp, factorial
 from datetime import datetime, timedelta
 from pathlib import Path
 
-APP_VERSION = "ONE WAY PICKZ MASTER PO MERGE V2.6.4 DIRECTIONAL CARDS + HRR IDENTITY FIX 2026-08-10"
+APP_VERSION = "ONE WAY PICKZ MASTER PO MERGE V2.6.7 DECISION SYNC + LINE INDEPENDENCE 2026-08-11"
 FULL_APP_UPDATE_MARKER = "FULL_APP_CANONICAL_K_PIPELINE_2026_07_30"
 # =========================
 # STABLE PROJECTION SEEDING
@@ -36,8 +37,9 @@ def stable_projection_seed(*parts):
     """Create deterministic simulation seed from stable projection inputs.
 
     Same pitcher/model inputs = same simulated projection on refresh.
-    Inputs changing (lineup, line, pitcher stats, BF, learning data) can still
-    change the projection normally.
+    Inputs changing (lineup, pitcher stats, BF, learning data) can still change
+    the biological projection normally. Sportsbook lines are deliberately not
+    biological inputs; they only change threshold probabilities and decisions.
     """
     try:
         raw = "|".join([str(p) for p in parts])
@@ -6358,6 +6360,11 @@ def build_first_inning_efficiency_profile(pitcher_id=None, pitcher_name=None, re
             rows.append(r)
         except Exception:
             continue
+    rows = sorted(
+        rows,
+        key=lambda item: str(item.get("game_date") or item.get("date") or item.get("graded_at") or item.get("first_inning_tracked_at") or ""),
+        reverse=True,
+    )
     samples = len(rows)
     def avg_field(field):
         vals = [safe_float(x.get(field), None) for x in rows]
@@ -6367,6 +6374,33 @@ def build_first_inning_efficiency_profile(pitcher_id=None, pitcher_name=None, re
     avg_bf = avg_field("first_inning_bf_actual")
     avg_k = avg_field("first_inning_k_actual")
     avg_bb = avg_field("first_inning_bb_actual")
+    k_values = [safe_int(item.get("first_inning_k_actual"), None) for item in rows]
+    k_values = [value for value in k_values if value is not None]
+
+    def clearance(window, threshold):
+        values = k_values[:window]
+        return None if not values else round(sum(value >= threshold for value in values) / len(values) * 100.0, 1)
+
+    def split_values(label):
+        selected = []
+        for item in rows:
+            side = str(item.get("home_away") or item.get("venue_side") or item.get("pitcher_home_away") or "").upper()
+            if side == label:
+                selected.append(item)
+        return selected
+
+    def split_average(items, field):
+        values = [safe_float(item.get(field), None) for item in items]
+        values = [value for value in values if value is not None]
+        return None if not values else round(float(np.mean(values)), 3)
+
+    def split_rate(items):
+        total_k = sum(safe_float(item.get("first_inning_k_actual"), 0) or 0 for item in items)
+        total_bf = sum(safe_float(item.get("first_inning_bf_actual"), 0) or 0 for item in items)
+        return None if total_bf <= 0 else round(total_k / total_bf * 100.0, 2)
+
+    home_rows = split_values("HOME")
+    away_rows = split_values("AWAY")
     label = _first_inning_label(avg_p, samples)
     confidence = _first_inning_confidence(samples)
     score = 50.0
@@ -6384,6 +6418,20 @@ def build_first_inning_efficiency_profile(pitcher_id=None, pitcher_name=None, re
         "avg_bf": avg_bf,
         "avg_k": avg_k,
         "avg_bb": avg_bb,
+        "last_5_first_inning_K": k_values[:5],
+        "last_10_first_inning_K": k_values[:10],
+        "season_first_inning_K_avg": avg_k,
+        "pct_L5_with_1plus_K_1st": clearance(5, 1),
+        "pct_L10_with_1plus_K_1st": clearance(10, 1),
+        "pct_season_with_1plus_K_1st": None if not k_values else round(sum(value >= 1 for value in k_values) / len(k_values) * 100.0, 1),
+        "pct_L5_with_2plus_K_1st": clearance(5, 2),
+        "pct_L10_with_2plus_K_1st": clearance(10, 2),
+        "pct_season_with_2plus_K_1st": None if not k_values else round(sum(value >= 2 for value in k_values) / len(k_values) * 100.0, 1),
+        "first_inning_K_avg_home": split_average(home_rows, "first_inning_k_actual"),
+        "first_inning_K_avg_away": split_average(away_rows, "first_inning_k_actual"),
+        "first_inning_K_pct_home": split_rate(home_rows),
+        "first_inning_K_pct_away": split_rate(away_rows),
+        "first_inning_K_data_source": "MLB_PLAY_BY_PLAY_GRADED_RESULTS" if samples else "UNAVAILABLE",
         "score": score,
         "label": label,
         "confidence": confidence,
@@ -12764,11 +12812,13 @@ def build_k_history_context_v256(
     starter_rows = select_recent_starter_workload_rows(all_rows)
     starter_rows = [row for row in starter_rows if safe_float((row or {}).get("Ks"), None) is not None]
     ks = [float(safe_float(row.get("Ks"), 0.0) or 0.0) for row in starter_rows]
-    windows = {size: _v256_window_summary(starter_rows, size) for size in (3, 5, 10)}
+    windows = {size: _v256_window_summary(starter_rows, size) for size in (3, 5, 10, 20)}
+    season_summary = _v256_window_summary(starter_rows, len(starter_rows)) if starter_rows else {}
     line_profiles = {
         "L3": _v256_clearance(starter_rows, line, 3),
         "L5": _v256_clearance(starter_rows, line, 5),
         "L10": _v256_clearance(starter_rows, line, 10),
+        "L20": _v256_clearance(starter_rows, line, 20),
         "SEASON": _v256_clearance(starter_rows, line, None),
     }
     std = float(np.std(ks[:10], ddof=1)) if len(ks[:10]) >= 2 else None
@@ -12957,6 +13007,10 @@ def build_k_history_context_v256(
     night_rows = [row for row in starter_rows if str(row.get("Day/Night") or "").upper() == "NIGHT"]
     home_summary = _v256_window_summary(home_rows, len(home_rows)) if home_rows else {}
     away_summary = _v256_window_summary(away_rows, len(away_rows)) if away_rows else {}
+    home_clearance = _v256_clearance(home_rows, line, None)
+    away_clearance = _v256_clearance(away_rows, line, None)
+    h2h_home_rows = [row for row in h2h_rows if row.get("Home/Away") == "HOME"]
+    h2h_away_rows = [row for row in h2h_rows if row.get("Home/Away") == "AWAY"]
     day_summary = _v256_window_summary(day_rows, len(day_rows)) if day_rows else {}
     night_summary = _v256_window_summary(night_rows, len(night_rows)) if night_rows else {}
     l3_summary = windows[3]
@@ -12970,14 +13024,21 @@ def build_k_history_context_v256(
     arsenal_whiff_trend = None
     if _v25_rate(pitch_l3.get("whiff")) is not None and _v25_rate(pitch_l10.get("whiff")) is not None:
         arsenal_whiff_trend = round((_v25_rate(pitch_l3.get("whiff")) - _v25_rate(pitch_l10.get("whiff"))) * 100.0, 2)
-    game_log = [{
+    def _history_game(row):
+        return {
         "date": row.get("Date"), "opponent": row.get("Opponent"), "Ks": safe_int(row.get("Ks"), None),
         "IP": row.get("IP"), "BF": safe_int(row.get("BF"), None), "pitch_count": safe_int(row.get("Pitches"), None),
         "home_away": row.get("Home/Away"), "day_night": row.get("Day/Night"),
+        "game_pk": row.get("GamePk"), "venue_id": row.get("Venue ID") or row.get("venue_id"),
         "role": row.get("Role") or ("STARTER" if (safe_int(row.get("GS"), 0) or 0) >= 1 else "RELIEF_OR_BULK"),
-    } for row in starter_rows[:10]]
+        }
+    game_log = [_history_game(row) for row in starter_rows[:20]]
+    h2h_game_log = [_history_game(row) for row in h2h_rows]
+    h2h_home_game_log = [_history_game(row) for row in h2h_home_rows]
+    h2h_away_game_log = [_history_game(row) for row in h2h_away_rows]
     return {
         "version": MERGE_V256_VERSION,
+        "status": "READY" if starter_rows else "UNAVAILABLE",
         "available": bool(starter_rows),
         "projection_enabled": bool(enabled),
         "projection_applied": abs(applied_shift) >= 0.01,
@@ -12986,8 +13047,9 @@ def build_k_history_context_v256(
         "clearance": line_profiles,
         "last_5_k": [safe_int(value, 0) for value in ks[:5]],
         "last_10_k": [safe_int(value, 0) for value in ks[:10]],
+        "last_20_k": [safe_int(value, 0) for value in ks[:20]],
         "game_log": game_log,
-        "L3": windows[3], "L5": windows[5], "L10": windows[10],
+        "L3": windows[3], "L5": windows[5], "L10": windows[10], "L20": windows[20], "SEASON": season_summary,
         "k_variance": None if variance is None else round(variance, 3),
         "k_standard_deviation": None if std is None else round(std, 3),
         "k_volatility": volatility,
@@ -13029,6 +13091,7 @@ def build_k_history_context_v256(
         "H2H_IP": [row.get("IP") for row in h2h_rows],
         "H2H_BF": [safe_int(row.get("BF"), None) for row in h2h_rows],
         "H2H_pitch_count": [safe_int(row.get("Pitches"), None) for row in h2h_rows],
+        "H2H_game_log": h2h_game_log,
         "H2H_avg_K": None if not h2h_ks else round(float(np.mean(h2h_ks)), 3),
         "H2H_median_K": None if not h2h_ks else round(float(np.median(h2h_ks)), 3),
         "H2H_clearance": h2h_clearance,
@@ -13039,10 +13102,41 @@ def build_k_history_context_v256(
         "H2H_arsenal_similarity": "UNKNOWN_DISPLAY_ONLY",
         "H2H_handedness_environment_similarity": "UNKNOWN_DISPLAY_ONLY",
         "H2H_context_note": "Historical arsenal/handedness similarity is display-only and remains unknown when comparable pitch-mix snapshots are unavailable.",
+        "H2H_HOME": {
+            "summary": _v256_window_summary(h2h_home_rows, len(h2h_home_rows)) if h2h_home_rows else {},
+            "clearance": _v256_clearance(h2h_home_rows, line, None),
+            "game_log": h2h_home_game_log,
+        },
+        "H2H_AWAY": {
+            "summary": _v256_window_summary(h2h_away_rows, len(h2h_away_rows)) if h2h_away_rows else {},
+            "clearance": _v256_clearance(h2h_away_rows, line, None),
+            "game_log": h2h_away_game_log,
+        },
+        "H2H_SAME_VENUE": {"status": "UNAVAILABLE_WITHOUT_VENUE_ID", "display_only": True},
         "home_K_avg": None if home_summary.get("avg") is None else round(home_summary.get("avg"), 3),
         "away_K_avg": None if away_summary.get("avg") is None else round(away_summary.get("avg"), 3),
         "home_K_pct": None if home_summary.get("k_pct") is None else round(home_summary.get("k_pct") * 100.0, 2),
         "away_K_pct": None if away_summary.get("k_pct") is None else round(away_summary.get("k_pct") * 100.0, 2),
+        "home_clearance": home_clearance,
+        "away_clearance": away_clearance,
+        "home_sample_size": len(home_rows),
+        "away_sample_size": len(away_rows),
+        "home_BF_avg": home_summary.get("bf_avg"),
+        "away_BF_avg": away_summary.get("bf_avg"),
+        "home_IP_avg": home_summary.get("ip_avg"),
+        "away_IP_avg": away_summary.get("ip_avg"),
+        "home_pitch_count_avg": home_summary.get("pitch_avg"),
+        "away_pitch_count_avg": away_summary.get("pitch_avg"),
+        "home_away": {
+            "HOME": {"summary": home_summary, "clearance": home_clearance, "game_log": [_history_game(row) for row in home_rows]},
+            "AWAY": {"summary": away_summary, "clearance": away_clearance, "game_log": [_history_game(row) for row in away_rows]},
+        },
+        "h2h": {
+            "ALL": {"summary": {"avg": None if not h2h_ks else float(np.mean(h2h_ks)), "median": None if not h2h_ks else float(np.median(h2h_ks))}, "clearance": h2h_clearance, "game_log": h2h_game_log},
+            "HOME": {"summary": _v256_window_summary(h2h_home_rows, len(h2h_home_rows)) if h2h_home_rows else {}, "clearance": _v256_clearance(h2h_home_rows, line, None), "game_log": h2h_home_game_log},
+            "AWAY": {"summary": _v256_window_summary(h2h_away_rows, len(h2h_away_rows)) if h2h_away_rows else {}, "clearance": _v256_clearance(h2h_away_rows, line, None), "game_log": h2h_away_game_log},
+            "SAME_VENUE": {"status": "UNAVAILABLE_WITHOUT_VENUE_ID", "display_only": True, "game_log": []},
+        },
         "day_K_avg": None if day_summary.get("avg") is None else round(day_summary.get("avg"), 3),
         "night_K_avg": None if night_summary.get("avg") is None else round(night_summary.get("avg"), 3),
         "day_K_pct": None if day_summary.get("k_pct") is None else round(day_summary.get("k_pct") * 100.0, 2),
@@ -16581,6 +16675,20 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "first_inning_avg_bf": first_inning_profile.get("avg_bf") if "first_inning_profile" in locals() else None,
         "first_inning_avg_k": first_inning_profile.get("avg_k") if "first_inning_profile" in locals() else None,
         "first_inning_avg_bb": first_inning_profile.get("avg_bb") if "first_inning_profile" in locals() else None,
+        "last_5_first_inning_K": first_inning_profile.get("last_5_first_inning_K") if "first_inning_profile" in locals() else [],
+        "last_10_first_inning_K": first_inning_profile.get("last_10_first_inning_K") if "first_inning_profile" in locals() else [],
+        "season_first_inning_K_avg": first_inning_profile.get("season_first_inning_K_avg") if "first_inning_profile" in locals() else None,
+        "pct_L5_with_1plus_K_1st": first_inning_profile.get("pct_L5_with_1plus_K_1st") if "first_inning_profile" in locals() else None,
+        "pct_L10_with_1plus_K_1st": first_inning_profile.get("pct_L10_with_1plus_K_1st") if "first_inning_profile" in locals() else None,
+        "pct_season_with_1plus_K_1st": first_inning_profile.get("pct_season_with_1plus_K_1st") if "first_inning_profile" in locals() else None,
+        "pct_L5_with_2plus_K_1st": first_inning_profile.get("pct_L5_with_2plus_K_1st") if "first_inning_profile" in locals() else None,
+        "pct_L10_with_2plus_K_1st": first_inning_profile.get("pct_L10_with_2plus_K_1st") if "first_inning_profile" in locals() else None,
+        "pct_season_with_2plus_K_1st": first_inning_profile.get("pct_season_with_2plus_K_1st") if "first_inning_profile" in locals() else None,
+        "first_inning_K_avg_home": first_inning_profile.get("first_inning_K_avg_home") if "first_inning_profile" in locals() else None,
+        "first_inning_K_avg_away": first_inning_profile.get("first_inning_K_avg_away") if "first_inning_profile" in locals() else None,
+        "first_inning_K_pct_home": first_inning_profile.get("first_inning_K_pct_home") if "first_inning_profile" in locals() else None,
+        "first_inning_K_pct_away": first_inning_profile.get("first_inning_K_pct_away") if "first_inning_profile" in locals() else None,
+        "first_inning_K_data_source": first_inning_profile.get("first_inning_K_data_source") if "first_inning_profile" in locals() else "UNAVAILABLE",
         "first_inning_efficiency_score": first_inning_profile.get("score") if "first_inning_profile" in locals() else 50,
         "first_inning_efficiency_label": first_inning_profile.get("label") if "first_inning_profile" in locals() else "FI_TRACK_ONLY",
         "first_inning_confidence": first_inning_profile.get("confidence") if "first_inning_profile" in locals() else "DAY_1_TRACK_ONLY",
@@ -16976,6 +17084,20 @@ def save_many_once(new_picks):
             official = dict(p)
             official["official_snapshot_saved_at"] = now_iso()
             official["snapshot_type"] = "OFFICIAL_BEFORE_GAME"
+            official["snapshot_schema"] = "MERGE_V2_6_7_REPRODUCIBLE_PREGAME"
+            official["app_version"] = APP_VERSION
+            try:
+                official["build_hash"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+            except Exception:
+                official["build_hash"] = None
+            try:
+                config_blob = json.dumps({
+                    "v265": globals().get("MERGE_V265_CONFIG", {}),
+                    "v267": globals().get("MERGE_V267_CONFIG", globals().get("MERGE_V266_CONFIG", {})),
+                }, sort_keys=True, default=str)
+                official["model_config_hash"] = hashlib.sha256(config_blob.encode("utf-8")).hexdigest()
+            except Exception:
+                official["model_config_hash"] = None
             # Projection Drift Tracker: preserve the original saved projection and line.
             official["opening_projection"] = official.get("opening_projection", official.get("projection"))
             official["opening_line"] = official.get("opening_line", official.get("line"))
@@ -21249,6 +21371,7 @@ def render_kproj_pitcher_card(p):
     fi_avg_p_display = '—' if p.get('first_inning_avg_pitches') is None else f"{safe_float(p.get('first_inning_avg_pitches'),0):.1f}"
     fi_avg_bf_display = '—' if p.get('first_inning_avg_bf') is None else f"{safe_float(p.get('first_inning_avg_bf'),0):.1f}"
     fi_avg_k_display = '—' if p.get('first_inning_avg_k') is None else f"{safe_float(p.get('first_inning_avg_k'),0):.2f}"
+    fi_projected_k_display = '—' if p.get('projected_1st_inning_K') is None else f"{safe_float(p.get('projected_1st_inning_K'),0):.2f} K"
     fi_label_display = html.escape(str(p.get('first_inning_efficiency_label') or 'FI_TRACK_ONLY'))
     fi_conf_display = html.escape(str(p.get('first_inning_confidence') or 'DAY_1_TRACK_ONLY'))
     # UI-only pick side: keep official/pass filters intact, but always reveal model side when line/projection has a direction.
@@ -21321,7 +21444,7 @@ def render_kproj_pitcher_card(p):
         <div class="mobile-info-card"><div class="small-muted">Opponent Team K Rank</div><div class="kpi-value" style="font-size:15px;">{okr_env_display}</div><div class="kpi-sub">Opp {okr_team_display} vs {okr_hand_display}: {okr_k_hand_display} / {okr_rank_hand_display}<br>{okr_overall_line}<br>{okr_overall_so_line}<br>{okr_l30_overall_line}<br>{okr_l30_so_line}<br>{okr_rhp_line}<br>{okr_lhp_line}<br>{okr_l30_rhp_line}<br>{okr_l30_lhp_line}<br>{team_k_read_display}<br>Source: {okr_official_source_line}<br>MI Nudge: {card_row.get("Matchup Intel K Nudge", "—") if isinstance(card_row, dict) else "—"} K | {card_row.get("Matchup Intel Label", "—") if isinstance(card_row, dict) else "—"}</div></div>
         <div class="mobile-info-card"><div class="small-muted">OG Matchup Intel Shadow</div><div class="kpi-value" style="font-size:15px;">{card_row.get("OG Matchup Intel Shadow K Projection", "—") if isinstance(card_row, dict) else "—"} K</div><div class="kpi-sub">Edge {card_row.get("OG Matchup Intel Shadow Edge", "—") if isinstance(card_row, dict) else "—"} | {html.escape(str(card_row.get("OG Matchup Intel Shadow Decision", "—") if isinstance(card_row, dict) else "—"))}<br>Nudge {card_row.get("OG Matchup Intel Shadow Nudge", "—") if isinstance(card_row, dict) else "—"} K | {html.escape(str(card_row.get("OG Matchup Intel Shadow Label", "—") if isinstance(card_row, dict) else "—"))}<br>{html.escape(str(card_row.get("OG Matchup Intel Shadow Reason", "—") if isinstance(card_row, dict) else "—"))[:220]}</div></div>
         <div class="mobile-info-card"><div class="small-muted">APP97 Current K Interaction</div><div class="kpi-value" style="font-size:15px;">{html.escape(str(card_row.get("APP97 K Interaction Label", "—") if isinstance(card_row, dict) else "—"))}</div><div class="kpi-sub">Raw MLB Season Pitcher K%: {_card_pct(card_row.get("APP97 Raw MLB Season Pitcher K%") if isinstance(card_row, dict) else None)}<br>Pitcher K Source: {html.escape(str(card_row.get("APP97 Pitcher K Source","—") if isinstance(card_row, dict) else "—"))}<br>Season/GameLog: {html.escape(str(card_row.get("APP97 Pitcher Season Fetch Status","—") if isinstance(card_row, dict) else "—"))} / {html.escape(str(card_row.get("APP97 Pitcher GameLog Fetch Status","—") if isinstance(card_row, dict) else "—"))}<br>Current Opp K Env: {_card_pct(card_row.get("APP97 Opponent K Environment") if isinstance(card_row, dict) else None)}<br>Lineup K%: {_card_pct(card_row.get("APP97 Lineup K%") if isinstance(card_row, dict) else None)} ({html.escape(str(card_row.get("APP97 Lineup Status","—") if isinstance(card_row, dict) else "—"))})<br>BF: {card_row.get("APP97 Model Expected BF","—") if isinstance(card_row, dict) else "—"} → {card_row.get("APP97 Reconciled Expected BF","—") if isinstance(card_row, dict) else "—"}<br>Implied K: {card_row.get("APP97 Matchup Implied K","—") if isinstance(card_row, dict) else "—"}<br>Final Shift: {card_row.get("APP97 Projection Shift","—") if isinstance(card_row, dict) else "—"} K<br>{html.escape(str(card_row.get("APP97 Data Freshness","—") if isinstance(card_row, dict) else "—"))}</div></div>
-        <div class="mobile-info-card"><div class="small-muted">1st Inning Layer</div><div class="kpi-value" style="font-size:15px;">{fi_label_display}</div><div class="kpi-sub">Sample {fi_sample_display} | Avg Pitches {fi_avg_p_display}<br>BF {fi_avg_bf_display} | 1st-K {fi_avg_k_display}<br>{fi_conf_display}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">1st Inning Strikeouts</div><div class="kpi-value" style="font-size:15px;">{fi_projected_k_display}</div><div class="kpi-sub">{html.escape(str(p.get('first_inning_K_profile') or fi_label_display))}<br>Expected BF {p.get('expected_1st_inning_BF', fi_avg_bf_display)} | Top 3 K% {p.get('first_inning_top3_weighted_K_pct', '—')}<br>{html.escape(str(p.get('first_inning_K_confidence') or fi_conf_display))}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Decision Tier 3.0</div><div class="kpi-value" style="font-size:15px;">{decision_tier_display}</div><div class="kpi-sub">{decision_tier_note_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Ace / Veteran / Rookie</div><div class="kpi-value" style="font-size:15px;">{html.escape(exp_label_display)}</div><div class="kpi-sub">Score {exp_score_display} | {exp_bf_factor_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Avg Ks</div><div class="kpi-value" style="font-size:18px;">{avg_k_display}</div><div class="kpi-sub">{avg_k_sub}</div></div>
@@ -21363,9 +21486,9 @@ def render_kproj_pitcher_card(p):
         <div class="kpi-sub" style="margin-top:8px;"><b>Risk checks:</b><br>{why_risk_html}</div>
       </div>
       <div class="mobile-info-card" style="margin-top:10px;min-height:0;">
-        <div class="small-muted">First Inning Layer 3.0</div>
-        <div class="kpi-value" style="font-size:16px;">{fi_label_display} • {fi_conf_display}</div>
-        <div class="kpi-sub" style="margin-top:6px;">{fi_note_display}<br><b>Projection impact:</b> 0.00 K until enough graded samples prove value.</div>
+        <div class="small-muted">K Timing</div>
+        <div class="kpi-value" style="font-size:16px;">{html.escape(str(p.get('timing_profile') or fi_label_display))} • {html.escape(str(p.get('first_inning_K_confidence') or fi_conf_display))}</div>
+        <div class="kpi-sub" style="margin-top:6px;">1st inning {fi_projected_k_display} | TTO1 {p.get('TTO1_K_pct', '—')}% | TTO2 {p.get('TTO2_K_pct', '—')}%<br>{html.escape(str(p.get('K_efficiency_profile') or 'INSUFFICIENT_SAMPLE'))} | {html.escape(str(p.get('timing_workload_fit') or 'NEUTRAL'))}<br><b>Projection impact:</b> 0.00 K until holdout validation proves value.</div>
       </div>
       <div class="mobile-info-card" style="margin-top:10px;min-height:0;">
         <div class="small-muted">Projection Attribution</div>
@@ -42133,60 +42256,11 @@ def _k_stage_26_file33_matched_k(df, board):
 
 
 def _impl_build_copy_paste_k_slate_04(df, show_pass_notes=False, force_all_players_ou=False):
-    try:
-        if not isinstance(df, pd.DataFrame) or df.empty:
-            return ""
-
-        d = _file33_match_apply(df.copy())
-        if "Line Source" in d.columns:
-            d = d[d["Line Source"].astype(str).str.upper().eq("UNDERDOG")].copy()
-
-        if "UD/Line" not in d.columns:
-            d["UD/Line"] = d.get("Line")
-        d["UD/Line"] = pd.to_numeric(d["UD/Line"], errors="coerce")
-        d = d[d["UD/Line"].notna()].copy()
-        d = _owp_one_final_row_per_pitcher(d)
-
-        output = []
-        for matchup, group in d.groupby("Matchup", sort=False):
-            block = []
-            for _, row in group.iterrows():
-                line = _file33_match_num(row.get("UD/Line"))
-                proj = _file33_match_num(row.get("File33 Matched K Projection"))
-                if not np.isfinite(line) or not np.isfinite(proj):
-                    continue
-
-                side = "OVER" if proj > line else "UNDER" if proj < line else "PUSH"
-                if side == "PUSH":
-                    if not show_pass_notes:
-                        continue
-                    symbol = "PASS"
-                else:
-                    edge = abs(proj - line)
-                    if edge < 0.65 and not show_pass_notes:
-                        continue
-                    prefix = "O" if side == "OVER" else "U"
-                    symbol = f"🔥 {prefix}" if edge >= 1.00 else (f"⚠️ {prefix}" if edge < 0.65 else prefix)
-
-                ip = float("nan")
-                for column in ["IP Floor", "IP PROJ", "Projected IP"]:
-                    if column in row.index:
-                        candidate = _file33_match_num(row.get(column))
-                        if np.isfinite(candidate):
-                            ip = candidate
-                            break
-
-                ip_text = "—" if not np.isfinite(ip) else f"{ip:.2f}"
-                block.append(f"• {row.get('Pitcher')} — {symbol} {line:.1f} — {proj:.2f} K — IP {ip_text}")
-
-            if block:
-                output.append(str(matchup))
-                output.extend(block)
-                output.append("")
-
-        return "\n".join(output).strip()
-    except Exception as exc:
-        return f"Slate builder unavailable: {exc}"
+    """Compatibility entry point; V2.6.5 never recomputes a public side."""
+    return _kclean_copy_paste_slate(
+        df,
+        include_thin=bool(show_pass_notes or force_all_players_ou),
+    )
 
 
 # =============================================================================
@@ -45533,7 +45607,7 @@ def _sim_side_from_text(value):
     return ""
 
 
-def _k_sim_volatility(row, mean, line):
+def _k_sim_volatility(row, mean, line=None):
     completeness = _tpl_num(row.get("K Data Completeness Score"), 65) or 65
     vol = 1.16
     if completeness < 50:
@@ -45553,8 +45627,8 @@ def _k_sim_volatility(row, mean, line):
         vol += 0.08
     if any(x in role_txt for x in ["OPENER", "BULK", "LIMIT", "IL", "CALL-UP", "TANDEM"]):
         vol += 0.22
-    if mean is not None and line is not None and abs(float(mean) - float(line)) < 0.45:
-        vol += 0.08
+    # Sportsbook thresholds belong to the decision layer. They must never
+    # alter the biological K distribution or its variance.
     return max(1.05, min(1.95, vol))
 
 
@@ -45586,8 +45660,8 @@ def _simulate_k_row(row, sims=TRUE_PROB_SIM_SIMS):
         return out
     mean = max(0.1, min(14.0, float(mean)))
     line = float(line)
-    vol = _k_sim_volatility(row, mean, line)
-    rng = _sim_stable_rng("K", pitcher, line, round(mean, 3), sims)
+    vol = _k_sim_volatility(row, mean)
+    rng = _sim_stable_rng("K", pitcher, round(mean, 3), round(vol, 3), sims)
     variance = max(mean + 0.05, mean * vol + 0.35)
     try:
         if variance <= mean + 0.05:
@@ -45689,7 +45763,7 @@ def _simulate_po_row(row, sims=TRUE_PROB_SIM_SIMS):
     elif "MED" in conf:
         sd += 0.25
     sd = max(1.7, min(5.8, sd))
-    rng = _sim_stable_rng("PO", pitcher, line, round(mean, 3), sims)
+    rng = _sim_stable_rng("PO", pitcher, round(mean, 3), round(sd, 3), sims)
     samples = np.rint(rng.normal(mean, sd, int(sims))).astype(int)
     samples = np.clip(samples, 0, 27)
     over_prob = float(np.mean(samples > line) * 100.0)
@@ -51250,6 +51324,9 @@ def _impl_kclean_side_label_01(row):
 
 
 def _kclean_display_decision(row):
+    final_state = str(_kclean_pick(row, ["Final Decision State", "final_decision_state"], "") or "").upper()
+    if final_state:
+        return _v265_state_display(final_state)
     side = _kclean_side_label(row)
     edge = _kclean_final_edge(row, np.nan)
     canonical = str(_kclean_pick(row, [
@@ -51258,7 +51335,7 @@ def _kclean_display_decision(row):
     official_filter = str(_kclean_pick(row, ["Official Filter"], "") or "").upper()
 
     if "PASS" in canonical or official_filter in {"PASS", "TRAP_PASS"}:
-        return f"TRACK {side}" if side in {"OVER", "UNDER"} else "TRACK"
+        return "PASS"
     if "LEAN" in canonical or official_filter == "LEAN_ONLY":
         return f"LEAN {side}" if side in {"OVER", "UNDER"} else "TRACK"
     if "OFFICIAL" in canonical or "BET OVER" in canonical or "BET UNDER" in canonical or "🔥" in canonical:
@@ -51311,6 +51388,12 @@ def _kclean_main_df(df):
             "Discord Status": protected_decision,
             "Official Filter": _kclean_pick(row, ["Official Filter"], ""),
             "Canonical Decision": _kclean_pick(row, ["Canonical Decision", "Final K Decision"], ""),
+            "Final Decision State": _kclean_pick(row, ["Final Decision State", "final_decision_state"], ""),
+            "Final Decision Reason": _kclean_pick(row, ["Final Decision Reason"], ""),
+            "P(Over Line)": _kclean_pick(row, ["P(OVER Today's Line)"], ""),
+            "P(Under Line)": _kclean_pick(row, ["P(UNDER Today's Line)"], ""),
+            "PO/Merge Sync": _kclean_pick(row, ["PO/Merge Sync State"], ""),
+            "Model Agreement": _kclean_pick(row, ["Model Agreement State"], ""),
             "PO Projection": _kclean_pick(row, ["PO Projection"], ""),
             "PO Side": _kclean_pick(row, ["PO Side"], ""),
             "Merge Raw Projection": _kclean_pick(row, ["Merge Raw Projection"], ""),
@@ -51366,7 +51449,9 @@ def _kclean_main_df(df):
         })
     out = pd.DataFrame(rows)
     try:
-        order = {"FIRE OVER": 0, "FIRE UNDER": 0, "LEAN OVER": 1, "LEAN UNDER": 1, "TRACK OVER": 2, "TRACK UNDER": 2, "PASS OVER": 3, "PASS UNDER": 3, "PASS": 4}
+        order = {"PLAY OVER": 0, "PLAY UNDER": 0, "TRACK OVER": 1, "TRACK UNDER": 1,
+                 "PASS - THIN EDGE": 2, "PASS - MODEL CONFLICT": 3, "PASS - PO CONFLICT": 3,
+                 "PASS - LINEUP UNCERTAIN": 3, "PASS - WORKLOAD UNCERTAIN": 3, "NO LINE": 4}
         out["_sort_pick"] = out["Pick"].astype(str).map(lambda x: order.get(x, 9))
         out["_sort_edge"] = pd.to_numeric(out["Edge"], errors="coerce").abs().fillna(-1)
         out = out.sort_values(["_sort_pick", "_sort_edge"], ascending=[True, False]).drop(columns=["_sort_pick", "_sort_edge"])
@@ -51419,14 +51504,18 @@ def _kclean_copy_paste_slate(df, include_thin=False):
                 edge = _kclean_final_edge(row, np.nan)
                 if not np.isfinite(edge):
                     edge = proj - line
-                side = "OVER" if edge > 0 else "UNDER"
-                abs_edge = abs(float(edge))
-                if not include_thin and abs_edge < 0.55:
+                state = str(_kclean_pick(row, ["Final Decision State", "final_decision_state"], "") or "").upper()
+                side = _v265_state_side(state) or _kclean_side_label(row)
+                if not state:
+                    state = f"TRACK_{side}" if side in {"OVER", "UNDER"} else "NO_LINE"
+                if not include_thin and not state.startswith("PLAY_"):
                     continue
-                symbol = f"🔥 {side}" if abs_edge >= 1.00 else (f"⚠️ {side}" if abs_edge >= 0.55 else side)
+                symbol = _v265_state_display(state)
                 ip = _kclean_num(_kclean_pick(row, ["IP Floor", "IP PROJ", "Projected IP", "IP Projection"], ""), np.nan)
                 ip_text = "—" if not np.isfinite(ip) else f"{ip:.2f}"
-                block.append(f"• {row.get('Pitcher')} — {symbol} {line:.1f} — {proj:.2f} K — IP {ip_text}")
+                prob = _kclean_num(_kclean_pick(row, ["Final Decision Confidence %", "K Sim Current Side Prob %"], np.nan), np.nan)
+                prob_text = "" if not np.isfinite(prob) else f" — {prob:.0f}%"
+                block.append(f"• {row.get('Pitcher')} — {symbol} {line:.1f} — {proj:.2f} K{prob_text} — IP {ip_text}")
             if block:
                 lines.append(str(matchup))
                 lines.extend(block)
@@ -51438,20 +51527,21 @@ def _kclean_copy_paste_slate(df, include_thin=False):
 
 def _kclean_card_decision(row):
     proj, line = _kclean_final_proj_line(row)
-    side = _kclean_side_label(row)
-    # Player cards are projection-first: if the final displayed K projection is
-    # above the line, show OVER; if it is below, show UNDER. Older side fields
-    # can lag behind late blend/elite-gate changes.
-    if np.isfinite(proj) and np.isfinite(line):
-        side = "OVER" if proj > line else "UNDER"
-        edge = round(float(proj - line), 2)
-    else:
-        edge = _kclean_final_edge(row, np.nan)
-    prob = _kclean_num(_kclean_pick(row, ["K Sim Current Side Prob %", "K Sim True Prob %", "Sim Side %"], ""), np.nan)
+    state = str(_kclean_pick(row, ["Final Decision State", "final_decision_state"], "") or "").upper()
+    side = _v265_state_side(state) or _kclean_side_label(row)
+    edge = round(float(proj - line), 2) if np.isfinite(proj) and np.isfinite(line) else _kclean_final_edge(row, np.nan)
+    prob = _kclean_num(_kclean_pick(row, ["Final Decision Confidence %", "K Sim Current Side Prob %", "K Sim True Prob %", "Sim Side %"], ""), np.nan)
     if np.isfinite(prob) and prob <= 1:
         prob *= 100.0
-    tier = "HIGH" if np.isfinite(prob) and prob >= 72 else "GOOD" if np.isfinite(prob) and prob >= 64 else "LEAN" if np.isfinite(prob) and prob >= 56 else "TRACK"
-    return side, edge, prob, tier
+    if state.startswith("PLAY_"):
+        tier = "PLAY"
+    elif state.startswith("TRACK_"):
+        tier = "TRACK"
+    elif state.startswith("PASS_"):
+        tier = "PASS"
+    else:
+        tier = "NO LINE"
+    return _v265_state_display(state) if state else side, edge, prob, tier
 
 
 def _kcard_split_matchup(matchup):
@@ -52035,6 +52125,295 @@ def _kcard_last10_html(row, p, line):
     return f"<div class='kc-section'><div class='kc-section-title'><span>Last 10 starts</span><span class='kc-chip'>{avg_txt} · line {html.escape(str(line))}</span></div><div class='kc-bars'>{''.join(bars)}</div></div>"
 
 
+def _v265_json_obj(value):
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _v265_pct_text(value):
+    value = _canonical_k_num(value, None)
+    if value is None:
+        return "—"
+    if value <= 1.0:
+        value *= 100.0
+    return f"{value:.0f}%"
+
+
+def _v265_history_summary_html(label, summary, clearance, games, line):
+    summary = summary if isinstance(summary, dict) else {}
+    clearance = clearance if isinstance(clearance, dict) else {}
+    sample = safe_int(clearance.get("sample"), len(games or [])) or 0
+    over_count = safe_int(clearance.get("over_count"), 0) or 0
+    under_count = safe_int(clearance.get("under_count"), 0) or 0
+    avg = _canonical_k_num(summary.get("avg"), None)
+    median = _canonical_k_num(summary.get("median"), None)
+    stats = (
+        f"<div class='kc-hstats'>"
+        f"<div><span>Today's line</span><b>{html.escape(str(line))}</b></div>"
+        f"<div class='h-over'><span>Over clearance</span><b>{over_count}/{sample} · {_v265_pct_text(clearance.get('over'))}</b></div>"
+        f"<div class='h-under'><span>Under clearance</span><b>{under_count}/{sample} · {_v265_pct_text(clearance.get('under'))}</b></div>"
+        f"<div><span>Average K</span><b>{'—' if avg is None else f'{avg:.1f}'}</b></div>"
+        f"<div><span>Median K</span><b>{'—' if median is None else f'{median:.1f}'}</b></div>"
+        f"</div>"
+    )
+    chips = []
+    rows = []
+    line_num = _canonical_k_num(line, None)
+    for game in (games or []):
+        if isinstance(game, dict):
+            k_value = _canonical_k_num(game.get("Ks"), None)
+            opponent = html.escape(str(game.get("opponent") or ""))
+            ip = game.get("IP")
+            bf = game.get("BF")
+            pitches = game.get("pitch_count")
+            date = html.escape(str(game.get("date") or ""))
+            role = html.escape(str(game.get("role") or ""))
+        else:
+            k_value = _canonical_k_num(game, None)
+            opponent = ""
+            ip = bf = pitches = ""
+            date = role = ""
+        if k_value is None:
+            continue
+        hit = bool(line_num is not None and k_value > line_num)
+        chips.append(f"<span class='kc-kchip {'hit' if hit else 'miss'}'>{k_value:g}K</span>")
+        context_bits = [bit for bit in [f"{ip} IP" if ip not in (None, "") else "", f"{bf} BF" if bf not in (None, "") else "", f"{pitches} P" if pitches not in (None, "") else "", f"vs {opponent}" if opponent else "", role] if bit]
+        rows.append(f"<div class='kc-game'><b>{k_value:g} K</b><span>{' · '.join(context_bits) or date}</span></div>")
+    return f"<div class='kc-hpanel'><div class='kc-section-title'><span>{html.escape(label)}</span><span class='kc-chip'>vs today's line</span></div>{stats}<div class='kc-kstrip'>{''.join(chips) or '<span class=kc-empty>No completed starts</span>'}</div><div class='kc-gamelog'>{''.join(rows)}</div></div>"
+
+
+def _v265_recent_history_html(row, p, line, card_id):
+    context = _v265_history_context(row or {}, p or {})
+    if not context or not context.get("available"):
+        return '<div class="kc-empty">Recent game logs are unavailable. The projection and card remain usable.</div>'
+    clearance = context.get("clearance") if isinstance(context.get("clearance"), dict) else {}
+    game_log = context.get("game_log") if isinstance(context.get("game_log"), list) else []
+    def summary_for(games):
+        values = [_canonical_k_num((game or {}).get("Ks"), None) for game in (games or [])]
+        values = [value for value in values if value is not None]
+        return {
+            "avg": None if not values else float(np.mean(values)),
+            "median": None if not values else float(np.median(values)),
+        }
+
+    def clearance_for(games):
+        line_value = _canonical_k_num(line, None)
+        values = [_canonical_k_num((game or {}).get("Ks"), None) for game in (games or [])]
+        values = [value for value in values if value is not None]
+        over = sum(value > line_value for value in values) if line_value is not None else 0
+        sample = len(values)
+        return {
+            "sample": sample, "over_count": over, "under_count": sample - over,
+            "over": None if not sample or line_value is None else over / sample,
+            "under": None if not sample or line_value is None else (sample - over) / sample,
+        }
+
+    def split_panel(prefix, views, h2h=False):
+        labels_html = []
+        inputs_html = []
+        panels_html = []
+        selectors = []
+        label_selectors = []
+        for position, (view_key, view_label, view_payload) in enumerate(views):
+            sub_id = f"{prefix}-{view_key.lower().replace('_', '-')}"
+            inputs_html.append(f"<input {'checked' if position == 0 else ''} type='radio' name='{prefix}' id='{sub_id}'>")
+            labels_html.append(f"<label for='{sub_id}'>{html.escape(view_label)}</label>")
+            payload = view_payload if isinstance(view_payload, dict) else {}
+            games = payload.get("game_log") if isinstance(payload.get("game_log"), list) else []
+            if payload.get("status") and not games:
+                panel = f"<div class='kc-empty'>{html.escape(str(payload.get('status')).replace('_', ' ').title())}</div>"
+            else:
+                panel = _v265_history_summary_html(
+                    view_label,
+                    payload.get("summary") or summary_for(games),
+                    payload.get("clearance") or clearance_for(games),
+                    games,
+                    line,
+                )
+            panels_html.append(f"<div class='kc-subpanel kc-sub-{view_key.lower().replace('_', '-')}'>{panel}</div>")
+            selectors.append(f"#{sub_id}:checked~.kc-subpanels .kc-sub-{view_key.lower().replace('_', '-')}")
+            label_selectors.append(f"#{sub_id}:checked~.kc-subtablabels label[for='{sub_id}']")
+        label_columns = len(views)
+        css = (
+            f"<style>{','.join(selectors)}{{display:block}}"
+            f"{','.join(label_selectors)}{{background:#5b226f;border-color:#ffd34e;color:#fff}}"
+            f".kc-subtabs[data-prefix='{prefix}'] .kc-subtablabels{{grid-template-columns:repeat({label_columns},minmax(0,1fr))}}</style>"
+        )
+        return (
+            f"<div class='kc-subtabs' data-prefix='{prefix}'>{''.join(inputs_html)}"
+            f"<div class='kc-subtablabels'>{''.join(labels_html)}</div>"
+            f"<div class='kc-subpanels'>{''.join(panels_html)}</div></div>{css}"
+        )
+
+    tabs = []
+    tab_specs = [
+        ("H2H", "H2H"), ("L5", "L5"), ("L10", "L10"), ("L20", "L20"), ("SEASON", "Season")
+    ]
+    labels = []
+    inputs = []
+    for index, (key, label) in enumerate(tab_specs):
+        tab_id = f"kh-{card_id}-{key.lower()}"
+        inputs.append(f"<input {'checked' if key == 'L5' else ''} type='radio' name='kh-{card_id}' id='{tab_id}'>")
+        labels.append(f"<label for='{tab_id}'>{label}</label>")
+        if key == "H2H":
+            h2h_context = context.get("h2h") if isinstance(context.get("h2h"), dict) else {}
+            body = split_panel(
+                f"kh-{card_id}-h2h-view",
+                [
+                    ("ALL", "ALL H2H", h2h_context.get("ALL") or {"game_log": context.get("H2H_game_log") or []}),
+                    ("HOME", "HOME H2H", h2h_context.get("HOME") or context.get("H2H_HOME") or {}),
+                    ("AWAY", "AWAY H2H", h2h_context.get("AWAY") or context.get("H2H_AWAY") or {}),
+                    ("SAME_VENUE", "SAME VENUE", h2h_context.get("SAME_VENUE") or context.get("H2H_SAME_VENUE") or {}),
+                ],
+                h2h=True,
+            )
+            body += f"<div class='kc-mini-note'>Current-lineup overlap: {html.escape(str(context.get('H2H_current_lineup_overlap') if context.get('H2H_current_lineup_overlap') is not None else 'unknown'))}/9 · H2H remains lower-weight context.</div>"
+        else:
+            size = None if key == "SEASON" else int(key[1:])
+            games = game_log if size is None else game_log[:size]
+            home_games = [game for game in games if str((game or {}).get("home_away") or "").upper() == "HOME"]
+            away_games = [game for game in games if str((game or {}).get("home_away") or "").upper() == "AWAY"]
+            body = split_panel(
+                f"kh-{card_id}-{key.lower()}-view",
+                [
+                    ("ALL", "ALL", {"summary": context.get(key) or summary_for(games), "clearance": clearance.get(key) or clearance_for(games), "game_log": games}),
+                    ("HOME", "HOME", {"summary": summary_for(home_games), "clearance": clearance_for(home_games), "game_log": home_games}),
+                    ("AWAY", "AWAY", {"summary": summary_for(away_games), "clearance": clearance_for(away_games), "game_log": away_games}),
+                ],
+            )
+        tabs.append(f"<div class='kc-tabpanel kc-tab-{key.lower()}'>{body}</div>")
+    timing = _v266_timing_html(row or {}, p or {}) if "_v266_timing_html" in globals() else ""
+    subtab_css = """
+    <style>
+    .kc-subtabs{position:relative;margin:8px 0}.kc-subtabs>input{position:absolute;opacity:0;pointer-events:none}
+    .kc-subtablabels{display:grid;gap:4px;margin:7px 0}.kc-subtablabels label{cursor:pointer;text-align:center;background:#0d0e18;border:1px solid rgba(255,255,255,.10);border-radius:7px;padding:6px 2px;font-size:8px;font-weight:900;color:#b9b0c6;white-space:normal}
+    .kc-subpanel{display:none}.kc-subtabs input:checked+input+input+input~.kc-subtablabels label,.kc-subtabs input:checked~.kc-subtablabels label{border-color:rgba(255,211,74,.28)}
+    @media(max-width:340px){.kc-subtablabels label{font-size:7px;padding:6px 1px}}
+    </style>
+    """
+    return f"<div class='kc-tabs'>{''.join(inputs)}<div class='kc-tablabels'>{''.join(labels)}</div><div class='kc-tabpanels'>{''.join(tabs)}</div></div>{timing}{subtab_css}"
+
+
+def _v266_timing_html(row, p):
+    def item(keys, default="—"):
+        for source in (row or {}, p or {}):
+            for key in keys:
+                value = source.get(key) if isinstance(source, dict) else None
+                if value not in (None, "", "nan", "NaN"):
+                    return html.escape(str(value))
+        return default
+    cells = [
+        ("Timing profile", item(["timing_profile"])),
+        ("1st inning K", item(["projected_1st_inning_K"])),
+        ("Expected 1st BF", item(["expected_1st_inning_BF"])),
+        ("First 9 BF", item(["K_first_9_BF_avg"])),
+        ("TTO1 K%", item(["TTO1_K_pct"])),
+        ("TTO2 K%", item(["TTO2_K_pct"])),
+        ("K efficiency", item(["K_efficiency_profile"])),
+        ("Workload fit", item(["timing_workload_fit"])),
+        ("Top 3 K env", item(["first_inning_top3_weighted_K_pct"])),
+        ("Lineup shape", item(["lineup_K_shape"])),
+    ]
+    source = item(["first_inning_K_data_source"])
+    confidence = item(["first_inning_K_confidence"])
+    return (
+        "<div class='kc-section' style='margin-top:10px'>"
+        "<div class='kc-section-title'><span>K Timing</span>"
+        f"<span class='kc-chip'>{confidence}</span></div>"
+        f"<div class='kc-auditgrid'>{''.join(f'<div><span>{label}</span><b>{value}</b></div>' for label, value in cells)}</div>"
+        f"<div class='kc-mini-note'>Source: {source}. EARLY_K_TIMING and K_EFFICIENCY are each counted once; projection effect remains validation-gated.</div>"
+        "</div>"
+    )
+
+
+def _v265_threshold_html(row, p):
+    distribution = _v265_json_obj((row or {}).get("Exact Line Distribution") or (p or {}).get("exact_line_distribution_v265"))
+    ladder = distribution.get("ladder") if isinstance(distribution.get("ladder"), dict) else {}
+    cells = []
+    for threshold in range(3, 11):
+        value = ladder.get(f"P({threshold}+ K)")
+        cells.append(f"<div><span>P({threshold}+)</span><b>{_v265_pct_text(value)}</b></div>")
+    return (
+        f"<div class='kc-hstats kc-ladder'>"
+        f"<div class='h-over'><span>P(Over line)</span><b>{_v265_pct_text(distribution.get('over_probability'))}</b></div>"
+        f"<div class='h-under'><span>P(Under line)</span><b>{_v265_pct_text(distribution.get('under_probability'))}</b></div>"
+        f"<div><span>Over needs</span><b>{html.escape(str(distribution.get('required_over_K') or '—'))} K</b></div>"
+        f"<div><span>Distribution sigma</span><b>{html.escape(str(distribution.get('sigma') or '—'))}</b></div>"
+        f"{''.join(cells)}</div>"
+    )
+
+
+def _v265_model_audit_html(row, p):
+    def value(keys, default="—"):
+        for source in (row or {}, p or {}):
+            for key in keys:
+                item = source.get(key) if isinstance(source, dict) else None
+                if item not in (None, "", "nan", "NaN"):
+                    return html.escape(str(item))
+        return default
+
+    audit_cells = [
+        ("Savant", value(["Savant Custom Status", "Official Savant Status", "savant_status"])),
+        ("Data quality", value(["Data Quality Gate", "data_quality_gate_status"])),
+        ("Lineup source", value(["lineup_resolver_source", "Canonical Lineup Status", "lineup_status"])),
+        ("Lineup match", f"{value(['Resolved Hitter Profiles', 'resolved_hitter_count'])}/9"),
+        ("Current PO", value(["po_shadow_projection", "PO Projection", "current_po_projection"])),
+        ("PO side / sync", f"{value(['po_shadow_side', 'PO Side', 'current_po_side'])} · {value(['PO/Merge Sync State', 'po_merge_sync_state'])}"),
+        ("Master core", value(["Master Core Projection", "master_core_projection"])),
+        ("OG shadow", value(["og_shadow_projection", "OG Architecture Projection", "og_architecture_projection"])),
+        ("Merge raw", value(["merge_raw_projection", "Merge Raw Projection", "hybrid_consensus_projection"])),
+        ("Final K", value(["Canonical Final K Projection", "projection"])),
+        ("Low / median / high", f"{value(['Low K Range'])} / {value(['Median K Range'])} / {value(['High K Range'])}"),
+        ("P(Over) / P(Under)", "{}% / {}%".format(value(["P(OVER Today's Line)"]), value(["P(UNDER Today's Line)"]))),
+        ("Model spread", value(["Hybrid Model Spread", "hybrid_model_spread"])),
+        ("Hybrid status", value(["Hybrid Model Status", "hybrid_model_status"])),
+        ("Line guard", value(["Hybrid Line Guard", "hybrid_line_guard_status"])),
+        ("Gate score", value(["Data Quality Score", "data_quality_gate_score"])),
+        ("Final decision", value(["Final Decision State", "final_decision_state"])),
+        ("Projection consistency", value(["Projection Consistency", "projection_consistency"])),
+        ("Rate consistency", value(["Projection Rate Consistency", "projection_rate_consistency"])),
+        ("Workload confidence", value(["workload_context_confidence"])),
+        ("Correlation guard", value(["correlation_guard_applied"])),
+        ("Pitcher profile", value(["pitcher_profile_family"])),
+        ("Lineup K check", value(["lineup_K_reconciliation_state"])),
+        ("Simple / weighted K", f"{value(['simple_lineup_K_pct'])}% / {value(['weighted_lineup_exposure_K_pct'])}%"),
+        ("Component reconciliation", value(["component_reconciliation_state"])),
+        ("Unexplained component", value(["component_unexplained_delta"])),
+        ("PO/Merge comparable", f"line {value(['po_merge_same_line'])} · game {value(['po_merge_same_game'])} · refresh {value(['po_merge_same_refresh_state'])}"),
+        ("Merge/OG comparable", f"line {value(['same_line_merge_og'])} · game {value(['same_game_merge_og'])}"),
+        ("Implied K rate", value(["final_implied_K_rate"])),
+        ("Defensible high rate", value(["defensible_high_K_rate"])),
+        ("Data freshness", value(["data_freshness_state"])),
+        ("Official lineup override", value(["official_lineup_override_active"])),
+        ("Data completeness", f"{value(['data_completeness_state'])} · {value(['data_completeness_score'])}"),
+        ("Line independence", value(["LINE_INDEPENDENCE_TEST"])),
+        ("Deterministic refresh", value(["SAME_INPUT_SAME_PROJECTION"])),
+        ("Order-aware sim", value(["order_aware_status"])),
+        ("Resolver hash", value(["resolver_input_hash"])),
+    ]
+    deltas = [
+        ("Matchup", value(["matchup_delta"])), ("Lineup", value(["lineup_delta"])),
+        ("Workload", value(["workload_delta"])), ("Recent", value(["recent_delta"])),
+        ("Arsenal", value(["arsenal_delta"])), ("Home/Away", value(["home_away_delta"])),
+        ("Other", value(["other_delta"])),
+    ]
+    reason = value(["Final Decision Reason", "final_decision_reason"])
+    history_reason = value(["Why Model Disagrees With History"])
+    return (
+        f"<div class='kc-auditgrid'>{''.join(f'<div><span>{label}</span><b>{item}</b></div>' for label, item in audit_cells)}</div>"
+        f"<div class='kc-deltas'>{''.join(f'<span>{label} <b>{item}</b></span>' for label, item in deltas)}</div>"
+        f"<div class='kc-why'><b>Why this state</b><br>{reason}</div>"
+        f"<div class='kc-why'><b>Why model disagrees with history</b><br>{history_reason}</div>"
+    )
+
+
 
 def _kcard_lineup_html(rows):
     if not rows:
@@ -52135,7 +52514,11 @@ def _kclean_render_player_cards(df, board=None, limit=None):
         .kc-lineup,.kc-arsenal{width:100%;border-collapse:collapse;font-size:12px}.kc-lineup th,.kc-arsenal th{color:#a99fb8;text-align:left;font-size:10px;text-transform:uppercase;padding:6px;border-bottom:1px solid #2b233b}.kc-lineup td,.kc-arsenal td{padding:6px;border-bottom:1px solid #1f1a2b;white-space:nowrap}.kc-lineup td:nth-child(2),.kc-arsenal td:first-child{white-space:normal;font-weight:850}.kc-lineup .hi,.kc-arsenal .hi{color:#35f071}.kc-lineup .lo,.kc-arsenal .lo{color:#ffd34e}.kc-empty{color:#b8adc8;font-size:12px;line-height:1.4}
         .kc-arsenal-top{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-bottom:9px}.kc-arsenal-box{background:rgba(19,17,30,.88);border:1px solid rgba(255,213,74,.18);border-radius:10px;padding:8px;min-width:0;overflow:hidden}.kc-arsenal-box span{display:block;font-size:9px;color:#a99fb8;text-transform:uppercase;font-weight:900}.kc-arsenal-box b{display:block;font-size:16px;margin-top:3px;color:#f9f5ff;line-height:1.12;overflow-wrap:anywhere}.kc-arsenal-box small{font-size:11px;color:#d9c2ff}.kc-arsenal-box.gold b{color:#ffd34e}.kc-arsenal-box.purp b{color:#d06bff}.kc-bars{height:88px;display:flex;align-items:flex-end;gap:7px;border-bottom:1px solid rgba(255,255,255,.32);padding-top:5px}.kc-barcol{flex:1;min-width:18px;border-radius:7px 7px 2px 2px;display:flex;align-items:flex-start;justify-content:center;color:#fff;font-size:11px;font-weight:950;padding-top:4px}.kc-barcol.hit{background:linear-gradient(180deg,#36f06d,#107d32)}.kc-barcol.miss{background:linear-gradient(180deg,#ff5a75,#8b1d2e)}
         .kc-note,.kc-data-note,.kc-data-gate,.kc-verdict,.kc-card-note,.kcard-note{display:none!important;height:0!important;min-height:0!important;margin:0!important;padding:0!important;border:0!important;overflow:hidden!important;font-size:0!important;line-height:0!important}.good{color:#42e878}.warn{color:#ffc247}.bad{color:#ff6b6b}
-        @media(max-width:640px){.kcard-stack{grid-template-columns:1fr}.kc-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.kc-arsenal-top{grid-template-columns:repeat(2,minmax(0,1fr))}.kc-proj{font-size:36px}.kc-lineup{font-size:11px}.kc-lineup th:nth-child(7),.kc-lineup td:nth-child(7){display:none}}
+        .kc-details{background:rgba(10,12,22,.88);border:1px solid rgba(174,78,255,.24);border-radius:12px;margin-top:9px;overflow:hidden}.kc-details summary{cursor:pointer;list-style:none;padding:11px 12px;color:#f5efff;font-size:12px;font-weight:950;text-transform:uppercase;letter-spacing:.02em;display:flex;align-items:center;justify-content:space-between;gap:10px}.kc-details summary::-webkit-details-marker{display:none}.kc-details summary:after{content:'+';color:#ffd34e;font-size:18px;line-height:1}.kc-details[open] summary:after{content:'−'}.kc-detail-body{padding:0 10px 11px}.kc-compact{grid-template-columns:repeat(3,minmax(0,1fr));margin-bottom:0}
+        .kc-auditgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.kc-auditgrid>div{background:#0d0e18;border:1px solid rgba(255,255,255,.08);border-radius:9px;padding:8px;min-width:0}.kc-auditgrid span{display:block;color:#a99fb8;font-size:9px;font-weight:900;text-transform:uppercase}.kc-auditgrid b{display:block;margin-top:3px;font-size:12px;overflow-wrap:anywhere}.kc-deltas{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.kc-deltas span{background:#161225;border:1px solid rgba(255,211,74,.15);border-radius:999px;padding:5px 7px;font-size:10px}.kc-why{margin-top:8px;padding:9px;background:rgba(255,211,74,.06);border-left:3px solid #ffd34e;border-radius:7px;font-size:11px;line-height:1.4}
+        .kc-tabs{position:relative}.kc-tabs>input{position:absolute;opacity:0;pointer-events:none}.kc-tablabels{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:4px;margin-bottom:8px}.kc-tablabels label{cursor:pointer;text-align:center;background:#171321;border:1px solid rgba(255,255,255,.09);border-radius:999px;padding:7px 2px;font-size:10px;font-weight:900;color:#b9b0c6}.kc-tabs input[id$='-h2h']:checked~.kc-tablabels label[for$='-h2h'],.kc-tabs input[id$='-l5']:checked~.kc-tablabels label[for$='-l5'],.kc-tabs input[id$='-l10']:checked~.kc-tablabels label[for$='-l10'],.kc-tabs input[id$='-l20']:checked~.kc-tablabels label[for$='-l20'],.kc-tabs input[id$='-season']:checked~.kc-tablabels label[for$='-season']{background:#5b226f;border-color:#ffd34e;color:#fff}.kc-tabpanel{display:none}.kc-tabs input[id$='-h2h']:checked~.kc-tabpanels .kc-tab-h2h,.kc-tabs input[id$='-l5']:checked~.kc-tabpanels .kc-tab-l5,.kc-tabs input[id$='-l10']:checked~.kc-tabpanels .kc-tab-l10,.kc-tabs input[id$='-l20']:checked~.kc-tabpanels .kc-tab-l20,.kc-tabs input[id$='-season']:checked~.kc-tabpanels .kc-tab-season{display:block}.kc-history-stats,.kc-hstats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.kc-history-stats>div,.kc-hstats>div{background:#0d0e18;border:1px solid rgba(255,255,255,.08);border-radius:8px;padding:7px}.kc-history-stats span,.kc-hstats span{display:block;font-size:9px;color:#a99fb8;text-transform:uppercase;font-weight:900}.kc-history-stats b,.kc-hstats b{display:block;font-size:13px;margin-top:3px}.kc-hstats .h-over{border-color:rgba(46,215,104,.65)}.kc-hstats .h-under{border-color:rgba(255,211,74,.55)}.kc-kstrip{display:flex;gap:5px;overflow-x:auto;padding:8px 0 3px;scrollbar-width:thin}.kc-kchip{flex:0 0 auto;min-width:36px;text-align:center;border-radius:8px;padding:7px 5px;font-size:11px;font-weight:950}.kc-kchip.hit{background:rgba(45,226,102,.16);border:1px solid #2ed768;color:#6bf093}.kc-kchip.miss{background:rgba(255,75,97,.14);border:1px solid #d94c61;color:#ff8393}.kc-game{font-size:10px;color:#c7bed2;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.06);display:flex;justify-content:space-between;gap:8px}.kc-mini-note{font-size:10px;color:#b9b0c6;margin-top:7px;line-height:1.35}.kc-splitbar{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin:8px 0}.kc-splitbar>div,.kc-splitbar>span{background:#0d0e18;border-radius:8px;padding:7px;font-size:10px;text-align:center}.kc-ladder{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}.kc-ladder>div{background:#0d0e18;border:1px solid rgba(255,255,255,.08);border-radius:8px;padding:7px;text-align:center}.kc-ladder span{display:block;font-size:9px;color:#a99fb8}.kc-ladder b{font-size:12px}.kc-lineprob{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:8px}.kc-lineprob>div{border-radius:9px;padding:9px;text-align:center;font-size:11px;font-weight:900}.kc-lineprob .over{background:rgba(45,226,102,.13);border:1px solid #2ed768}.kc-lineprob .under{background:rgba(255,211,74,.10);border:1px solid #d5ad35}
+        @media(max-width:640px){.kcard-stack{grid-template-columns:1fr}.kcard{padding:12px;border-radius:14px}.kc-metrics,.kc-compact{grid-template-columns:repeat(2,minmax(0,1fr))}.kc-arsenal-top{grid-template-columns:repeat(2,minmax(0,1fr))}.kc-proj{font-size:36px}.kc-lineup{font-size:11px}.kc-lineup th:nth-child(n+7),.kc-lineup td:nth-child(n+7){display:none}.kc-name{font-size:19px}.kc-badge{font-size:10px;padding:5px 7px}.kc-tablabels{gap:3px}.kc-tablabels label{font-size:9px;padding:7px 1px}.kc-ladder{grid-template-columns:repeat(2,minmax(0,1fr))}.kc-auditgrid{grid-template-columns:1fr}}
+        @media(max-width:340px){.kc-top{grid-template-columns:auto 1fr}.kc-badge{grid-column:1/-1;justify-self:start}.kc-prow{grid-template-columns:1fr}.kc-side{text-align:left;font-size:19px}.kc-tablabels label{font-size:8px}.kc-history-stats{grid-template-columns:1fr 1fr}}
         </style>
         """
         cards = []
@@ -52156,7 +52539,7 @@ def _kclean_render_player_cards(df, board=None, limit=None):
             line = _kclean_fmt(line_raw, 1)
             proj = _kclean_fmt(proj_raw, 2)
             side, edge, prob, tier = _kclean_card_decision(row)
-            side_class = "over" if side == "OVER" else "under" if side == "UNDER" else "track"
+            side_class = "over" if "OVER" in side else "under" if "UNDER" in side else "track"
             side_txt = html.escape(str(side or "TRACK"))
             prob_txt = "—" if not np.isfinite(prob) else f"{prob:.0f}%"
             prob_width = 0 if not np.isfinite(prob) else max(0, min(100, prob))
@@ -52166,6 +52549,10 @@ def _kclean_render_player_cards(df, board=None, limit=None):
             whiff = _kclean_fmt(_kclean_pick(row, ["Savant Custom Whiff%", "Official Savant Whiff%", "Whiff%", "APP85 PutAway Rate"], ""), 1)
             bf = _kclean_fmt(_kclean_pick(row, ["APP97 Reconciled Expected BF", "Exp BF", "Projected BF"], ""), 1)
             ip = _kclean_fmt(_kclean_pick(row, ["IP Floor", "IP PROJ", "Projected IP", "IP Projection"], ""), 2)
+            first_inning_k = _kclean_fmt(
+                _kclean_pick(row, ["projected_1st_inning_K"], (p or {}).get("projected_1st_inning_K")),
+                2,
+            )
             savant = html.escape(str(_kclean_pick(row, ["Savant Custom Status", "Official Savant Status"], ""))[:24])
             quality = html.escape(str(_kclean_pick(row, ["APP100 Projection Quality"], "—"))[:22])
             qscore = html.escape(str(_kclean_pick(row, ["APP100 Projection Quality Score"], "—")))
@@ -52204,9 +52591,9 @@ def _kclean_render_player_cards(df, board=None, limit=None):
             ).upper()
             # This is a data-integrity status, not a betting decision. Keep the
             # internal PASS_DATA_QUALITY value for audits, but use an unambiguous
-            # public label so the player card never appears to recommend PASS.
+            # public label so it cannot be confused with a canonical betting PASS.
             if quality_gate_raw == "PASS_DATA_QUALITY":
-                quality_gate_public = "DATA VERIFIED"
+                quality_gate_public = "DATA BLOCKED"
             elif quality_gate_raw in {"READY", "GREEN", "VERIFIED"}:
                 quality_gate_public = "DATA READY"
             elif quality_gate_raw in {"CAUTION", "LOW_DATA_REVIEW"}:
@@ -52263,7 +52650,10 @@ def _kclean_render_player_cards(df, board=None, limit=None):
             match_whiff = _kclean_fmt(arsenal.get("weighted_whiff"), 1)
             ceiling_num = _kcard_ceiling_value(row, line=line, proj=proj, arsenal=arsenal)
             ceiling = "—" if not np.isfinite(_kclean_num(ceiling_num, np.nan)) else f"{int(round(float(ceiling_num)))}K"
-            last10_html = _kcard_last10_html(row, p, line)
+            card_id = hashlib.sha256(f"{raw_pitcher}|{raw_matchup}|{line}".encode("utf-8")).hexdigest()[:12]
+            history_html = _v265_recent_history_html(row, p, line, card_id)
+            threshold_html = _v265_threshold_html(row, p)
+            model_audit_html = _v265_model_audit_html(row, p)
             cards.append(f"""
             <div class="kcard">
               <div class="kc-top">
@@ -52278,7 +52668,16 @@ def _kclean_render_player_cards(df, board=None, limit=None):
                 </div>
                 <div class="kc-bar"><div class="kc-fill" style="width:{prob_width:.0f}%"></div></div>
               </div>
-              <div class="kc-section">
+              <div class="kc-metrics kc-compact">
+                <div class="kc-stat"><span>K Grade</span><b>{arsenal_grade}</b></div>
+                <div class="kc-stat"><span>Ceiling</span><b>{ceiling}</b></div>
+                <div class="kc-stat"><span>Pitch K%</span><b>{pk}</b></div>
+                <div class="kc-stat"><span>Opp K%</span><b>{opp_k}</b></div>
+                <div class="kc-stat"><span title="1st Inning Strikeouts">BF / IP / 1st Inning K</span><b>{bf} / {ip} / {first_inning_k}</b></div>
+                <div class="kc-stat"><span>Lineup</span><b>{lineup_display}</b></div>
+              </div>
+              <details class="kc-details">
+                <summary>Pitch Arsenal</summary><div class="kc-detail-body">
                 <div class="kc-arsenal-top">
                   <div class="kc-arsenal-box"><span>K Grade</span><b>{arsenal_grade}</b></div>
                   <div class="kc-arsenal-box gold"><span>Ceiling</span><b>{ceiling}</b></div>
@@ -52287,44 +52686,92 @@ def _kclean_render_player_cards(df, board=None, limit=None):
                 </div>
                 <div class="kc-section-title"><span>{arsenal_signal}</span><span class="kc-chip">Match K {match_k}% · Opp Whiff {match_whiff}%</span></div>
                 {arsenal_rows}
-              </div>
-              <div class="kc-metrics">
-                <div class="kc-stat"><span>Pitch K%</span><b>{pk}</b></div>
-                <div class="kc-stat"><span>Opp K%</span><b>{opp_k}</b></div>
-                <div class="kc-stat"><span>Whiff</span><b>{whiff}</b></div>
-                <div class="kc-stat"><span>BF</span><b>{bf}</b></div>
-                <div class="kc-stat"><span>IP</span><b>{ip}</b></div>
-                <div class="kc-stat"><span>Savant</span><b>{savant or '—'}</b></div>
-                <div class="kc-stat"><span>Quality</span><b>{qscore}</b></div>
-                <div class="kc-stat"><span>BF Gate</span><b>{bf_quality or '—'}</b></div>
-                <div class="kc-stat"><span>Skill</span><b>{recent_skill or '—'}</b></div>
-                <div class="kc-stat"><span>K/9</span><b>{k9}</b></div>
-                <div class="kc-stat"><span>BB/9</span><b>{bb9}</b></div>
-                <div class="kc-stat"><span>ERA/FIP</span><b>{era}/{fip}</b></div>
-                <div class="kc-stat"><span>MASTER Core</span><b>{hybrid_master}</b></div>
-                <div class="kc-stat"><span>OG Shadow</span><b>{hybrid_og}</b></div>
-                <div class="kc-stat"><span>Model Spread</span><b>{hybrid_spread}</b></div>
-                <div class="kc-stat"><span>Hybrid Status</span><b>{hybrid_status}</b></div>
-                <div class="kc-stat"><span>Line Guard</span><b>{hybrid_line_status or '—'}</b></div>
-                <div class="kc-stat"><span>Data Quality</span><b>{quality_gate}</b></div>
-                <div class="kc-stat"><span>Gate Score</span><b>{quality_gate_score}</b></div>
-                <div class="kc-stat"><span>Hitter K Profiles</span><b>{resolved_hitters}</b></div>
-              </div>
-              {last10_html}
-              <div class="kc-section">
+                </div>
+              </details>
+              <details class="kc-details">
+                <summary>Batter-by-Batter</summary><div class="kc-detail-body">
                 <div class="kc-section-title"><span>Batter-by-batter K matchup</span><span class="kc-chip">{lineup_display} · exposure K {avg_lineup_k} · BF {_kclean_fmt(_card_expected_bf, 1)} · order {order_conf_card}% · high-K {high_bats} · low-K {low_bats}</span></div>
                 {lineup_table}
-              </div>
+                </div>
+              </details>
+              <details class="kc-details">
+                <summary>Model Audit / Why This Pick</summary><div class="kc-detail-body">{model_audit_html}</div>
+              </details>
+              <details class="kc-details">
+                <summary>Recent K History</summary><div class="kc-detail-body">{history_html}</div>
+              </details>
+              <details class="kc-details">
+                <summary>H2H / Threshold Ladder</summary><div class="kc-detail-body">{threshold_html}</div>
+              </details>
             </div>
             """)
         html_doc = css + '<div class="kcard-stack">' + "\n".join(cards) + "</div>"
         try:
             import streamlit.components.v1 as components
-            components.html(html_doc, height=max(1000, min(42000, 980 * max(1, len(cards))) + 320), scrolling=True)
+            components.html(html_doc, height=max(900, min(36000, 790 * max(1, len(cards))) + 240), scrolling=True)
         except Exception:
             st.markdown(html_doc, unsafe_allow_html=True)
     except Exception as e:
         st.info(f"K player cards unavailable: {e}")
+
+
+@st.cache_data(show_spinner=False)
+def _v265_mobile_package_bytes():
+    """Return a mobile-safe package without depending on a developer path."""
+    root = Path(__file__).resolve().parent
+    archive_name = "Merge_V2_6_7_MLB_FINAL_MOBILE.zip"
+    prebuilt = root / archive_name
+    if prebuilt.exists() and prebuilt.is_file():
+        payload = prebuilt.read_bytes()
+    else:
+        payload_io = io.BytesIO()
+        with zipfile.ZipFile(payload_io, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+            zf.writestr("app.py", Path(__file__).read_bytes())
+            for name in (
+                "requirements.txt", "runtime.txt", "README_MOBILE.txt",
+                "CHANGE_AUDIT.txt", "TEST_REPORT.txt", "VERSION.txt",
+                "mobile_download.html",
+            ):
+                candidate = root / name
+                if candidate.exists() and candidate.is_file():
+                    zf.writestr(name, candidate.read_bytes())
+        payload = payload_io.getvalue()
+    integrity = "PASS"
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload), "r") as zf:
+            if zf.testzip() is not None or "app.py" not in zf.namelist():
+                integrity = "FAIL"
+    except Exception:
+        integrity = "FAIL"
+    return payload, hashlib.sha256(payload).hexdigest(), integrity
+
+
+def render_v265_download_panel():
+    try:
+        payload, checksum, integrity = _v265_mobile_package_bytes()
+        size_mb = len(payload) / (1024.0 * 1024.0)
+        build_stamp = datetime.fromtimestamp(Path(__file__).stat().st_mtime).astimezone().strftime("%Y-%m-%d %I:%M %p %Z")
+        with st.expander("CURRENT VERIFIED FILES · Merge V2.6.7 MLB", expanded=False):
+            st.markdown("### Engine Downloads")
+            st.caption("Lineup resolver + pitcher profiles + first-inning K + model audit + canonical decision sync")
+            st.markdown(
+                f"**Merge V2.6.7 MLB** · `CURRENT`  \n"
+                f"Package size: **{size_mb:.2f} MB**  \n"
+                f"Archive integrity: **{integrity}**  \n"
+                f"Build: **{build_stamp}**  \n"
+                f"SHA256: `{checksum}`"
+            )
+            st.download_button(
+                "DOWNLOAD MLB ZIP",
+                data=payload,
+                file_name="Merge_V2_6_7_MLB_FINAL_MOBILE.zip",
+                mime="application/zip",
+                use_container_width=True,
+                disabled=integrity != "PASS",
+                key="download_merge_v267_mobile_zip",
+            )
+    except Exception as exc:
+        st.info(f"Mobile package is not available in this runtime: {exc}")
 
 
 def _impl_render_kproj_tab_08(board):
@@ -52365,15 +52812,16 @@ def _impl_render_kproj_tab_08(board):
 
     try:
         total = len(main)
-        fire = int(main["Pick"].astype(str).str.startswith("FIRE").sum())
-        lean = int(main["Pick"].astype(str).str.startswith("LEAN").sum())
-        track = int(main["Pick"].astype(str).str.startswith("TRACK").sum())
-        pass_ct = int(main["Pick"].astype(str).str.startswith("PASS").sum())
+        states = main["Final Decision State"].astype(str) if "Final Decision State" in main else main["Pick"].astype(str)
+        play = int(states.str.startswith("PLAY_").sum())
+        track = int(states.str.startswith("TRACK_").sum())
+        pass_ct = int(states.str.startswith("PASS_").sum())
+        no_line = int(states.eq("NO_LINE").sum())
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Pitchers", total)
-        m2.metric("Fire", fire)
-        m3.metric("Lean", lean)
-        m4.metric("Track/Pass", track + pass_ct)
+        m2.metric("Play", play)
+        m3.metric("Track", track)
+        m4.metric("Pass / No Line", pass_ct + no_line)
     except Exception:
         pass
 
@@ -52887,6 +53335,7 @@ _KSLIP_PREV_RENDER_K = globals().get('_impl_render_kproj_tab_08', globals().get(
 
 
 def _impl_render_kproj_tab_09(board):
+    render_v265_download_panel()
     if _KSLIP_PREV_RENDER_K is not None:
         _KSLIP_PREV_RENDER_K(board)
     try:
@@ -57140,10 +57589,10 @@ def _canonical_k_line(row, board_row=None):
 
 
 def _canonical_k_projection(board_row, row):
-    # The protected core already selected the correct line-independent model
-    # projection for the final side. Do not overwrite it with the raw Merge mean.
+    # The biological mean must be selected before any sportsbook-line resolver.
+    # decision_projection may be a PO-preserved, line-dependent decision aid, so
+    # it is intentionally excluded from the biological projection candidates.
     candidates = [
-        (board_row.get("decision_projection"), "PROTECTED_RESOLVER_FINAL"),
         (board_row.get("hybrid_consensus_projection"), "MASTER_PO_HYBRID_CONSENSUS"),
         (board_row.get("baseball_projection"), "CORE_BASEBALL_PROJECTION"),
         (board_row.get("projection"), "CORE_BOARD_PROJECTION"),
@@ -57378,11 +57827,1507 @@ def _canonicalize_k_table(df, board=None, relock=False):
     return out
 
 
+# =============================================================================
+# MERGE V2.6.5 FINAL STATE ENRICHMENT
+#
+# This layer does not create a second projection engine. It synchronizes model
+# provenance, evaluates the existing final mean at the exact sportsbook line,
+# and emits one final decision state used by every UI/export surface.
+# =============================================================================
+MERGE_V265_RUNTIME_VERSION = "MERGE_V2_6_5_CANONICAL_STATE_2026_08_10"
+MERGE_V265_CONFIG = {
+    "pass_edge_k": 0.25,
+    "track_edge_k": 0.60,
+    "play_probability": 0.59,
+    "track_probability": 0.54,
+    "po_stale_minutes": 45,
+    "component_reconcile_tolerance_k": 0.12,
+    "min_lineup_profiles": 5,
+}
+
+
+def _v265_side_from_projection(projection, line):
+    projection = _canonical_k_num(projection, None)
+    line = _canonical_k_num(line, None)
+    if projection is None or line is None:
+        return ""
+    return "OVER" if projection > line else "UNDER"
+
+
+def _v265_state_side(state):
+    text = str(state or "").upper()
+    if text.endswith("_OVER") or " OVER" in text:
+        return "OVER"
+    if text.endswith("_UNDER") or " UNDER" in text:
+        return "UNDER"
+    return ""
+
+
+def _v265_state_display(state):
+    state = str(state or "NO_LINE").upper()
+    labels = {
+        "PLAY_OVER": "PLAY OVER",
+        "PLAY_UNDER": "PLAY UNDER",
+        "TRACK_OVER": "TRACK OVER",
+        "TRACK_UNDER": "TRACK UNDER",
+        "PASS_THIN_EDGE": "PASS - THIN EDGE",
+        "PASS_MODEL_CONFLICT": "PASS - MODEL CONFLICT",
+        "PASS_PO_PROTECTION": "PASS - PO CONFLICT",
+        "PASS_LINEUP_UNCERTAINTY": "PASS - LINEUP UNCERTAIN",
+        "PASS_WORKLOAD_UNCERTAINTY": "PASS - WORKLOAD UNCERTAIN",
+        "PASS_DATA_INCOMPLETE": "PASS - DATA INCOMPLETE",
+        "NO_LINE": "NO LINE",
+    }
+    return labels.get(state, state.replace("_", " "))
+
+
+def _v265_iso_timestamp(value):
+    if value in (None, "", "None", "nan", "NaN"):
+        return None
+    try:
+        text = str(value).replace("Z", "+00:00")
+        return datetime.fromisoformat(text)
+    except Exception:
+        return None
+
+
+def _v265_exact_line_distribution(mean_k, line, history_std=None):
+    """Continuity-corrected count distribution around the existing final mean."""
+    mean_k = _canonical_k_num(mean_k, None)
+    line = _canonical_k_num(line, None)
+    if mean_k is None:
+        return {"status": "UNAVAILABLE", "ladder": {}}
+    hist_sigma = _canonical_k_num(history_std, None)
+    poisson_sigma = math.sqrt(max(0.35, mean_k))
+    sigma = poisson_sigma if hist_sigma is None else 0.55 * poisson_sigma + 0.45 * hist_sigma
+    sigma = float(clamp(sigma, 1.05, 3.25))
+
+    def p_at_least(threshold):
+        z = (float(threshold) - 0.5 - mean_k) / sigma
+        return float(clamp(0.5 * math.erfc(z / math.sqrt(2.0)), 0.001, 0.999))
+
+    ladder = {f"P({threshold}+ K)": round(p_at_least(threshold), 4) for threshold in range(3, 11)}
+    required = None if line is None else int(math.floor(line) + 1)
+    over_probability = None if required is None else p_at_least(required)
+    return {
+        "status": "READY" if line is not None else "NO_LINE",
+        "mean": round(mean_k, 3),
+        "low_K": round(max(0.0, mean_k - 1.28 * sigma), 2),
+        "median_K": round(mean_k, 2),
+        "high_K": round(mean_k + 1.28 * sigma, 2),
+        "sigma": round(sigma, 3),
+        "required_over_K": required,
+        "under_max_K": None if required is None else required - 1,
+        "over_probability": None if over_probability is None else round(over_probability, 4),
+        "under_probability": None if over_probability is None else round(1.0 - over_probability, 4),
+        "ladder": ladder,
+    }
+
+
+def _v265_matchup_identity(value):
+    """Normalize matchup text without assuming home/away display order."""
+    text_value = str(value or "").upper().strip()
+    for token in (" VS. ", " VS ", " AT ", " @ "):
+        text_value = text_value.replace(token, "|")
+    parts = []
+    for part in text_value.split("|"):
+        cleaned = "".join(ch for ch in part if ch.isalnum()).strip()
+        if cleaned:
+            try:
+                cleaned = str(_rw_norm_team_abbr(cleaned) or cleaned).upper()
+            except Exception:
+                cleaned = cleaned.upper()
+            parts.append(cleaned)
+    return tuple(sorted(parts[:2])) if len(parts) >= 2 else tuple(parts)
+
+
+def _v265_model_sync(row, board_row, projection, line):
+    now = california_now()
+    matchup = str(row.get("Matchup") or board_row.get("matchup") or "").strip().upper()
+    po_projection = _canonical_k_num(
+        board_row.get("current_po_projection"),
+        _canonical_k_num(row.get("PO Projection"), None),
+    )
+    po_line = _canonical_k_num(
+        board_row.get("current_po_line"),
+        _canonical_k_num(board_row.get("po_shadow_line"), _canonical_k_num(row.get("PO Line"), None)),
+    )
+    po_side = str(board_row.get("current_po_side") or row.get("PO Side") or "").upper().strip()
+    if po_side not in {"OVER", "UNDER"}:
+        po_side = _v265_side_from_projection(po_projection, po_line)
+    merge_raw = _canonical_k_num(
+        board_row.get("hybrid_consensus_projection"),
+        _canonical_k_num(row.get("Merge Raw Projection"), projection),
+    )
+    merge_side = _v265_side_from_projection(merge_raw, line)
+    og_projection = _canonical_k_num(
+        board_row.get("og_architecture_projection"),
+        _canonical_k_num(row.get("OG Architecture Projection"), None),
+    )
+    og_line = _canonical_k_num(board_row.get("og_shadow_line"), _canonical_k_num(row.get("OG Line"), None))
+    og_side = _v265_side_from_projection(og_projection, og_line)
+    po_ts_raw = (
+        board_row.get("current_po_timestamp") or board_row.get("po_shadow_timestamp")
+        or row.get("PO Timestamp") or row.get("Pregame Timestamp")
+    )
+    merge_ts_raw = (
+        board_row.get("projection_timestamp") or board_row.get("merge_timestamp")
+        or row.get("Pregame Timestamp") or st.session_state.get("last_refresh_time")
+    )
+    po_ts = _v265_iso_timestamp(po_ts_raw)
+    merge_ts = _v265_iso_timestamp(merge_ts_raw)
+    # A PO value stored on the already pitcher/game-resolved board row inherits
+    # that row's matchup when an older snapshot omitted its duplicate label.
+    po_matchup = str(board_row.get("current_po_matchup") or board_row.get("po_shadow_matchup") or row.get("PO Matchup") or matchup).strip().upper()
+    og_matchup = str(board_row.get("og_shadow_matchup") or row.get("OG Matchup") or matchup).strip().upper()
+    matchup_key = _v265_matchup_identity(matchup)
+    po_matchup_key = _v265_matchup_identity(po_matchup)
+    og_matchup_key = _v265_matchup_identity(og_matchup)
+    same_line = bool(po_line is not None and line is not None and abs(po_line - line) < 0.001)
+    same_game = bool(matchup_key and po_matchup_key and matchup_key == po_matchup_key)
+    same_line_merge_og = bool(line is not None and og_line is not None and abs(line - og_line) < 0.001)
+    same_line_po_og = bool(po_line is not None and og_line is not None and abs(po_line - og_line) < 0.001)
+    same_game_merge_og = bool(matchup_key and og_matchup_key and matchup_key == og_matchup_key)
+    same_game_po_og = bool(po_matchup_key and og_matchup_key and po_matchup_key == og_matchup_key)
+    stale = False
+    if po_ts is not None and merge_ts is not None:
+        try:
+            stale = abs((merge_ts - po_ts).total_seconds()) > MERGE_V265_CONFIG["po_stale_minutes"] * 60
+        except Exception:
+            stale = False
+    elif po_projection is not None and po_ts_raw in (None, ""):
+        stale = True
+    if po_projection is None or po_side not in {"OVER", "UNDER"} or po_line is None or not po_matchup:
+        po_state = "CURRENT_PO_UNAVAILABLE"
+    elif not same_game:
+        po_state = "CURRENT_PO_UNAVAILABLE"
+    elif not same_line:
+        po_state = "CURRENT_PO_LINE_MISMATCH"
+    elif stale:
+        po_state = "CURRENT_PO_STALE"
+    elif po_side == _v265_side_from_projection(projection, line):
+        po_state = "CURRENT_PO_AGREEMENT"
+    else:
+        po_state = "CURRENT_PO_DISAGREEMENT"
+    merge_po_comparable = bool(same_line and same_game and not stale and merge_side and po_side)
+    merge_og_comparable = bool(same_line_merge_og and same_game_merge_og and merge_side and og_side)
+    po_og_comparable = bool(same_line_po_og and same_game_po_og and not stale and po_side and og_side)
+    if (
+        (po_projection is not None and not merge_po_comparable)
+        or (og_projection is not None and not merge_og_comparable)
+    ):
+        agreement = "LINE_MISMATCH_NOT_COMPARABLE"
+    elif merge_po_comparable and merge_og_comparable and po_og_comparable and merge_side == po_side == og_side:
+        agreement = "THREE_WAY_AGREEMENT"
+    elif merge_po_comparable and merge_side == po_side:
+        agreement = "MERGE_PO_AGREE"
+    elif merge_og_comparable and merge_side == og_side:
+        agreement = "MERGE_OG_AGREE"
+    elif po_og_comparable and po_side == og_side:
+        agreement = "PO_OG_AGREE"
+    else:
+        agreement = "THREE_WAY_CONFLICT"
+    payload = {
+        "pitcher": normalize_name(row.get("Pitcher") or board_row.get("pitcher") or ""),
+        "matchup": matchup,
+        "matchup_key": matchup_key,
+        "po_matchup": po_matchup,
+        "po_matchup_key": po_matchup_key,
+        "line": line,
+        "po_line": po_line,
+        "po_projection": po_projection,
+        "po_timestamp": str(po_ts_raw or ""),
+        "merge_raw": merge_raw,
+        "merge_timestamp": str(merge_ts_raw or ""),
+        "lineup": str(board_row.get("lineup_status") or row.get("Canonical Lineup Status") or ""),
+    }
+    resolver_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:20]
+    return {
+        "po_shadow_projection": po_projection,
+        "po_shadow_side": po_side,
+        "po_shadow_line": po_line,
+        "po_shadow_timestamp": str(po_ts_raw or ""),
+        "merge_raw_projection": merge_raw,
+        "merge_raw_side": merge_side,
+        "merge_line": line,
+        "merge_timestamp": str(merge_ts_raw or now.isoformat()),
+        "og_shadow_projection": og_projection,
+        "og_shadow_side": og_side,
+        "og_shadow_line": og_line,
+        "resolver_input_hash": resolver_hash,
+        "resolver_timestamp": now.isoformat(),
+        "po_merge_same_line": same_line,
+        "po_merge_same_game": same_game,
+        "po_merge_same_refresh_state": bool(not stale and po_ts is not None and merge_ts is not None),
+        "po_merge_sync_state": po_state,
+        "same_line_merge_po": same_line,
+        "same_line_merge_og": same_line_merge_og,
+        "same_line_po_og": same_line_po_og,
+        "same_game_merge_og": same_game_merge_og,
+        "same_game_po_og": same_game_po_og,
+        "merge_po_comparable": merge_po_comparable,
+        "merge_og_comparable": merge_og_comparable,
+        "po_og_comparable": po_og_comparable,
+        "model_agreement_state": agreement,
+    }
+
+
+def _v265_rate(value):
+    value = _canonical_k_num(value, None)
+    if value is None:
+        return None
+    return float(value / 100.0 if value > 1.0 else value)
+
+
+def _v265_projection_rate_guard(row, board_row, projection):
+    bf = _canonical_k_num(
+        board_row.get("expected_bf"),
+        _canonical_k_num(row.get("Canonical Expected BF"), _canonical_k_num(row.get("Exp BF"), None)),
+    )
+    implied = None if bf is None or bf <= 0 else float(projection) / float(bf)
+    anchors = []
+    for value in [
+        board_row.get("pitcher_k"), row.get("Canonical Pitcher K%"), row.get("Pitcher K%"),
+        board_row.get("recent_pitcher_k_pct"), row.get("Recent Pitcher K%"),
+        board_row.get("opp_k"), row.get("Canonical Opponent K%"), row.get("Opponent K% vs Pitcher Hand"),
+        board_row.get("underdog_current_model_k_pct"), row.get("Current Expected Lineup K%"),
+        board_row.get("l30_hand_k"), row.get("Opponent L30 K% vs Hand"),
+        board_row.get("arsenal_matchup_k_pct"), row.get("Arsenal Matchup K%"),
+    ]:
+        rate = _v265_rate(value)
+        if rate is not None and 0.05 <= rate <= 0.55:
+            anchors.append(rate)
+    anchor_high = max(anchors) if anchors else None
+    pitcher_anchor = _v265_rate(
+        board_row.get("pitcher_k") if board_row.get("pitcher_k") is not None else row.get("Canonical Pitcher K%")
+    )
+    whiff = _v265_rate(board_row.get("statcast_whiff") or row.get("Official Savant Whiff%") or row.get("Savant Custom Whiff%"))
+    csw = _v265_rate(board_row.get("statcast_csw") or row.get("Official Savant CSW%"))
+    putaway = _v265_rate(board_row.get("statcast_putaway") or row.get("APP85 PutAway Rate"))
+    skill_support = sum(
+        value is not None and value >= threshold
+        for value, threshold in ((pitcher_anchor, 0.275), (whiff, 0.29), (csw, 0.30), (putaway, 0.24))
+    )
+    margin = 0.105 if skill_support >= 3 else 0.085 if skill_support >= 2 else 0.065
+    defensible_high = None if anchor_high is None else float(clamp(anchor_high + margin, 0.28, 0.48))
+    if implied is None:
+        status = "UNAVAILABLE"
+    elif implied >= 0.50 or (defensible_high is not None and implied > defensible_high + 0.035):
+        status = "IMPLAUSIBLE"
+    elif implied >= 0.44 or (defensible_high is not None and implied > defensible_high + 0.015):
+        status = "EXTREME"
+    elif implied >= 0.36 or (defensible_high is not None and implied > defensible_high):
+        status = "ELEVATED"
+    else:
+        status = "NORMAL"
+    model_projections = {
+        "master_core_implied_K_rate": _canonical_k_num(board_row.get("master_core_projection"), None),
+        "po_shadow_implied_K_rate": _canonical_k_num(board_row.get("current_po_projection"), None),
+        "og_shadow_implied_K_rate": _canonical_k_num(board_row.get("og_architecture_projection"), None),
+        "merge_raw_implied_K_rate": _canonical_k_num(board_row.get("hybrid_consensus_projection"), None),
+    }
+    model_rates = {
+        key: None if value is None or bf is None or bf <= 0 else round(float(value) / float(bf), 4)
+        for key, value in model_projections.items()
+    }
+    return {
+        "projected_bf": bf,
+        "final_implied_K_rate": None if implied is None else round(implied, 4),
+        "projection_rate_anchor_high": None if anchor_high is None else round(anchor_high, 4),
+        "projection_rate_defensible_high": None if defensible_high is None else round(defensible_high, 4),
+        "projection_rate_skill_support_count": int(skill_support),
+        "projection_rate_consistency": status,
+        "PROJECTION_RATE_CONFLICT": status in {"EXTREME", "IMPLAUSIBLE"},
+        **model_rates,
+    }
+
+
+def _v265_history_context(row, board_row):
+    context = board_row.get("k_history_context_v256") or row.get("K History Context") or {}
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except Exception:
+            context = {}
+    return context if isinstance(context, dict) else {}
+
+
+def _v265_projection_consistency(row, board_row, projection, line, sync, distribution):
+    side = _v265_side_from_projection(projection, line)
+    comparable = [sync.get("merge_raw_side")]
+    if sync.get("merge_po_comparable"):
+        comparable.append(sync.get("po_shadow_side"))
+    if sync.get("merge_og_comparable"):
+        comparable.append(sync.get("og_shadow_side"))
+    comparable = [value for value in comparable if value in {"OVER", "UNDER"}]
+    opposing_models = sum(1 for value in comparable if value != side)
+    history = _v265_history_context(row, board_row)
+    clearance = history.get("clearance") if isinstance(history.get("clearance"), dict) else {}
+    l10 = clearance.get("L10") if isinstance(clearance.get("L10"), dict) else {}
+    l10_over = _canonical_k_num(l10.get("over"), None)
+    history_side = "OVER" if l10_over is not None and l10_over >= 0.70 else "UNDER" if l10_over is not None and l10_over <= 0.30 else ""
+    recent_skill = str(history.get("recent_k_skill_trend") or board_row.get("recent_skill_status") or "").upper()
+    history_conflict = bool(history_side and side and history_side != side)
+    skill_conflict = bool(
+        (side == "UNDER" and recent_skill in {"IMPROVING", "STRONG_REBOUND_SIGNAL", "HIGH_UPSIDE_BREAKOUT_PROFILE"})
+        or (side == "OVER" and recent_skill == "DECLINING")
+    )
+    bf = _canonical_k_num(board_row.get("expected_bf"), _canonical_k_num(row.get("Canonical Expected BF"), None))
+    pitcher_rate = _v265_rate(board_row.get("pitcher_k") or row.get("Canonical Pitcher K%"))
+    lineup_rate = _v265_rate(board_row.get("underdog_current_model_k_pct") or row.get("Current Expected Lineup K%"))
+    skill_mean = None if bf is None or pitcher_rate is None else bf * pitcher_rate
+    matchup_mean = None
+    if bf is not None and pitcher_rate is not None and lineup_rate is not None:
+        matchup_mean = bf * (0.62 * pitcher_rate + 0.38 * lineup_rate)
+    skill_side = _v265_side_from_projection(skill_mean, line)
+    matchup_side = _v265_side_from_projection(matchup_mean, line)
+    independent_conflicts = sum(
+        signal in {"OVER", "UNDER"} and signal != side
+        for signal in (skill_side, matchup_side, history_side)
+    )
+    supporting_families = sum(
+        signal in {"OVER", "UNDER"} and signal == side
+        for signal in (skill_side, matchup_side, history_side)
+    )
+    rate_state = str(board_row.get("projection_rate_consistency") or "")
+    score = 100.0
+    score -= opposing_models * 16.0
+    score -= independent_conflicts * 9.0
+    score -= 8.0 if history_conflict else 0.0
+    score -= 12.0 if skill_conflict else 0.0
+    if rate_state in {"EXTREME", "IMPLAUSIBLE"}:
+        score -= 24.0
+    over_prob = _canonical_k_num(distribution.get("over_probability"), None)
+    if over_prob is not None and 0.47 <= over_prob <= 0.53:
+        score -= 10.0
+    score = float(clamp(score, 0.0, 100.0))
+    state = "CONSISTENT" if score >= 78 else "MILD_CONFLICT" if score >= 62 else "STRONG_CONFLICT" if score >= 42 else "SEVERE_CONFLICT"
+    if l10_over is not None and l10_over >= 0.60:
+        result_signal = "HISTORY_SUPPORTS_OVER"
+    elif l10_over is not None and l10_over <= 0.40:
+        result_signal = "HISTORY_SUPPORTS_UNDER"
+    else:
+        result_signal = "HISTORY_MIXED"
+    if recent_skill == "IMPROVING":
+        skill_signal = "SKILL_SUPPORTS_OVER"
+    elif recent_skill == "DECLINING":
+        skill_signal = "SKILL_SUPPORTS_UNDER"
+    else:
+        skill_signal = "SKILL_NEUTRAL"
+    return {
+        "projection_consistency_score": round(score, 1),
+        "projection_consistency": state,
+        "historical_result_signal": result_signal,
+        "underlying_skill_signal": skill_signal,
+        "history_model_conflict": history_conflict,
+        "history_skill_conflict": skill_conflict,
+        "opposing_model_count": opposing_models,
+        "comparable_model_count": len(comparable),
+        "skill_implied_side": skill_side,
+        "matchup_implied_side": matchup_side,
+        "independent_conflicting_signal_families": independent_conflicts,
+        "independent_supporting_signal_families": supporting_families,
+    }
+
+
+def _v265_component_audit(row, board_row, projection):
+    master = _canonical_k_num(board_row.get("master_core_projection"), _canonical_k_num(row.get("Master Core Projection"), projection))
+    final_minus_master = None if master is None else round(projection - master, 3)
+    lineup_delta = _canonical_k_num(
+        board_row.get("lineup_adjustment_k"),
+        _canonical_k_num(board_row.get("confirmed_lineup_projection_delta"), _canonical_k_num(row.get("Lineup Projection Delta"), 0.0)),
+    ) or 0.0
+    workload_delta = _canonical_k_num(board_row.get("workload_adjustment_k"), _canonical_k_num(row.get("Projected BF Learning Adj"), 0.0)) or 0.0
+    recent_delta = _canonical_k_num(board_row.get("recent_skill_adjustment_k"), _canonical_k_num(row.get("Recent Skill Adjustment"), 0.0)) or 0.0
+    arsenal_delta = _canonical_k_num(board_row.get("arsenal_adjustment_k"), _canonical_k_num(row.get("Pitch Arsenal Support Adj"), 0.0)) or 0.0
+    matchup_delta = _canonical_k_num(board_row.get("matchup_adjustment_k"), _canonical_k_num(row.get("Matchup Intel K Nudge"), 0.0)) or 0.0
+    home_away_delta = _canonical_k_num(board_row.get("home_away_adjustment_k"), 0.0) or 0.0
+    po_preservation_delta = _canonical_k_num(board_row.get("po_preservation_delta"), 0.0) or 0.0
+    og_rescue_delta = _canonical_k_num(board_row.get("og_rescue_delta"), 0.0) or 0.0
+    other_delta = _canonical_k_num(
+        board_row.get("other_adjustment_k"),
+        _canonical_k_num(row.get("Other Projection Adjustment"), 0.0),
+    ) or 0.0
+    known = (
+        lineup_delta + workload_delta + recent_delta + arsenal_delta + matchup_delta
+        + home_away_delta + po_preservation_delta + og_rescue_delta + other_delta
+    )
+    unexplained = None if final_minus_master is None else final_minus_master - known
+    error = unexplained
+    components = {
+        "matchup_delta": round(matchup_delta, 3),
+        "lineup_delta": round(lineup_delta, 3),
+        "workload_delta": round(workload_delta, 3),
+        "recent_delta": round(recent_delta, 3),
+        "arsenal_delta": round(arsenal_delta, 3),
+        "home_away_delta": round(home_away_delta, 3),
+        "PO_preservation_delta": round(po_preservation_delta, 3),
+        "OG_rescue_delta": round(og_rescue_delta, 3),
+        "other_delta": round(other_delta, 3),
+        "component_unexplained_delta": None if unexplained is None else round(unexplained, 3),
+    }
+    contribution_values = [
+        matchup_delta, lineup_delta, workload_delta, recent_delta, arsenal_delta,
+        home_away_delta, po_preservation_delta, og_rescue_delta, other_delta,
+    ]
+    abs_values = sorted([abs(value) for value in contribution_values], reverse=True)
+    total_abs = sum(abs_values)
+    single_share = 0.0 if total_abs <= 0 else abs_values[0] / total_abs
+    return {
+        "final_minus_master": final_minus_master,
+        "final_minus_po": None if _canonical_k_num(board_row.get("current_po_projection"), None) is None else round(projection - float(board_row.get("current_po_projection")), 3),
+        "final_minus_og": None if _canonical_k_num(board_row.get("og_architecture_projection"), None) is None else round(projection - float(board_row.get("og_architecture_projection")), 3),
+        **components,
+        "component_reconciliation_error": None if error is None else round(error, 4),
+        "COMPONENT_RECONCILIATION_ERROR": bool(error is not None and abs(error) > MERGE_V265_CONFIG["component_reconcile_tolerance_k"]),
+        "largest_component_abs_delta": round(abs_values[0], 3) if abs_values else 0.0,
+        "second_largest_component_abs_delta": round(abs_values[1], 3) if len(abs_values) > 1 else 0.0,
+        "single_factor_share": round(single_share, 3),
+        "SINGLE_FACTOR_DOMINANCE": bool(single_share >= 0.72 and abs_values and abs_values[0] >= 0.75),
+    }
+
+
+def _v265_final_decision(row, board_row, projection, line, distribution, sync, consistency, rate_guard):
+    if line is None or projection is None:
+        return "NO_LINE", "No synchronized Underdog strikeout line is available."
+    side = _v265_side_from_projection(projection, line)
+    edge = float(projection - line)
+    abs_edge = abs(edge)
+    side_probability = distribution.get("over_probability") if side == "OVER" else distribution.get("under_probability")
+    side_probability = _canonical_k_num(side_probability, 0.5)
+    guard = str(board_row.get("hybrid_line_guard_status") or row.get("Hybrid Line Guard") or "").upper()
+    guard_reason = str(board_row.get("hybrid_line_guard_reason") or row.get("Hybrid Line Guard Reason") or "")
+    lineup_status = str(board_row.get("lineup_status") or row.get("Canonical Lineup Status") or "").upper()
+    resolved_hitters = safe_int(board_row.get("resolved_hitter_count"), safe_int(row.get("Resolved Hitter Profiles"), 0)) or 0
+    workload_label = str(board_row.get("workload_context_confidence") or board_row.get("bf_quality") or row.get("APP100 BF Coverage") or "").upper()
+    role_status = str(board_row.get("role_status") or board_row.get("role_signal") or row.get("Open/Bulk Role Signal 2.1") or "").upper()
+    data_quality_status = str(board_row.get("data_quality_gate_status") or row.get("Data Quality Gate") or "").upper()
+    hard_reasons = board_row.get("data_quality_hard_reasons") or []
+    if isinstance(hard_reasons, str):
+        hard_reasons = [hard_reasons]
+    hard_reason_text = "; ".join(str(reason) for reason in hard_reasons if reason)
+
+    if data_quality_status == "PASS_DATA_QUALITY":
+        reason_upper = hard_reason_text.upper()
+        if "HITTER" in reason_upper or "LINEUP" in reason_upper:
+            return "PASS_LINEUP_UNCERTAINTY", hard_reason_text or "The active lineup did not resolve enough hitter K profiles."
+        if "ROLE" in reason_upper or "STARTER" in reason_upper or "BF" in reason_upper:
+            return "PASS_WORKLOAD_UNCERTAINTY", hard_reason_text or "The current role/workload inputs are incomplete."
+        return "PASS_MODEL_CONFLICT", hard_reason_text or "A required pregame data source failed its hard quality gate."
+    if resolved_hitters and resolved_hitters < MERGE_V265_CONFIG["min_lineup_profiles"]:
+        return "PASS_LINEUP_UNCERTAINTY", f"Only {resolved_hitters}/9 hitter K profiles resolved ({lineup_status or 'UNKNOWN'})."
+    if any(token in role_status for token in ("OPENER", "BULK_UNKNOWN", "SHORT_ROLE")) or "LOW" in workload_label:
+        return "PASS_WORKLOAD_UNCERTAINTY", f"Role/workload is not stable enough ({role_status or workload_label or 'UNKNOWN'})."
+    if rate_guard.get("projection_rate_consistency") == "IMPLAUSIBLE":
+        return "PASS_MODEL_CONFLICT", "Final implied K/BF is not supported by pitcher, lineup, or opponent rate anchors."
+    if consistency.get("projection_consistency") == "SEVERE_CONFLICT":
+        return "PASS_MODEL_CONFLICT", "Independent model/skill/history families are in severe conflict."
+    if sync.get("po_merge_sync_state") == "CURRENT_PO_DISAGREEMENT" and consistency.get("projection_consistency") in {"STRONG_CONFLICT", "SEVERE_CONFLICT"}:
+        return "PASS_PO_PROTECTION", "Current PO and Merge disagree on the same synchronized line without enough independent support to resolve it."
+    if guard.startswith("PASS") or "PRESERVE_FIRST" in guard or "CONFLICT" in guard:
+        if abs_edge < MERGE_V265_CONFIG["track_edge_k"]:
+            return "PASS_THIN_EDGE", guard_reason or guard
+        return "PASS_MODEL_CONFLICT", guard_reason or guard
+    if abs_edge < MERGE_V265_CONFIG["pass_edge_k"] or side_probability < MERGE_V265_CONFIG["track_probability"]:
+        return "PASS_THIN_EDGE", f"Edge {edge:+.2f} K; exact-line side probability {side_probability:.1%}."
+    if abs_edge < MERGE_V265_CONFIG["track_edge_k"] or side_probability < MERGE_V265_CONFIG["play_probability"] or consistency.get("projection_consistency") == "STRONG_CONFLICT":
+        return f"TRACK_{side}", f"Directional edge remains review-only: {edge:+.2f} K, {side_probability:.1%} exact-line probability."
+    return f"PLAY_{side}", f"Exact-line probability {side_probability:.1%}; edge {edge:+.2f} K with {consistency.get('projection_consistency', 'UNKNOWN')} model context."
+
+
+def _v265_stat_provenance(row, board_row):
+    as_of = str(board_row.get("projection_timestamp") or row.get("Pregame Timestamp") or california_now().isoformat())
+    season_sample = safe_int(board_row.get("season_bf"), safe_int(row.get("Season BF"), None))
+    provenance = {
+        "pitcher_K_pct": {"source": str(board_row.get("pitcher_k_source") or row.get("Pitcher K Source") or "UNKNOWN"), "stat_window": "SEASON", "sample_size": season_sample, "as_of_timestamp": as_of},
+        "pitcher_K9": {"source": str(board_row.get("pitcher_k_source") or row.get("Pitcher K Source") or "UNKNOWN"), "stat_window": str(board_row.get("pitcher_k9_window") or "SEASON"), "sample_size": season_sample, "as_of_timestamp": as_of},
+        "pitcher_ERA": {"source": str(board_row.get("pitcher_run_prevention_source") or "MLB"), "stat_window": str(board_row.get("pitcher_era_window") or "SEASON"), "sample_size": safe_int(board_row.get("season_ip"), None), "as_of_timestamp": as_of},
+        "pitcher_FIP": {"source": str(board_row.get("pitcher_run_prevention_source") or "MLB"), "stat_window": str(board_row.get("pitcher_fip_window") or "SEASON"), "sample_size": safe_int(board_row.get("season_ip"), None), "as_of_timestamp": as_of},
+        "opponent_K_pct_vs_hand": {"source": str(board_row.get("opp_k_source") or row.get("Opp K Source") or "UNKNOWN"), "stat_window": "SEASON_VS_HAND", "sample_size": safe_int(board_row.get("opp_k_pa"), None), "as_of_timestamp": as_of},
+        "lineup_weighted_K_pct": {"source": str(board_row.get("lineup_resolver_source") or board_row.get("lineup_status") or "UNKNOWN"), "stat_window": "CURRENT_EXPECTED_OR_CONFIRMED_NINE", "sample_size": safe_int(board_row.get("resolved_hitter_count"), None), "as_of_timestamp": as_of},
+    }
+    source_fallback = any("FALLBACK" in str(item.get("source") or "").upper() for item in provenance.values())
+    tiny_sample = any(item.get("sample_size") is not None and item.get("sample_size") < 5 for item in provenance.values())
+    return provenance, source_fallback, tiny_sample
+
+
+def _v265_role_context(row, board_row):
+    role = str(board_row.get("role_status") or board_row.get("role_signal") or row.get("Open/Bulk Role Signal 2.1") or "UNKNOWN").upper()
+    days_rest = _canonical_k_num(board_row.get("days_rest"), _canonical_k_num(row.get("Days Rest"), None))
+    pitch_trend = str(board_row.get("recent_pitch_count_trend") or row.get("Pitch Count Trend") or "UNKNOWN")
+    bf_trend = str(board_row.get("recent_bf_trend") or row.get("BF Trend") or "UNKNOWN")
+    ip_trend = str(board_row.get("recent_ip_trend") or row.get("IP Trend") or "UNKNOWN")
+    pitch_limit = _canonical_k_num(board_row.get("known_pitch_limit"), None)
+    return_from_injury = bool(board_row.get("return_from_injury") or False)
+    tandem_risk = str(board_row.get("tandem_risk") or "UNKNOWN").upper()
+    confidence = str(board_row.get("workload_context_confidence") or row.get("APP100 BF Coverage") or "UNKNOWN").upper()
+    if any(token in role for token in ("OPENER", "BULK_UNKNOWN", "SHORT_ROLE")) or return_from_injury or tandem_risk == "HIGH":
+        confidence = "LOW"
+    elif confidence in {"", "UNKNOWN"} and role in {"STARTER", "ROLE_NORMAL", "NORMAL"}:
+        confidence = "MEDIUM"
+    return {
+        "role_status": role,
+        "days_rest": days_rest,
+        "recent_pitch_count_trend": pitch_trend,
+        "recent_BF_trend": bf_trend,
+        "recent_IP_trend": ip_trend,
+        "known_pitch_limit": pitch_limit,
+        "return_from_injury": return_from_injury,
+        "tandem_risk": tandem_risk,
+        "workload_context_confidence": confidence,
+    }
+
+
+def _v265_signal_family_audit(row, board_row, components, consistency):
+    families = {
+        "PITCHER_SKILL": 1.00,
+        "WORKLOAD": 1.00,
+        "LINEUP": 1.00,
+        "TEAM_K_ENVIRONMENT": 0.75,
+        "RECENT_SKILL": 0.75,
+        "RECENT_RESULTS": 0.35,
+        "ARSENAL": 0.65,
+        "H2H": 0.20,
+        "HOME_AWAY": 0.20,
+        "SHADOW_MODELS": 0.55,
+    }
+    correlated_recent = sum(bool(board_row.get(key)) for key in (
+        "recent_k_pct", "recent_whiff_pct", "recent_csw_pct", "recent_swstr_pct",
+        "recent_putaway_pct", "l5_over_rate", "l10_over_rate",
+    ))
+    correlated_matchup = sum(bool(board_row.get(key)) for key in (
+        "opp_k", "l30_hand_k", "underdog_current_model_k_pct", "arsenal_matchup_k_pct",
+    ))
+    applied = correlated_recent > 2 or correlated_matchup > 2
+    independent_support = 0
+    for key in ("lineup_delta", "workload_delta", "recent_delta", "arsenal_delta", "matchup_delta", "home_away_delta"):
+        if abs(_canonical_k_num(components.get(key), 0.0) or 0.0) >= 0.10:
+            independent_support += 1
+    return {
+        "signal_family": json.dumps(families, sort_keys=True),
+        "signal_family_weight": json.dumps(families, sort_keys=True),
+        "correlation_guard_applied": applied,
+        "independent_supporting_signal_families": independent_support,
+        "supporting_signal_count": independent_support,
+        "disagreement_strength": consistency.get("projection_consistency"),
+    }
+
+
+def _v265_history_disagreement_reason(row, board_row, projection, line, distribution, consistency, role_context):
+    if not consistency.get("history_model_conflict"):
+        return "HISTORY_AND_MODEL_NOT_IN_STRONG_CONFLICT"
+    reasons = []
+    bf = _canonical_k_num(board_row.get("expected_bf"), _canonical_k_num(row.get("Canonical Expected BF"), None))
+    lineup_k = _v265_rate(board_row.get("underdog_current_model_k_pct") or row.get("Current Expected Lineup K%"))
+    side = _v265_side_from_projection(projection, line)
+    if bf is not None and bf < 19.0:
+        reasons.append("LOW_BF_SUPPRESSION")
+    if role_context.get("workload_context_confidence") == "LOW":
+        reasons.append("LIMITED_IP_EXPECTATION")
+    if role_context.get("known_pitch_limit") is not None:
+        reasons.append("PITCH_COUNT_LIMIT")
+    if side == "UNDER" and lineup_k is not None and lineup_k < 0.21:
+        reasons.append("CONTACT_LINEUP_SUPPRESSION")
+    if line is not None and line >= 6.5:
+        reasons.append("HIGH_EXACT_LINE_THRESHOLD")
+    if consistency.get("history_skill_conflict"):
+        reasons.append("RECENT_SKILL_DECLINE" if side == "OVER" else "MULTI_FACTOR_CONFLICT")
+    over_probability = _canonical_k_num(distribution.get("over_probability"), None)
+    if over_probability is not None and over_probability < 0.46 and side == "UNDER":
+        reasons.append(f"P_OVER_{over_probability:.0%}")
+    return " | ".join(reasons) if reasons else "UNEXPLAINED_PROJECTION_CONFLICT"
+
+
+def _v265_lineup_snapshot(row, board_row):
+    expected = board_row.get("expected_lineup_players") or board_row.get("expected_lineup_names") or []
+    confirmed = board_row.get("confirmed_lineup_players") or board_row.get("confirmed_lineup_names") or []
+    if not isinstance(expected, (list, tuple)):
+        expected = []
+    if not isinstance(confirmed, (list, tuple)):
+        confirmed = []
+    expected_keys = {normalize_name(value) for value in expected if value}
+    confirmed_keys = {normalize_name(value) for value in confirmed if value}
+    expected_projection = _canonical_k_num(
+        board_row.get("pre_lineup_projection"),
+        _canonical_k_num(board_row.get("expected_lineup_projection"), _canonical_k_num(row.get("Pre-Lineup Projection"), None)),
+    )
+    confirmed_projection = _canonical_k_num(
+        board_row.get("confirmed_lineup_projection"),
+        _canonical_k_num(row.get("Confirmed Lineup Projection"), None),
+    )
+    projection_delta = None
+    if expected_projection is not None and confirmed_projection is not None:
+        projection_delta = round(confirmed_projection - expected_projection, 3)
+    expected_bf = _canonical_k_num(board_row.get("expected_lineup_bf"), None)
+    confirmed_bf = _canonical_k_num(board_row.get("confirmed_lineup_bf"), _canonical_k_num(board_row.get("expected_bf"), None))
+    expected_ip = _canonical_k_num(board_row.get("expected_lineup_ip"), None)
+    confirmed_ip = _canonical_k_num(board_row.get("confirmed_lineup_ip"), _canonical_k_num(board_row.get("ip_projection"), None))
+    current_line = _canonical_k_num(row.get("Canonical Line"), _canonical_k_line(row, board_row))
+    return {
+        "expected_lineup_players": json.dumps(list(expected), default=str),
+        "confirmed_lineup_players": json.dumps(list(confirmed), default=str),
+        "lineup_players_added": json.dumps(sorted(confirmed_keys - expected_keys)),
+        "lineup_players_removed": json.dumps(sorted(expected_keys - confirmed_keys)),
+        "expected_weighted_K_pct": _canonical_k_num(board_row.get("expected_lineup_k_pct"), None),
+        "confirmed_weighted_K_pct": _canonical_k_num(board_row.get("confirmed_lineup_k_pct"), _canonical_k_num(board_row.get("underdog_current_model_k_pct"), None)),
+        "lineup_K_pct_delta": _canonical_k_num(board_row.get("lineup_k_pct_delta"), None),
+        "expected_BF": expected_bf,
+        "confirmed_BF": confirmed_bf,
+        "BF_delta": None if expected_bf is None or confirmed_bf is None else round(confirmed_bf - expected_bf, 3),
+        "expected_IP": expected_ip,
+        "confirmed_IP": confirmed_ip,
+        "IP_delta": None if expected_ip is None or confirmed_ip is None else round(confirmed_ip - expected_ip, 3),
+        "pre_lineup_projection": expected_projection,
+        "confirmed_lineup_projection": confirmed_projection,
+        "pre_to_confirmed_delta": projection_delta,
+        "pre_lineup_side": _v265_side_from_projection(expected_projection, current_line),
+        "confirmed_lineup_side": _v265_side_from_projection(confirmed_projection, current_line),
+        "current_line": current_line,
+        "actual_K_after_game": _canonical_k_num(row.get("Actual K"), None),
+        "lineup_change_classification": "PREGAME_PENDING_GRADE",
+    }
+
+
+def apply_v265_canonical_runtime(df, board=None):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    out = df.copy()
+    lookup = _canonical_k_board_lookup(board)
+    records = []
+    for idx, rr in out.iterrows():
+        row = rr.to_dict()
+        board_row = _canonical_k_pick_board_row(lookup, row)
+        projection = _canonical_k_num(row.get("Canonical Final K Projection"), None)
+        line = _canonical_k_num(row.get("Canonical Line"), _canonical_k_line(row, board_row))
+        if projection is None:
+            projection, _ = _canonical_k_projection(board_row, row)
+        history = _v265_history_context(row, board_row)
+        history_std = history.get("k_standard_deviation") if isinstance(history, dict) else None
+        distribution = _v265_exact_line_distribution(projection, line, history_std)
+        sync = _v265_model_sync(row, board_row, projection, line)
+        rate_guard = _v265_projection_rate_guard(row, board_row, projection)
+        board_row["projection_rate_consistency"] = rate_guard.get("projection_rate_consistency")
+        consistency = _v265_projection_consistency(row, board_row, projection, line, sync, distribution)
+        components = _v265_component_audit(row, board_row, projection)
+        role_context = _v265_role_context(row, board_row)
+        board_row.update(role_context)
+        signal_audit = _v265_signal_family_audit(row, board_row, components, consistency)
+        lineup_snapshot = _v265_lineup_snapshot(row, board_row)
+        history_disagreement = _v265_history_disagreement_reason(
+            row, board_row, projection, line, distribution, consistency, role_context
+        )
+        final_state, final_reason = _v265_final_decision(row, board_row, projection, line, distribution, sync, consistency, rate_guard)
+        if history_disagreement == "UNEXPLAINED_PROJECTION_CONFLICT" and consistency.get("projection_consistency") in {"STRONG_CONFLICT", "SEVERE_CONFLICT"}:
+            final_state = "PASS_MODEL_CONFLICT"
+            final_reason = "Recent exact-line history conflicts with the final side and no defensible workload, lineup, skill, or threshold reason explains it."
+        if components.get("COMPONENT_RECONCILIATION_ERROR"):
+            final_state = "PASS_MODEL_CONFLICT"
+            final_reason = "Projection components do not reconcile to the final biological K mean."
+        final_side = _v265_state_side(final_state) or _v265_side_from_projection(projection, line)
+        provenance, source_fallback, tiny_sample = _v265_stat_provenance(row, board_row)
+        over_prob = distribution.get("over_probability")
+        under_prob = distribution.get("under_probability")
+        final_confidence = None
+        if final_side == "OVER":
+            final_confidence = over_prob
+        elif final_side == "UNDER":
+            final_confidence = under_prob
+        record = {
+            "_idx": idx,
+            "final_decision_state": final_state,
+            "Final Decision State": final_state,
+            "Final Decision Display": _v265_state_display(final_state),
+            "Final Decision Reason": final_reason,
+            "Final Decision Side": final_side,
+            "Final Decision Confidence %": None if final_confidence is None else round(final_confidence * 100.0, 1),
+            "P(OVER Today's Line)": None if over_prob is None else round(over_prob * 100.0, 1),
+            "P(UNDER Today's Line)": None if under_prob is None else round(under_prob * 100.0, 1),
+            "Required Over K": distribution.get("required_over_K"),
+            "Under Max K": distribution.get("under_max_K"),
+            "Low K Range": distribution.get("low_K"),
+            "Median K Range": distribution.get("median_K"),
+            "High K Range": distribution.get("high_K"),
+            "Exact Line Distribution": json.dumps(distribution, sort_keys=True),
+            "Threshold Ladder": json.dumps(distribution.get("ladder") or {}, sort_keys=True),
+            "PO/Merge Sync State": sync.get("po_merge_sync_state"),
+            "Model Agreement State": sync.get("model_agreement_state"),
+            "Projection Consistency": consistency.get("projection_consistency"),
+            "Projection Consistency Score": consistency.get("projection_consistency_score"),
+            "Projection Rate Consistency": rate_guard.get("projection_rate_consistency"),
+            "Projection Rate Conflict": rate_guard.get("PROJECTION_RATE_CONFLICT"),
+            "Final Implied K Rate": rate_guard.get("final_implied_K_rate"),
+            "Why Model Disagrees With History": history_disagreement,
+            "Stat Provenance": json.dumps(provenance, sort_keys=True, default=str),
+            "STAT_SOURCE_FALLBACK": source_fallback,
+            "STAT_SAMPLE_TOO_SMALL": tiny_sample,
+            "STAT_WINDOW_MISMATCH": bool(board_row.get("stat_window_mismatch") or False),
+            "History Status": str(history.get("status") or "UNAVAILABLE"),
+            "Home/Away History": json.dumps(history.get("home_away") or {}, sort_keys=True, default=str),
+            "H2H History": json.dumps(history.get("h2h") or {}, sort_keys=True, default=str),
+            "Canonical Runtime Version": MERGE_V265_RUNTIME_VERSION,
+            **sync,
+            **consistency,
+            **components,
+            **role_context,
+            **signal_audit,
+            **lineup_snapshot,
+        }
+        records.append(record)
+        if isinstance(board_row, dict):
+            board_row.update({key: value for key, value in record.items() if key != "_idx"})
+            board_row["final_decision_state"] = final_state
+            board_row["final_decision_reason"] = final_reason
+            board_row["final_decision_side"] = final_side
+            board_row["final_decision_confidence"] = final_confidence
+            board_row["exact_line_distribution_v265"] = distribution
+            board_row["po_merge_sync_v265"] = sync
+            board_row["component_audit_v265"] = components
+            board_row["stat_provenance_v265"] = provenance
+    add = pd.DataFrame(records).set_index("_idx")
+    for column in add.columns:
+        out[column] = add[column].reindex(out.index)
+    out["Canonical Decision"] = out["Final Decision Display"]
+    out["Decision"] = out["Final Decision Display"]
+    out["Final K Decision"] = out["Final Decision Display"]
+    out["Line-Aware Smart Decision"] = out["Final Decision Display"]
+    out["Main Engine Action"] = out["Final Decision Display"]
+    out["Model Lean"] = out["Final Decision Side"]
+    out["Canonical Side"] = out["Final Decision Side"]
+    out["Final Resolved Side"] = out["Final Decision Side"]
+    out["Active K Pipeline"] = MERGE_V265_RUNTIME_VERSION
+    return out
+
+
+# =============================================================================
+# MERGE V2.6.7 DECISION-SYNC / LINE-INDEPENDENCE ENRICHMENT
+#
+# This layer is intentionally downstream of the locked biological projection.
+# It adds diagnostics, a real order-aware first-inning K expectation, and
+# fail-closed decision guards. It never reads a sportsbook line while building
+# the biological projection or the order-aware pitcher profile.
+# =============================================================================
+MERGE_V267_RUNTIME_VERSION = "MERGE_V2_6_7_DECISION_SYNC_LINE_INDEPENDENCE_2026_08_11"
+MERGE_V266_RUNTIME_VERSION = MERGE_V267_RUNTIME_VERSION
+MERGE_V266_CONFIG = {
+    "lineup_reconciliation_tolerance_pp": 0.30,
+    "lineup_reconciliation_error_pp": 1.25,
+    "timing_partial_sample": 3,
+    "timing_good_sample": 8,
+    "timing_verified_sample": 15,
+    "early_k_projection_enabled": False,
+    "order_aware_full_game_enabled": False,
+    "fresh_minutes": 30,
+    "acceptable_minutes": 90,
+    "critical_missing_pass_count": 3,
+    "league_k_rate": 0.224,
+}
+MERGE_V267_CONFIG = MERGE_V266_CONFIG
+_V267_PROJECTION_LEDGER = {}
+
+
+def _v266_number(value, default=None):
+    return _canonical_k_num(value, default)
+
+
+def _v266_rate(value):
+    value = _v266_number(value, None)
+    if value is None:
+        return None
+    return float(value / 100.0 if value > 1.0 else value)
+
+
+def _v266_first(source, keys, default=None):
+    for key in keys:
+        value = source.get(key) if isinstance(source, dict) else None
+        if value not in (None, "", "nan", "NaN"):
+            return value
+    return default
+
+
+def _v266_lineup_rows(board_row):
+    for key in ("lineup_rows", "confirmed_lineup_rows", "expected_lineup_rows"):
+        rows = board_row.get(key) if isinstance(board_row, dict) else None
+        if isinstance(rows, list) and rows:
+            return [dict(item) for item in rows[:9] if isinstance(item, dict)]
+    history = board_row.get("k_history_context_v256") if isinstance(board_row, dict) else None
+    rows = history.get("lineup_rows") if isinstance(history, dict) else None
+    return [dict(item) for item in (rows or [])[:9] if isinstance(item, dict)]
+
+
+def _v266_row_k_rate(lineup_row):
+    for key in ("Raw_K_Rate", "Used K%", "K% Used", "Split K%", "Season K%"):
+        rate = _v266_rate((lineup_row or {}).get(key))
+        if rate is not None and 0.03 <= rate <= 0.60:
+            return rate
+    return None
+
+
+def _v266_profile_family(row, board_row):
+    pitcher_k = _v266_rate(_v266_first(board_row, ["pitcher_k", "season_pitcher_k_pct"], _v266_first(row, ["Canonical Pitcher K%", "Pitcher K%"])))
+    k9 = _v266_number(_v266_first(board_row, ["pitcher_k9", "k9"], _v266_first(row, ["APP100 Pitcher K/9", "K/9"])), None)
+    bf = _v266_number(_v266_first(board_row, ["expected_bf"], _v266_first(row, ["Canonical Expected BF", "Exp BF"])), None)
+    role = str(_v266_first(board_row, ["role_status", "role_signal"], _v266_first(row, ["role_status", "Open/Bulk Role Signal 2.1"], "UNKNOWN"))).upper()
+    return_from_injury = bool(board_row.get("return_from_injury") or False)
+    if return_from_injury:
+        family = "RETURN_FROM_INJURY"
+    elif any(token in role for token in ("OPENER", "BULK", "TANDEM")):
+        family = "OPENER_BULK_UNCERTAIN"
+    elif bf is not None and bf < 19.0:
+        family = "ELITE_K_LIMITED_WORKLOAD" if (pitcher_k or 0) >= 0.275 else "WORKLOAD_LIMITED"
+    elif (pitcher_k or 0) >= 0.29 or (k9 or 0) >= 10.5:
+        family = "ELITE_K_HIGH_WORKLOAD"
+    elif (pitcher_k or 0) >= 0.255 or (k9 or 0) >= 9.3:
+        family = "HIGH_K_VOLATILE" if str(board_row.get("k_history_volatility") or "").upper() in {"HIGH", "EXTREME"} else "ABOVE_AVERAGE_K"
+    elif (pitcher_k or 0) >= 0.215 or (k9 or 0) >= 7.8:
+        family = "MID_K"
+    elif (pitcher_k or 0) < 0.185 or (k9 is not None and k9 < 6.8):
+        family = "LOW_K"
+    else:
+        family = "CONTACT_DEPENDENT"
+    return {
+        "pitcher_profile_family": family,
+        "profile_pitcher_K_pct": None if pitcher_k is None else round(pitcher_k * 100.0, 2),
+        "profile_K9": k9,
+        "profile_expected_BF": bf,
+        "profile_role_status": role,
+    }
+
+
+def _v266_lineup_reconciliation(board_row):
+    rows = _v266_lineup_rows(board_row)
+    ordered = sorted(rows, key=lambda item: safe_int(item.get("Order"), 99) or 99)
+    rates = []
+    weighted = []
+    names = []
+    lineup_status = str(board_row.get("lineup_status") or board_row.get("lineup_resolver_source") or "").upper()
+    official = bool(
+        "CONFIRMED" in lineup_status
+        or "OFFICIAL" in lineup_status
+        or bool(board_row.get("lineup_locked"))
+    )
+    order_weights = (1.10, 1.07, 1.04, 1.02, 1.00, 0.97, 0.94, 0.91, 0.88)
+    for index, item in enumerate(ordered[:9]):
+        rate = _v266_row_k_rate(item)
+        if rate is None:
+            continue
+        rates.append(rate)
+        names.append(normalize_name(item.get("Batter") or item.get("Player") or item.get("Name") or ""))
+        start_probability = 1.0 if official else _v266_number(
+            item.get("Expected Start Probability"),
+            _v266_number(item.get("Expected Starter Confidence"), 80.0) / 100.0,
+        )
+        start_probability = float(clamp(start_probability or 0.8, 0.35, 1.0))
+        weighted.append((rate, order_weights[min(index, 8)] * start_probability))
+    simple = None if not rates else float(np.mean(rates)) * 100.0
+    weighted_rate = None if not weighted else sum(rate * weight for rate, weight in weighted) / sum(weight for _, weight in weighted) * 100.0
+    delta = None if simple is None or weighted_rate is None else weighted_rate - simple
+    tolerance = MERGE_V266_CONFIG["lineup_reconciliation_tolerance_pp"]
+    error_limit = MERGE_V266_CONFIG["lineup_reconciliation_error_pp"]
+    if delta is None or len(rates) < 5:
+        state = "LINEUP_K_RECONCILIATION_ERROR"
+    elif abs(delta) <= tolerance:
+        state = "LINEUP_K_RECONCILIATION_NORMAL"
+    elif abs(delta) <= error_limit:
+        state = "LINEUP_K_RECONCILIATION_REVIEW"
+    else:
+        state = "LINEUP_K_RECONCILIATION_ERROR"
+    duplicate_count = len([name for name in names if name]) - len({name for name in names if name})
+    if duplicate_count:
+        state = "LINEUP_K_RECONCILIATION_ERROR"
+    return {
+        "simple_lineup_K_pct": None if simple is None else round(simple, 3),
+        "weighted_lineup_exposure_K_pct": None if weighted_rate is None else round(weighted_rate, 3),
+        "lineup_K_reconciliation_delta": None if delta is None else round(delta, 3),
+        "lineup_K_reconciliation_state": state,
+        "lineup_K_reconciliation_tolerance_pp": tolerance,
+        "lineup_K_duplicate_count": duplicate_count,
+        "lineup_K_valid_hitters": len(rates),
+        "confirmed_lineup_start_uncertainty_removed": bool(official and len(rates) >= 9),
+    }
+
+
+def _v266_log5_k_probability(pitcher_rate, hitter_rate):
+    league = MERGE_V266_CONFIG["league_k_rate"]
+    p = float(clamp(pitcher_rate if pitcher_rate is not None else league, 0.06, 0.50))
+    h = float(clamp(hitter_rate if hitter_rate is not None else league, 0.05, 0.55))
+    odds = (p / (1.0 - p)) * (h / (1.0 - h)) / (league / (1.0 - league))
+    return float(clamp(odds / (1.0 + odds), 0.04, 0.58))
+
+
+def _v266_lineup_shape(lineup_rows):
+    ordered = sorted(lineup_rows, key=lambda item: safe_int(item.get("Order"), 99) or 99)
+    segments = []
+    for start in (0, 3, 6):
+        values = [_v266_row_k_rate(item) for item in ordered[start:start + 3]]
+        values = [value for value in values if value is not None]
+        segments.append(None if not values else float(np.mean(values)))
+    valid = [value for value in segments if value is not None]
+    if len(valid) < 3:
+        shape = "INSUFFICIENT_LINEUP_SAMPLE"
+    else:
+        high = int(np.argmax(segments))
+        low = int(np.argmin(segments))
+        spread = max(segments) - min(segments)
+        if spread < 0.025:
+            shape = "BALANCED_K"
+        elif low == 0 and segments[0] + 0.025 <= min(segments[1], segments[2]):
+            shape = "TOP_HEAVY_CONTACT"
+        elif low == 2 and segments[2] + 0.025 <= min(segments[0], segments[1]):
+            shape = "BOTTOM_HEAVY_CONTACT"
+        elif high == 0:
+            shape = "TOP_HEAVY_K"
+        elif high == 1:
+            shape = "MIDDLE_HEAVY_K"
+        else:
+            shape = "BOTTOM_HEAVY_K"
+    return {
+        "top_3_weighted_K_pct": None if segments[0] is None else round(segments[0] * 100.0, 2),
+        "middle_3_weighted_K_pct": None if segments[1] is None else round(segments[1] * 100.0, 2),
+        "bottom_3_weighted_K_pct": None if segments[2] is None else round(segments[2] * 100.0, 2),
+        "lineup_K_shape": shape,
+    }
+
+
+def _v266_first_inning_profile(row, board_row, profile):
+    lineup_rows = sorted(_v266_lineup_rows(board_row), key=lambda item: safe_int(item.get("Order"), 99) or 99)
+    pitcher_rate = _v266_rate(_v266_first(board_row, ["pitcher_k", "season_pitcher_k_pct"], _v266_first(row, ["Canonical Pitcher K%", "Pitcher K%"])))
+    opponent_obp = _v266_rate(_v266_first(board_row, ["opponent_obp", "lineup_obp"], None))
+    reach = float(clamp(opponent_obp if opponent_obp is not None else 0.320, 0.270, 0.390))
+    probability_4_bf = float(clamp(0.34 + (reach - 0.320) * 1.8, 0.25, 0.47))
+    probability_5_plus_bf = float(clamp(0.105 + (reach - 0.320) * 1.0, 0.06, 0.18))
+    expected_bf = 3.0 + probability_4_bf + probability_5_plus_bf
+    slot_exposure = (1.0, 1.0, 1.0, probability_4_bf, probability_5_plus_bf)
+    slot_probs = []
+    for index in range(5):
+        hitter_rate = _v266_row_k_rate(lineup_rows[index]) if index < len(lineup_rows) else None
+        slot_probs.append(_v266_log5_k_probability(pitcher_rate, hitter_rate))
+    raw_expected = sum(prob * exposure for prob, exposure in zip(slot_probs, slot_exposure))
+    sample = safe_int(board_row.get("first_inning_sample"), 0) or 0
+    historical_avg = _v266_number(board_row.get("first_inning_avg_k"), None)
+    if historical_avg is not None and sample > 0:
+        weight = sample / (sample + 12.0)
+        projected = raw_expected * (1.0 - weight) + historical_avg * weight
+        source = "MLB_PLAY_BY_PLAY_GRADED_RESULTS"
+    else:
+        weight = 0.0
+        projected = raw_expected
+        source = "ORDER_AWARE_LOG5_FALLBACK"
+    projected = float(clamp(projected, 0.05, 2.25))
+    baseline = max(0.10, raw_expected)
+    ratio = projected / baseline
+    timing_profile = (
+        "INSUFFICIENT_TIMING_SAMPLE" if sample < MERGE_V266_CONFIG["timing_partial_sample"] else
+        "QUICK_STRIKEOUT_STARTER" if ratio >= 1.18 else
+        "EARLY_K_LEAN" if ratio >= 1.07 else
+        "SECOND_TURN_RISER" if ratio <= 0.82 else
+        "LATE_K_DEPENDENT" if ratio <= 0.92 else
+        "BALANCED_K_TIMING"
+    )
+    first_profile = (
+        "INSUFFICIENT_SAMPLE" if sample < MERGE_V266_CONFIG["timing_partial_sample"] else
+        "VERY_FAST_K_STARTER" if ratio >= 1.25 else
+        "FAST_K_STARTER" if ratio >= 1.08 else
+        "VERY_SLOW_K_START" if ratio <= 0.75 else
+        "SLOW_K_START" if ratio <= 0.92 else
+        "NORMAL_K_START"
+    )
+    confidence = (
+        "VERIFIED" if sample >= MERGE_V266_CONFIG["timing_verified_sample"] else
+        "GOOD" if sample >= MERGE_V266_CONFIG["timing_good_sample"] else
+        "PARTIAL" if sample >= MERGE_V266_CONFIG["timing_partial_sample"] else
+        "ESTIMATED"
+    )
+    history = _v265_history_context(row, board_row)
+    games = history.get("game_log") if isinstance(history, dict) else []
+    pitches_per_k = []
+    for game in (games or [])[:10]:
+        ks = _v266_number((game or {}).get("Ks"), None)
+        pitches = _v266_number((game or {}).get("pitch_count"), None)
+        if ks is not None and ks > 0 and pitches is not None:
+            pitches_per_k.append(pitches / ks)
+    avg_pitches_per_k = None if not pitches_per_k else float(np.mean(pitches_per_k))
+    putaway = _v266_rate(_v266_first(board_row, ["statcast_putaway", "putaway_pct"], _v266_first(row, ["Putaway%", "APP85 PutAway Rate"])))
+    if avg_pitches_per_k is None and putaway is None:
+        efficiency = "INSUFFICIENT_SAMPLE"
+    elif (avg_pitches_per_k is not None and avg_pitches_per_k <= 15.5) or (putaway or 0) >= 0.27:
+        efficiency = "QUICK_PUTAWAY"
+    elif (avg_pitches_per_k is not None and avg_pitches_per_k >= 24.0) or (putaway is not None and putaway < 0.17):
+        efficiency = "LABORED_KS"
+    elif avg_pitches_per_k is not None and avg_pitches_per_k >= 20.5:
+        efficiency = "HIGH_PITCH_COUNT_K_RISK"
+    else:
+        efficiency = "NORMAL_PUTAWAY"
+    expected_total_bf = _v266_number(_v266_first(board_row, ["expected_bf"], _v266_first(row, ["Canonical Expected BF", "Exp BF"])), 20.0) or 20.0
+    if timing_profile in {"SECOND_TURN_RISER", "LATE_K_DEPENDENT"} and expected_total_bf < 20.0:
+        workload_fit = "LIMITED_SECOND_TURN_ACCESS"
+    elif timing_profile in {"SECOND_TURN_RISER", "LATE_K_DEPENDENT"} and expected_total_bf >= 23.0:
+        workload_fit = "GOOD_SECOND_TURN_ACCESS"
+    elif timing_profile in {"QUICK_STRIKEOUT_STARTER", "EARLY_K_LEAN"}:
+        workload_fit = "GOOD"
+    else:
+        workload_fit = "NEUTRAL"
+    top_rates = [_v266_row_k_rate(item) for item in lineup_rows[:5]]
+    top_rates = [value for value in top_rates if value is not None]
+    top3 = top_rates[:3]
+    top4 = top_rates[:4]
+    top5 = top_rates[:5]
+    historical_bf = _v266_number(board_row.get("first_inning_avg_bf"), None)
+    historical_rate = None
+    if historical_avg is not None and historical_bf is not None and historical_bf > 0:
+        historical_rate = historical_avg / historical_bf
+    first_two_avg = _v266_number(_v266_first(board_row, ["first_two_innings_K_avg", "first_2_innings_K_avg"]), None)
+    first_three_avg = _v266_number(_v266_first(board_row, ["first_three_innings_K_avg", "first_3_innings_K_avg"]), None)
+    first_nine_avg = _v266_number(board_row.get("K_first_9_BF_avg"), None)
+    first_eighteen_avg = _v266_number(board_row.get("K_first_18_BF_avg"), None)
+    after_eighteen_avg = _v266_number(board_row.get("K_after_18_BF_avg"), None)
+    first_nine_avg = first_nine_avg if first_nine_avg is not None else projected * 2.45
+    first_eighteen_avg = first_eighteen_avg if first_eighteen_avg is not None else projected * 4.70
+    tto1_rate = _v266_rate(_v266_first(board_row, ["TTO1_K_pct", "tto1_k_pct"], None))
+    tto2_rate = _v266_rate(_v266_first(board_row, ["TTO2_K_pct", "tto2_k_pct"], None))
+    tto3_rate = _v266_rate(_v266_first(board_row, ["TTO3_K_pct", "tto3_k_pct"], None))
+    if tto1_rate is None and pitcher_rate is not None:
+        tto1_rate = pitcher_rate * (ratio if sample >= MERGE_V266_CONFIG["timing_partial_sample"] else 1.0)
+    if tto2_rate is None:
+        tto2_rate = pitcher_rate
+    tto_shape = "INSUFFICIENT_SAMPLE"
+    if sample >= MERGE_V266_CONFIG["timing_good_sample"] and tto1_rate is not None and tto2_rate is not None:
+        if tto1_rate >= tto2_rate + 0.025:
+            tto_shape = "EARLY_DOMINANT"
+        elif tto2_rate >= tto1_rate + 0.025:
+            tto_shape = "SECOND_TURN_DOMINANT"
+        elif tto3_rate is not None and tto3_rate <= min(tto1_rate, tto2_rate) - 0.035:
+            tto_shape = "THIRD_TURN_DROP"
+        else:
+            tto_shape = "STABLE_ACROSS_TURNS"
+    first_trip_rates = [_v266_row_k_rate(item) for item in lineup_rows[:9]]
+    first_trip_rates = [value for value in first_trip_rates if value is not None]
+    first_trip_environment = None if not first_trip_rates else float(np.mean(first_trip_rates))
+    second_trip_environment = first_trip_environment
+    first_pitch_strike = _v266_rate(_v266_first(board_row, ["first_strike_pct", "first_pitch_strike_pct"], _v266_first(row, ["First Strike%", "F-Strike%"])))
+    swstr = _v266_rate(_v266_first(board_row, ["swstr_pct", "statcast_swstr"], _v266_first(row, ["T12 SwStr%", "SwStr%"])))
+    chase = _v266_rate(_v266_first(board_row, ["statcast_chase", "chase_pct"], _v266_first(row, ["Statcast Chase%", "Chase%"])))
+    foul_extension = _v266_rate(_v266_first(board_row, ["foul_extension_rate"], None))
+    deep_count = _v266_rate(_v266_first(board_row, ["deep_count_rate"], None))
+    two_strike_reach = _v266_rate(_v266_first(board_row, ["two_strike_reach_rate"], None))
+    two_strike_putaway = _v266_rate(_v266_first(board_row, ["two_strike_putaway_rate"], putaway))
+    pitches_per_bf = _v266_number(_v266_first(board_row, ["pitches_per_bf", "ppb"], None), None)
+    total_projection = _v266_number(_v266_first(row, ["Canonical Final K Projection", "K PROJ"]), None)
+    if timing_profile in {"QUICK_STRIKEOUT_STARTER", "EARLY_K_LEAN"} and workload_fit == "GOOD":
+        early_pace = "FAST_START_STRONG_FINISH"
+    elif timing_profile in {"QUICK_STRIKEOUT_STARTER", "EARLY_K_LEAN"}:
+        early_pace = "FAST_START_FADE"
+    elif timing_profile in {"SECOND_TURN_RISER", "LATE_K_DEPENDENT"} and workload_fit == "GOOD_SECOND_TURN_ACCESS":
+        early_pace = "SLOW_START_STRONG_FINISH"
+    elif timing_profile in {"SECOND_TURN_RISER", "LATE_K_DEPENDENT"}:
+        early_pace = "SLOW_START_LOW_CEILING"
+    else:
+        early_pace = "BALANCED_PACE"
+    return {
+        "projected_1st_inning_K": round(projected, 3),
+        "expected_1st_inning_BF": round(expected_bf, 3),
+        "first_inning_probability_3_BF": round(max(0.0, 1.0 - probability_4_bf), 4),
+        "first_inning_probability_4_BF": round(probability_4_bf - probability_5_plus_bf, 4),
+        "first_inning_probability_5plus_BF": round(probability_5_plus_bf, 4),
+        "first_inning_top3_weighted_K_pct": None if not top3 else round(float(np.mean(top3)) * 100.0, 2),
+        "first_inning_top4_weighted_K_pct": None if not top4 else round(float(np.mean(top4)) * 100.0, 2),
+        "first_inning_top5_weighted_K_pct": None if not top5 else round(float(np.mean(top5)) * 100.0, 2),
+        "first_inning_K_profile": first_profile,
+        "timing_profile": timing_profile,
+        "first_inning_K_data_source": source,
+        "first_inning_K_sample_size": sample,
+        "first_inning_K_confidence": confidence,
+        "last_5_first_inning_K": board_row.get("last_5_first_inning_K") or [],
+        "last_10_first_inning_K": board_row.get("last_10_first_inning_K") or [],
+        "season_first_inning_K_avg": _v266_number(board_row.get("season_first_inning_K_avg"), historical_avg),
+        "pct_L5_with_1plus_K_1st": _v266_number(board_row.get("pct_L5_with_1plus_K_1st"), None),
+        "pct_L10_with_1plus_K_1st": _v266_number(board_row.get("pct_L10_with_1plus_K_1st"), None),
+        "pct_season_with_1plus_K_1st": _v266_number(board_row.get("pct_season_with_1plus_K_1st"), None),
+        "pct_L5_with_2plus_K_1st": _v266_number(board_row.get("pct_L5_with_2plus_K_1st"), None),
+        "pct_L10_with_2plus_K_1st": _v266_number(board_row.get("pct_L10_with_2plus_K_1st"), None),
+        "pct_season_with_2plus_K_1st": _v266_number(board_row.get("pct_season_with_2plus_K_1st"), None),
+        "first_inning_K_avg_home": _v266_number(board_row.get("first_inning_K_avg_home"), None),
+        "first_inning_K_avg_away": _v266_number(board_row.get("first_inning_K_avg_away"), None),
+        "first_inning_K_pct_home": _v266_number(board_row.get("first_inning_K_pct_home"), None),
+        "first_inning_K_pct_away": _v266_number(board_row.get("first_inning_K_pct_away"), None),
+        "first_inning_historical_weight": round(weight, 4),
+        "first_inning_K_projection_impact": 0.0,
+        "first_inning_K_avg": None if historical_avg is None else round(historical_avg, 3),
+        "first_inning_K_rate_per_BF": None if historical_rate is None else round(historical_rate * 100.0, 2),
+        "first_two_innings_K_avg": first_two_avg,
+        "first_two_innings_K_rate_per_BF": _v266_number(board_row.get("first_two_innings_K_rate_per_BF"), None),
+        "first_three_innings_K_avg": first_three_avg,
+        "first_three_innings_K_rate_per_BF": _v266_number(board_row.get("first_three_innings_K_rate_per_BF"), None),
+        "K_first_9_BF_avg": round(first_nine_avg, 3),
+        "K_first_18_BF_avg": round(first_eighteen_avg, 3),
+        "K_after_18_BF_avg": after_eighteen_avg,
+        "pct_starts_with_1plus_K_first_inning": _v266_number(board_row.get("pct_starts_with_1plus_K_first_inning"), None),
+        "pct_starts_with_2plus_K_first_two_innings": _v266_number(board_row.get("pct_starts_with_2plus_K_first_two_innings"), None),
+        "pct_starts_with_3plus_K_first_three_innings": _v266_number(board_row.get("pct_starts_with_3plus_K_first_three_innings"), None),
+        "avg_BF_before_first_K": _v266_number(board_row.get("avg_BF_before_first_K"), None),
+        "median_BF_before_first_K": _v266_number(board_row.get("median_BF_before_first_K"), None),
+        "avg_inning_of_first_K": _v266_number(board_row.get("avg_inning_of_first_K"), None),
+        "early_K_share": _v266_number(board_row.get("early_K_share"), None),
+        "middle_K_share": _v266_number(board_row.get("middle_K_share"), None),
+        "late_K_share": _v266_number(board_row.get("late_K_share"), None),
+        "TTO1_K_pct": None if tto1_rate is None else round(tto1_rate * 100.0, 2),
+        "TTO2_K_pct": None if tto2_rate is None else round(tto2_rate * 100.0, 2),
+        "TTO3_K_pct": None if tto3_rate is None else round(tto3_rate * 100.0, 2),
+        "TTO1_whiff_pct": _v266_number(_v266_first(board_row, ["TTO1_whiff_pct", "tto1_whiff_pct"]), None),
+        "TTO2_whiff_pct": _v266_number(_v266_first(board_row, ["TTO2_whiff_pct", "tto2_whiff_pct"]), None),
+        "TTO3_whiff_pct": _v266_number(_v266_first(board_row, ["TTO3_whiff_pct", "tto3_whiff_pct"]), None),
+        "TTO1_CSW_pct": _v266_number(_v266_first(board_row, ["TTO1_CSW_pct", "tto1_csw_pct"]), None),
+        "TTO2_CSW_pct": _v266_number(_v266_first(board_row, ["TTO2_CSW_pct", "tto2_csw_pct"]), None),
+        "TTO3_CSW_pct": _v266_number(_v266_first(board_row, ["TTO3_CSW_pct", "tto3_csw_pct"]), None),
+        "TTO1_putaway_pct": _v266_number(_v266_first(board_row, ["TTO1_putaway_pct", "tto1_putaway_pct"]), None),
+        "TTO2_putaway_pct": _v266_number(_v266_first(board_row, ["TTO2_putaway_pct", "tto2_putaway_pct"]), None),
+        "TTO3_putaway_pct": _v266_number(_v266_first(board_row, ["TTO3_putaway_pct", "tto3_putaway_pct"]), None),
+        "TTO1_BF_avg": _v266_number(_v266_first(board_row, ["TTO1_BF_avg", "tto1_bf_avg"]), 9.0),
+        "TTO2_BF_avg": _v266_number(_v266_first(board_row, ["TTO2_BF_avg", "tto2_bf_avg"]), 9.0),
+        "TTO3_BF_avg": _v266_number(_v266_first(board_row, ["TTO3_BF_avg", "tto3_bf_avg"]), None),
+        "TTO_K_shape": tto_shape,
+        "K_efficiency_profile": efficiency,
+        "pitches_per_BF": pitches_per_bf,
+        "pitches_per_K": None if avg_pitches_per_k is None else round(avg_pitches_per_k, 2),
+        "two_strike_reach_rate": None if two_strike_reach is None else round(two_strike_reach * 100.0, 2),
+        "two_strike_putaway_rate": None if two_strike_putaway is None else round(two_strike_putaway * 100.0, 2),
+        "two_strike_pitches_per_K": _v266_number(board_row.get("two_strike_pitches_per_K"), None),
+        "first_pitch_strike_pct": None if first_pitch_strike is None else round(first_pitch_strike * 100.0, 2),
+        "swinging_strike_pct": None if swstr is None else round(swstr * 100.0, 2),
+        "chase_pct": None if chase is None else round(chase * 100.0, 2),
+        "foul_extension_rate": None if foul_extension is None else round(foul_extension * 100.0, 2),
+        "deep_count_rate": None if deep_count is None else round(deep_count * 100.0, 2),
+        "timing_workload_fit": workload_fit,
+        "first_trip_expected_K_environment": None if first_trip_environment is None else round(first_trip_environment * 100.0, 2),
+        "second_trip_expected_K_environment": None if second_trip_environment is None else round(second_trip_environment * 100.0, 2),
+        "early_K_pace_flag": early_pace,
+        "early_K_pace_projection": None if total_projection is None else round(total_projection, 3),
+        "early_K_pace_is_diagnostic": True,
+        "early_K_workload_delta": 0.0,
+        "timing_signal_family": "EARLY_K_TIMING",
+        "efficiency_signal_family": "K_EFFICIENCY",
+        "timing_projection_enabled": bool(MERGE_V266_CONFIG["early_k_projection_enabled"]),
+        **_v266_lineup_shape(lineup_rows),
+    }
+
+
+def _v266_order_aware_distribution(row, board_row, timing):
+    lineup_rows = sorted(_v266_lineup_rows(board_row), key=lambda item: safe_int(item.get("Order"), 99) or 99)
+    pitcher_rate = _v266_rate(_v266_first(board_row, ["pitcher_k", "season_pitcher_k_pct"], _v266_first(row, ["Canonical Pitcher K%", "Pitcher K%"])))
+    expected_bf = _v266_number(_v266_first(board_row, ["expected_bf"], _v266_first(row, ["Canonical Expected BF", "Exp BF"])), None)
+    if pitcher_rate is None or expected_bf is None or expected_bf <= 0 or len(lineup_rows) < 5:
+        return {"order_aware_status": "UNAVAILABLE", "order_aware_projection_enabled": False}
+    tto1 = _v266_rate(timing.get("TTO1_K_pct")) or pitcher_rate
+    tto2 = _v266_rate(timing.get("TTO2_K_pct")) or pitcher_rate
+    tto3 = _v266_rate(timing.get("TTO3_K_pct")) or pitcher_rate
+    probabilities = []
+    whole = int(math.floor(expected_bf))
+    fractional = float(expected_bf - whole)
+    for pa_index in range(whole + (1 if fractional > 0 else 0)):
+        hitter_rate = _v266_row_k_rate(lineup_rows[pa_index % len(lineup_rows)])
+        base = _v266_log5_k_probability(pitcher_rate, hitter_rate)
+        tto_rate = tto1 if pa_index < 9 else tto2 if pa_index < 18 else tto3
+        probability = float(clamp(base * tto_rate / max(pitcher_rate, 0.05), 0.03, 0.60))
+        if pa_index >= whole:
+            probability *= fractional
+        probabilities.append(probability)
+    mean = float(sum(probabilities))
+    variance = float(sum(prob * (1.0 - prob) for prob in probabilities))
+    # Exact Poisson-binomial distribution for the order-aware PA path. This
+    # remains diagnostic until it proves value on untouched holdout slates.
+    pmf = [1.0]
+    for probability in probabilities:
+        next_pmf = [0.0] * (len(pmf) + 1)
+        for strikeouts, mass in enumerate(pmf):
+            next_pmf[strikeouts] += mass * (1.0 - probability)
+            next_pmf[strikeouts + 1] += mass * probability
+        pmf = next_pmf
+    ladder = {
+        f"P({threshold}+ K)": round(sum(pmf[threshold:]) * 100.0, 2)
+        for threshold in range(3, 11)
+    }
+    return {
+        "order_aware_status": "DIAGNOSTIC_ONLY" if not MERGE_V266_CONFIG["order_aware_full_game_enabled"] else "ENABLED_AFTER_VALIDATION",
+        "order_aware_projection_enabled": bool(MERGE_V266_CONFIG["order_aware_full_game_enabled"]),
+        "order_aware_expected_K": round(mean, 3),
+        "order_aware_variance": round(variance, 3),
+        "order_aware_BF": round(expected_bf, 2),
+        "order_aware_PA_probabilities": json.dumps([round(value, 4) for value in probabilities]),
+        "order_aware_threshold_ladder": json.dumps(ladder, sort_keys=True),
+        "order_aware_signal": "ORDER_AWARE_DIAGNOSTIC_NO_PROJECTION_EFFECT",
+    }
+
+
+def _v266_parse_time(value):
+    parsed = _v265_iso_timestamp(value)
+    if parsed is None:
+        return None
+    try:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=california_now().tzinfo)
+    except Exception:
+        pass
+    return parsed
+
+
+def _v266_freshness(row, board_row, now=None):
+    now = now or california_now()
+    lineup_status = str(board_row.get("lineup_status") or board_row.get("lineup_resolver_source") or "").upper()
+    official_active = bool(
+        "CONFIRMED" in lineup_status
+        or "OFFICIAL" in lineup_status
+        or board_row.get("lineup_locked")
+    )
+    fields = {
+        "line_timestamp": _v266_first(board_row, ["line_timestamp", "underdog_pull_time"], _v266_first(row, ["Line Timestamp"])),
+        "lineup_timestamp": _v266_first(board_row, ["lineup_timestamp", "lineup_pull_time"], None),
+        "official_lineup_timestamp": _v266_first(board_row, ["official_lineup_timestamp"], None),
+        "Underdog_timestamp": _v266_first(board_row, ["underdog_pull_time"], None),
+        "pitcher_stats_timestamp": _v266_first(board_row, ["pitcher_stats_timestamp"], None),
+        "recent_game_log_timestamp": _v266_first(board_row, ["recent_game_log_timestamp"], None),
+        "team_split_timestamp": _v266_first(board_row, ["team_split_timestamp"], None),
+        "Savant_timestamp": _v266_first(board_row, ["savant_timestamp", "statcast_timestamp"], None),
+        "projection_timestamp": _v266_first(board_row, ["projection_timestamp"], _v266_first(row, ["Pregame Timestamp"])),
+    }
+    active_lineup_timestamp = (
+        fields["official_lineup_timestamp"]
+        if official_active and fields["official_lineup_timestamp"]
+        else fields["lineup_timestamp"]
+    )
+    # Completed historical logs are optional. A stale optional history source
+    # cannot make an otherwise current projection board stale.
+    critical_values = [
+        fields["line_timestamp"], active_lineup_timestamp,
+        fields["pitcher_stats_timestamp"], fields["team_split_timestamp"],
+        fields["projection_timestamp"],
+    ]
+    ages = []
+    parsed_count = 0
+    for value in critical_values:
+        parsed = _v266_parse_time(value)
+        if parsed is not None:
+            try:
+                ages.append(max(0.0, (now - parsed).total_seconds() / 60.0))
+                parsed_count += 1
+            except Exception:
+                continue
+    if not ages:
+        state = "UNKNOWN"
+    elif max(ages) <= MERGE_V266_CONFIG["fresh_minutes"]:
+        state = "FRESH"
+    elif max(ages) <= MERGE_V266_CONFIG["acceptable_minutes"]:
+        state = "ACCEPTABLE"
+    elif min(ages) <= MERGE_V266_CONFIG["acceptable_minutes"]:
+        state = "MIXED"
+    else:
+        state = "STALE"
+    return {
+        **{key: str(value or "") for key, value in fields.items()},
+        "active_lineup_timestamp": str(active_lineup_timestamp or ""),
+        "official_lineup_override_active": official_active,
+        "stale_expected_lineup_suppressed": bool(official_active and fields["lineup_timestamp"]),
+        "data_freshness_state": state,
+        "freshness_parsed_source_count": parsed_count,
+        "freshness_max_age_minutes": None if not ages else round(max(ages), 1),
+        "STALE_INPUT_REVIEW": state in {"STALE", "MIXED"},
+    }
+
+
+def _v266_completeness(row, board_row, reconciliation):
+    identity = bool(str(row.get("Pitcher") or board_row.get("pitcher") or "").strip())
+    hand = str(_v266_first(board_row, ["hand"], _v266_first(row, ["Pitcher Hand", "Hand"], ""))).upper() in {"L", "R", "LHP", "RHP"}
+    line = _canonical_k_line(row, board_row) is not None
+    role_text = str(_v266_first(board_row, ["role_status", "role_signal", "pitcher_role", "role"], _v266_first(row, ["Open/Bulk Role Signal 2.1"], ""))).upper()
+    role = role_text not in {"", "UNKNOWN"} or bool(
+        board_row.get("pitcher_confirmed")
+        or board_row.get("starter_confirmed")
+        or board_row.get("probable_pitcher")
+        or board_row.get("is_starter")
+    )
+    workload = _v266_number(_v266_first(board_row, ["expected_bf"], _v266_first(row, ["Canonical Expected BF", "Exp BF"])), None) is not None
+    lineup = int(reconciliation.get("lineup_K_valid_hitters") or 0) >= 5
+    skill = _v266_rate(_v266_first(board_row, ["pitcher_k"], _v266_first(row, ["Canonical Pitcher K%", "Pitcher K%"])) ) is not None
+    critical = {"pitcher_identity": identity, "pitcher_hand": hand, "sportsbook_line": line, "role": role, "workload": workload, "lineup": lineup, "pitcher_skill": skill}
+    missing = [key for key, available in critical.items() if not available]
+    fallback_count = sum("FALLBACK" in str(value or "").upper() for value in (
+        board_row.get("pitcher_k_source"), board_row.get("lineup_resolver_source"), board_row.get("opp_k_source")
+    ))
+    score = float(clamp((len(critical) - len(missing)) / len(critical) * 100.0 - fallback_count * 4.0, 0.0, 100.0))
+    state = "DATA_COMPLETE" if not missing and not fallback_count else "DATA_PARTIAL" if len(missing) <= 1 else "DATA_WEAK" if len(missing) <= 2 else "DATA_INSUFFICIENT"
+    return {
+        "critical_missing_count": len(missing),
+        "critical_missing_fields": json.dumps(missing),
+        "fallback_signal_count": fallback_count,
+        "data_completeness_score": round(score, 1),
+        "data_completeness_state": state,
+    }
+
+
+def _v266_reproducibility(row, board_row, projection, line):
+    lineup_signature = []
+    for item in _v266_lineup_rows(board_row):
+        lineup_signature.append({
+            "player": normalize_name(item.get("Batter") or item.get("Player") or item.get("Name") or ""),
+            "order": safe_int(item.get("Order"), 0) or 0,
+            "k_rate": _v266_row_k_rate(item),
+        })
+    biological = {
+        "pitcher": normalize_name(row.get("Pitcher") or board_row.get("pitcher") or ""),
+        "game": _v265_matchup_identity(row.get("Matchup") or board_row.get("matchup") or ""),
+        "hand": str(_v266_first(board_row, ["hand"], _v266_first(row, ["Pitcher Hand", "Hand"], ""))).upper(),
+        "lineup": lineup_signature,
+        "pitcher_k": _v266_rate(_v266_first(board_row, ["pitcher_k"], _v266_first(row, ["Canonical Pitcher K%", "Pitcher K%"]))),
+        "recent_pitcher_k": _v266_rate(_v266_first(board_row, ["recent_pitcher_k", "recent_k_pct"], _v266_first(row, ["Recent Pitcher K%", "Recent K%"], None))),
+        "whiff": _v266_rate(_v266_first(board_row, ["whiff_pct", "whiff"], _v266_first(row, ["Whiff%", "Whiff"], None))),
+        "csw": _v266_rate(_v266_first(board_row, ["csw_pct", "csw"], _v266_first(row, ["CSW%", "CSW"], None))),
+        "putaway": _v266_rate(_v266_first(board_row, ["putaway_pct", "putaway"], _v266_first(row, ["PutAway%", "Putaway%"], None))),
+        "arsenal_matchup_k": _v266_rate(_v266_first(board_row, ["arsenal_matchup_k_pct", "arsenal_k_pct"], _v266_first(row, ["Arsenal Matchup K%"], None))),
+        "expected_bf": _v266_number(_v266_first(board_row, ["expected_bf"], _v266_first(row, ["Canonical Expected BF", "Exp BF"])), None),
+        "expected_ip": _v266_number(_v266_first(board_row, ["projected_ip", "expected_ip"], _v266_first(row, ["IP PROJ", "Projected IP"])), None),
+        "opponent_k": _v266_rate(_v266_first(board_row, ["opp_k", "lineup_exposure_k"], _v266_first(row, ["Opponent K% vs Pitcher Hand"]))),
+        "opponent_l30_k": _v266_rate(_v266_first(board_row, ["opp_l30_k", "opponent_l30_k_pct"], _v266_first(row, ["Opponent L30 K% vs Pitcher Hand"], None))),
+        "master_core": _v266_number(_v266_first(board_row, ["master_core_projection"], _v266_first(row, ["Master Core Projection"])), None),
+        "merge_raw": _v266_number(_v266_first(board_row, ["hybrid_consensus_projection", "baseball_projection"], _v266_first(row, ["Merge Raw Projection"])), None),
+        "role": str(_v266_first(board_row, ["role_status", "role_signal"], "")),
+        "lineup_status": str(_v266_first(board_row, ["lineup_status", "lineup_lock_state"], _v266_first(row, ["Lineup Status"], ""))),
+        "lineup_source": str(_v266_first(board_row, ["lineup_resolver_source", "lineup_source"], _v266_first(row, ["Lineup Source"], ""))),
+        "config": MERGE_V266_RUNTIME_VERSION,
+    }
+    biological_json = json.dumps(biological, sort_keys=True, default=str)
+    input_hash = hashlib.sha256(biological_json.encode("utf-8")).hexdigest()
+    decision_json = json.dumps({"input_hash": input_hash, "line": line}, sort_keys=True)
+    config_hash = hashlib.sha256(json.dumps(MERGE_V266_CONFIG, sort_keys=True).encode("utf-8")).hexdigest()
+    seed = int(input_hash[:16], 16) % (2 ** 32)
+    biological_projection_probe = []
+    projection_sources = []
+    for probe_line in (4.5, 5.5, 6.5):
+        probe_row = dict(row)
+        probe_board = dict(board_row)
+        if _v266_number(probe_row.get("Canonical Final K Projection"), None) is None and projection is not None:
+            probe_row["Canonical Final K Projection"] = projection
+        for key in ("Canonical Line", "UD/Line", "Line", "Underdog Line", "K Line"):
+            if key in probe_row:
+                probe_row[key] = probe_line
+        for key in ("line", "underdog_line"):
+            if key in probe_board:
+                probe_board[key] = probe_line
+        probe_projection, probe_source = _canonical_k_projection(probe_board, probe_row)
+        biological_projection_probe.append(probe_projection)
+        projection_sources.append(probe_source)
+    valid_probes = [value for value in biological_projection_probe if value is not None]
+    line_independent = bool(valid_probes) and len({round(float(value), 6) for value in valid_probes}) == 1
+    prior_projection = _V267_PROJECTION_LEDGER.get(input_hash)
+    same_input_same_projection = prior_projection is None or (
+        projection is not None and abs(float(prior_projection) - float(projection)) <= 0.001
+    )
+    if projection is not None and prior_projection is None:
+        _V267_PROJECTION_LEDGER[input_hash] = float(projection)
+    return {
+        "input_hash": input_hash,
+        "biological_input_hash": input_hash,
+        "decision_input_hash": hashlib.sha256(decision_json.encode("utf-8")).hexdigest(),
+        "model_config_hash": config_hash,
+        "projection_seed": seed,
+        "final_projected_K": projection,
+        "SAME_INPUT_SAME_PROJECTION": "PASS" if same_input_same_projection else "FAIL",
+        "UNEXPLAINED_REFRESH_DRIFT": not same_input_same_projection,
+        "LINE_INDEPENDENCE_TEST": "PASS" if line_independent else "FAIL",
+        "BIOLOGICAL_PROJECTION_CONTAMINATED_BY_MARKET_LINE": not line_independent,
+        "line_independence_projection_probe": json.dumps(biological_projection_probe),
+        "line_independence_projection_sources": json.dumps(projection_sources),
+    }
+
+
+def apply_v266_profile_runtime(df, board=None):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    out = df.copy()
+    lookup = _canonical_k_board_lookup(board)
+    records = []
+    for idx, rr in out.iterrows():
+        row = rr.to_dict()
+        board_row = _canonical_k_pick_board_row(lookup, row)
+        projection = _v266_number(row.get("Canonical Final K Projection"), None)
+        line = _v266_number(row.get("Canonical Line"), _canonical_k_line(row, board_row))
+        profile = _v266_profile_family(row, board_row)
+        reconciliation = _v266_lineup_reconciliation(board_row)
+        timing = _v266_first_inning_profile(row, board_row, profile)
+        order_aware = _v266_order_aware_distribution(row, board_row, timing)
+        freshness = _v266_freshness(row, board_row)
+        completeness = _v266_completeness(row, board_row, reconciliation)
+        reproducibility = _v266_reproducibility(row, board_row, projection, line)
+        final_state = str(row.get("Final Decision State") or "NO_LINE")
+        final_reason = str(row.get("Final Decision Reason") or "")
+        if completeness["critical_missing_count"] >= MERGE_V266_CONFIG["critical_missing_pass_count"]:
+            final_state = "PASS_DATA_INCOMPLETE"
+            final_reason = "Critical projection inputs are incomplete: " + ", ".join(json.loads(completeness["critical_missing_fields"]))
+        if reproducibility.get("SAME_INPUT_SAME_PROJECTION") == "FAIL" or reproducibility.get("LINE_INDEPENDENCE_TEST") == "FAIL":
+            final_state = "PASS_MODEL_CONFLICT"
+            final_reason = "Projection reproducibility or sportsbook-line independence invariant failed."
+        final_side = _v265_state_side(final_state) or _v265_side_from_projection(projection, line)
+        distribution = _v265_json_obj(row.get("Exact Line Distribution"))
+        probability = distribution.get("over_probability") if final_side == "OVER" else distribution.get("under_probability")
+        record = {
+            "_idx": idx,
+            **profile,
+            **reconciliation,
+            **timing,
+            **order_aware,
+            **freshness,
+            **completeness,
+            **reproducibility,
+            "final_decision_state": final_state,
+            "Final Decision State": final_state,
+            "Final Decision Display": _v265_state_display(final_state),
+            "Final Decision Reason": final_reason,
+            "Final Decision Side": final_side,
+            "Final Decision Confidence %": None if probability is None else round(float(probability) * 100.0, 1),
+            "EARLY_K_TIMING_correlation_guard_applied": True,
+            "K_EFFICIENCY_correlation_guard_applied": True,
+            "timing_rescue_supported": False,
+            "timing_rescue_blocked": True,
+            "timing_surrendered_winner": False,
+            "Canonical Runtime Version": MERGE_V266_RUNTIME_VERSION,
+        }
+        records.append(record)
+        if isinstance(board_row, dict):
+            board_row.update({key: value for key, value in record.items() if key != "_idx"})
+            board_row["first_inning_profile_v266"] = timing
+            board_row["lineup_reconciliation_v266"] = reconciliation
+            board_row["order_aware_sim_v266"] = order_aware
+            board_row["data_freshness_v266"] = freshness
+            board_row["data_completeness_v266"] = completeness
+            board_row["final_decision_state"] = final_state
+            board_row["final_decision_reason"] = final_reason
+            board_row["final_decision_side"] = final_side
+    add = pd.DataFrame(records).set_index("_idx")
+    for column in add.columns:
+        out[column] = add[column].reindex(out.index)
+    out["Canonical Decision"] = out["Final Decision Display"]
+    out["Decision"] = out["Final Decision Display"]
+    out["Final K Decision"] = out["Final Decision Display"]
+    out["Line-Aware Smart Decision"] = out["Final Decision Display"]
+    out["Main Engine Action"] = out["Final Decision Display"]
+    out["Model Lean"] = out["Final Decision Side"]
+    out["Canonical Side"] = out["Final Decision Side"]
+    out["Final Resolved Side"] = out["Final Decision Side"]
+    out["Active K Pipeline"] = MERGE_V266_RUNTIME_VERSION
+    return out
+
+
 def _canonical_k_board_signature(board):
     rows = []
     for p in board or []:
         if not isinstance(p, dict):
             continue
+        lineup_rows = _v266_lineup_rows(p) if "_v266_lineup_rows" in globals() else (p.get("lineup_rows") or [])
+        lineup_signature = tuple(
+            (
+                normalize_name(item.get("Batter") or item.get("Player") or item.get("Name") or ""),
+                safe_int(item.get("Order"), 0) or 0,
+                _v266_row_k_rate(item) if "_v266_row_k_rate" in globals() else item.get("Used K%"),
+            )
+            for item in lineup_rows[:9] if isinstance(item, dict)
+        )
         rows.append((
             normalize_name(p.get("pitcher") or p.get("Pitcher") or ""),
             str(p.get("matchup") or p.get("Matchup") or ""),
@@ -57392,6 +59337,9 @@ def _canonical_k_board_signature(board):
             str(p.get("lineup_status") or ""),
             str(p.get("data_quality_gate_status") or ""),
             _canonical_k_num(p.get("data_quality_gate_score"), None),
+            str(p.get("line_timestamp") or p.get("underdog_pull_time") or ""),
+            str(p.get("official_lineup_timestamp") or p.get("lineup_timestamp") or ""),
+            lineup_signature,
         ))
     return tuple(rows)
 
@@ -57400,6 +59348,7 @@ def build_k_projection_pipeline(board):
     """The only active K-table execution path."""
     if _CANONICAL_LEGACY_ENRICHMENT_PIPELINE is None:
         return pd.DataFrame()
+    core_started = _a86_time.perf_counter()
     signature = _canonical_k_board_signature(board)
     cached = _CANONICAL_K_RUNTIME_CACHE.get(signature)
     if isinstance(cached, pd.DataFrame):
@@ -57417,7 +59366,19 @@ def build_k_projection_pipeline(board):
     except Exception:
         pass
     df = _canonicalize_k_table(df, board=board, relock=True)
+    # V2.6.5 locks the synchronized exact-line state. V2.6.7 adds the profile,
+    # first-inning K, decision sync, and real line-independence guards without
+    # allowing the sportsbook threshold to alter the biological mean.
+    df = apply_v265_canonical_runtime(df, board=board)
+    df = apply_v266_profile_runtime(df, board=board)
     if isinstance(df, pd.DataFrame):
+        core_elapsed = round(max(0.0, _a86_time.perf_counter() - core_started), 4)
+        df["projection_core_load_time"] = core_elapsed
+        # History and timing panels render from the already-batched row context;
+        # expanding a card performs no per-card network request.
+        df["history_panel_load_time"] = 0.0
+        df["history_panel_load_mode"] = "BATCHED_CONTEXT_NO_CARD_NETWORK"
+        df["mobile_render_status"] = "READY"
         _CANONICAL_K_RUNTIME_CACHE[signature] = df.copy()
     return df
 
@@ -57442,6 +59403,9 @@ def _impl_kclean_final_edge_02(row, default=np.nan):
 
 
 def _impl_kclean_side_label_02(row):
+    state_side = _v265_state_side(_kclean_pick(row, ["Final Decision State", "final_decision_state"], ""))
+    if state_side:
+        return state_side
     proj, line = _kclean_final_proj_line(row)
     if np.isfinite(proj) and np.isfinite(line):
         return "OVER" if proj > line else "UNDER"
