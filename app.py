@@ -26,7 +26,7 @@ from math import exp, factorial
 from datetime import datetime, timedelta
 from pathlib import Path
 
-APP_VERSION = "ONE WAY PICKZ MASTER PO MERGE V2.6.7 DECISION SYNC + LINE INDEPENDENCE 2026-08-11"
+APP_VERSION = "ONE WAY PICKZ MASTER PO MERGE V2.6.8 DIRECTIONAL CARDS + DECISION AUDIT 2026-08-11"
 FULL_APP_UPDATE_MARKER = "FULL_APP_CANONICAL_K_PIPELINE_2026_07_30"
 # =========================
 # STABLE PROJECTION SEEDING
@@ -17084,7 +17084,7 @@ def save_many_once(new_picks):
             official = dict(p)
             official["official_snapshot_saved_at"] = now_iso()
             official["snapshot_type"] = "OFFICIAL_BEFORE_GAME"
-            official["snapshot_schema"] = "MERGE_V2_6_7_REPRODUCIBLE_PREGAME"
+            official["snapshot_schema"] = "MERGE_V2_6_8_REPRODUCIBLE_PREGAME"
             official["app_version"] = APP_VERSION
             try:
                 official["build_hash"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
@@ -51324,42 +51324,10 @@ def _impl_kclean_side_label_01(row):
 
 
 def _kclean_display_decision(row):
-    final_state = str(_kclean_pick(row, ["Final Decision State", "final_decision_state"], "") or "").upper()
-    if final_state:
-        return _v265_state_display(final_state)
+    # The public board is directional by design. Resolver PASS states remain
+    # available as audit warnings, but never replace the visible Over/Under.
     side = _kclean_side_label(row)
-    edge = _kclean_final_edge(row, np.nan)
-    canonical = str(_kclean_pick(row, [
-        "Canonical Decision", "Final K Decision", "Main Engine Action", "Decision"
-    ], "") or "").upper()
-    official_filter = str(_kclean_pick(row, ["Official Filter"], "") or "").upper()
-
-    if "PASS" in canonical or official_filter in {"PASS", "TRAP_PASS"}:
-        return "PASS"
-    if "LEAN" in canonical or official_filter == "LEAN_ONLY":
-        return f"LEAN {side}" if side in {"OVER", "UNDER"} else "TRACK"
-    if "OFFICIAL" in canonical or "BET OVER" in canonical or "BET UNDER" in canonical or "🔥" in canonical:
-        return f"FIRE {side}" if side in {"OVER", "UNDER"} else "TRACK"
-
-    reason = str(row.get("APP98 Loss Target Reason") or "").lower()
-    gate = str(row.get("APP99 Right Wins Gate") or "").upper()
-    if not side or side == "PASS":
-        return "TRACK"
-    if "RED" in gate:
-        return f"TRACK {side}"
-    if "ORANGE" in gate:
-        return f"TRACK {side}"
-    if np.isfinite(edge):
-        abs_edge = abs(edge)
-        if "contact-suppression" in reason or "thin sim" in reason or "pitcher k% warning" in reason:
-            return f"TRACK {side}"
-        if abs_edge >= 1.00:
-            return f"FIRE {side}"
-        if abs_edge >= 0.55:
-            return f"LEAN {side}"
-        if abs_edge >= 0.15:
-            return f"TRACK {side}"
-    return f"TRACK {side}"
+    return side if side in {"OVER", "UNDER"} else "NO LINE"
 
 
 def _kclean_main_df(df):
@@ -51373,6 +51341,8 @@ def _kclean_main_df(df):
         pitcher_k_display = _kclean_pct_display(pitcher_k_raw)
         pitcher_k_source = _kclean_pick(row, ["APP97 Pitcher K Source", "APP97 Pitcher K% Display Source", "Savant Custom Source", "Official Savant Source"], "")
         protected_decision = _kclean_display_decision(row)
+        internal_state = str(_kclean_pick(row, ["Final Decision State", "final_decision_state"], "") or "").upper()
+        risk_warning = internal_state[5:].replace("_", " ") if internal_state.startswith("PASS_") else ""
         rows.append({
             "Pitcher": _kclean_pick(row, ["Pitcher", "pitcher", "Player"], ""),
             "Matchup": _kclean_pick(row, ["Matchup", "matchup"], ""),
@@ -51387,8 +51357,9 @@ def _kclean_main_df(df):
             "Pick": protected_decision,
             "Discord Status": protected_decision,
             "Official Filter": _kclean_pick(row, ["Official Filter"], ""),
-            "Canonical Decision": _kclean_pick(row, ["Canonical Decision", "Final K Decision"], ""),
-            "Final Decision State": _kclean_pick(row, ["Final Decision State", "final_decision_state"], ""),
+            "Canonical Decision": protected_decision,
+            "Final Decision State": protected_decision,
+            "Risk Warning": risk_warning,
             "Final Decision Reason": _kclean_pick(row, ["Final Decision Reason"], ""),
             "P(Over Line)": _kclean_pick(row, ["P(OVER Today's Line)"], ""),
             "P(Under Line)": _kclean_pick(row, ["P(UNDER Today's Line)"], ""),
@@ -51449,9 +51420,7 @@ def _kclean_main_df(df):
         })
     out = pd.DataFrame(rows)
     try:
-        order = {"PLAY OVER": 0, "PLAY UNDER": 0, "TRACK OVER": 1, "TRACK UNDER": 1,
-                 "PASS - THIN EDGE": 2, "PASS - MODEL CONFLICT": 3, "PASS - PO CONFLICT": 3,
-                 "PASS - LINEUP UNCERTAIN": 3, "PASS - WORKLOAD UNCERTAIN": 3, "NO LINE": 4}
+        order = {"OVER": 0, "UNDER": 0, "NO LINE": 4}
         out["_sort_pick"] = out["Pick"].astype(str).map(lambda x: order.get(x, 9))
         out["_sort_edge"] = pd.to_numeric(out["Edge"], errors="coerce").abs().fillna(-1)
         out = out.sort_values(["_sort_pick", "_sort_edge"], ascending=[True, False]).drop(columns=["_sort_pick", "_sort_edge"])
@@ -51504,18 +51473,22 @@ def _kclean_copy_paste_slate(df, include_thin=False):
                 edge = _kclean_final_edge(row, np.nan)
                 if not np.isfinite(edge):
                     edge = proj - line
-                state = str(_kclean_pick(row, ["Final Decision State", "final_decision_state"], "") or "").upper()
-                side = _v265_state_side(state) or _kclean_side_label(row)
-                if not state:
-                    state = f"TRACK_{side}" if side in {"OVER", "UNDER"} else "NO_LINE"
-                if not include_thin and not state.startswith("PLAY_"):
+                side = _kclean_side_label(row)
+                if side not in {"OVER", "UNDER"}:
                     continue
-                symbol = _v265_state_display(state)
                 ip = _kclean_num(_kclean_pick(row, ["IP Floor", "IP PROJ", "Projected IP", "IP Projection"], ""), np.nan)
                 ip_text = "—" if not np.isfinite(ip) else f"{ip:.2f}"
-                prob = _kclean_num(_kclean_pick(row, ["Final Decision Confidence %", "K Sim Current Side Prob %"], np.nan), np.nan)
+                probability_key = "P(OVER Today's Line)" if side == "OVER" else "P(UNDER Today's Line)"
+                prob = _kclean_num(_kclean_pick(row, [probability_key, "Final Decision Confidence %", "K Sim Current Side Prob %"], np.nan), np.nan)
+                if np.isfinite(prob) and prob <= 1:
+                    prob *= 100.0
+                if not include_thin:
+                    probability_ok = np.isfinite(prob) and prob >= float(MERGE_V265_CONFIG.get("play_probability", 0.59)) * 100.0
+                    edge_ok = abs(float(edge)) >= float(MERGE_V265_CONFIG.get("track_edge_k", 0.60))
+                    if not (probability_ok and edge_ok):
+                        continue
                 prob_text = "" if not np.isfinite(prob) else f" — {prob:.0f}%"
-                block.append(f"• {row.get('Pitcher')} — {symbol} {line:.1f} — {proj:.2f} K{prob_text} — IP {ip_text}")
+                block.append(f"• {row.get('Pitcher')} — {side} {line:.1f} — {proj:.2f} K{prob_text} — IP {ip_text}")
             if block:
                 lines.append(str(matchup))
                 lines.extend(block)
@@ -51527,21 +51500,23 @@ def _kclean_copy_paste_slate(df, include_thin=False):
 
 def _kclean_card_decision(row):
     proj, line = _kclean_final_proj_line(row)
-    state = str(_kclean_pick(row, ["Final Decision State", "final_decision_state"], "") or "").upper()
-    side = _v265_state_side(state) or _kclean_side_label(row)
+    side = _kclean_side_label(row)
     edge = round(float(proj - line), 2) if np.isfinite(proj) and np.isfinite(line) else _kclean_final_edge(row, np.nan)
-    prob = _kclean_num(_kclean_pick(row, ["Final Decision Confidence %", "K Sim Current Side Prob %", "K Sim True Prob %", "Sim Side %"], ""), np.nan)
+    probability_key = "P(OVER Today's Line)" if side == "OVER" else "P(UNDER Today's Line)"
+    prob = _kclean_num(_kclean_pick(row, [probability_key, "Final Decision Confidence %", "K Sim Current Side Prob %", "K Sim True Prob %", "Sim Side %"], ""), np.nan)
     if np.isfinite(prob) and prob <= 1:
         prob *= 100.0
-    if state.startswith("PLAY_"):
-        tier = "PLAY"
-    elif state.startswith("TRACK_"):
-        tier = "TRACK"
-    elif state.startswith("PASS_"):
-        tier = "PASS"
-    else:
+    if side not in {"OVER", "UNDER"}:
         tier = "NO LINE"
-    return _v265_state_display(state) if state else side, edge, prob, tier
+    elif np.isfinite(prob) and prob >= 70.0:
+        tier = "HIGH"
+    elif np.isfinite(prob) and prob >= 60.0:
+        tier = "GOOD"
+    elif np.isfinite(prob) and prob >= 54.0:
+        tier = "LEAN"
+    else:
+        tier = "CAUTION"
+    return side if side in {"OVER", "UNDER"} else "NO LINE", edge, prob, tier
 
 
 def _kcard_split_matchup(matchup):
@@ -52359,6 +52334,11 @@ def _v265_model_audit_html(row, p):
                     return html.escape(str(item))
         return default
 
+    public_side = _kclean_side_label(row or {})
+    internal_state = str(_kclean_pick(row or {}, ["Final Decision State", "final_decision_state"], "") or "").upper()
+    risk_warning = internal_state[5:].replace("_", " ") if internal_state.startswith("PASS_") else "NONE"
+    line_guard = value(["Hybrid Line Guard", "hybrid_line_guard_status"])
+    line_guard = line_guard.replace("PASS_", "").replace("PASS - ", "").replace("PASS/", "REVIEW/")
     audit_cells = [
         ("Savant", value(["Savant Custom Status", "Official Savant Status", "savant_status"])),
         ("Data quality", value(["Data Quality Gate", "data_quality_gate_status"])),
@@ -52374,9 +52354,10 @@ def _v265_model_audit_html(row, p):
         ("P(Over) / P(Under)", "{}% / {}%".format(value(["P(OVER Today's Line)"]), value(["P(UNDER Today's Line)"]))),
         ("Model spread", value(["Hybrid Model Spread", "hybrid_model_spread"])),
         ("Hybrid status", value(["Hybrid Model Status", "hybrid_model_status"])),
-        ("Line guard", value(["Hybrid Line Guard", "hybrid_line_guard_status"])),
+        ("Line guard", line_guard),
         ("Gate score", value(["Data Quality Score", "data_quality_gate_score"])),
-        ("Final decision", value(["Final Decision State", "final_decision_state"])),
+        ("Directional recommendation", public_side or "NO LINE"),
+        ("Risk warning", risk_warning),
         ("Projection consistency", value(["Projection Consistency", "projection_consistency"])),
         ("Rate consistency", value(["Projection Rate Consistency", "projection_rate_consistency"])),
         ("Workload confidence", value(["workload_context_confidence"])),
@@ -52404,12 +52385,12 @@ def _v265_model_audit_html(row, p):
         ("Arsenal", value(["arsenal_delta"])), ("Home/Away", value(["home_away_delta"])),
         ("Other", value(["other_delta"])),
     ]
-    reason = value(["Final Decision Reason", "final_decision_reason"])
+    reason = value(["Final Decision Reason", "final_decision_reason"]).replace("PASS_", "").replace("PASS - ", "")
     history_reason = value(["Why Model Disagrees With History"])
     return (
         f"<div class='kc-auditgrid'>{''.join(f'<div><span>{label}</span><b>{item}</b></div>' for label, item in audit_cells)}</div>"
         f"<div class='kc-deltas'>{''.join(f'<span>{label} <b>{item}</b></span>' for label, item in deltas)}</div>"
-        f"<div class='kc-why'><b>Why this state</b><br>{reason}</div>"
+        f"<div class='kc-why'><b>Risk explanation</b><br>{reason}</div>"
         f"<div class='kc-why'><b>Why model disagrees with history</b><br>{history_reason}</div>"
     )
 
@@ -52719,7 +52700,7 @@ def _kclean_render_player_cards(df, board=None, limit=None):
 def _v265_mobile_package_bytes():
     """Return a mobile-safe package without depending on a developer path."""
     root = Path(__file__).resolve().parent
-    archive_name = "Merge_V2_6_7_MLB_FINAL_MOBILE.zip"
+    archive_name = "Merge_V2_6_8_MLB_FINAL_MOBILE.zip"
     prebuilt = root / archive_name
     if prebuilt.exists() and prebuilt.is_file():
         payload = prebuilt.read_bytes()
@@ -52751,11 +52732,11 @@ def render_v265_download_panel():
         payload, checksum, integrity = _v265_mobile_package_bytes()
         size_mb = len(payload) / (1024.0 * 1024.0)
         build_stamp = datetime.fromtimestamp(Path(__file__).stat().st_mtime).astimezone().strftime("%Y-%m-%d %I:%M %p %Z")
-        with st.expander("CURRENT VERIFIED FILES · Merge V2.6.7 MLB", expanded=False):
+        with st.expander("CURRENT VERIFIED FILES · Merge V2.6.8 MLB", expanded=False):
             st.markdown("### Engine Downloads")
             st.caption("Lineup resolver + pitcher profiles + first-inning K + model audit + canonical decision sync")
             st.markdown(
-                f"**Merge V2.6.7 MLB** · `CURRENT`  \n"
+                f"**Merge V2.6.8 MLB** · `CURRENT`  \n"
                 f"Package size: **{size_mb:.2f} MB**  \n"
                 f"Archive integrity: **{integrity}**  \n"
                 f"Build: **{build_stamp}**  \n"
@@ -52764,11 +52745,11 @@ def render_v265_download_panel():
             st.download_button(
                 "DOWNLOAD MLB ZIP",
                 data=payload,
-                file_name="Merge_V2_6_7_MLB_FINAL_MOBILE.zip",
+                file_name="Merge_V2_6_8_MLB_FINAL_MOBILE.zip",
                 mime="application/zip",
                 use_container_width=True,
                 disabled=integrity != "PASS",
-                key="download_merge_v267_mobile_zip",
+                key="download_merge_v268_mobile_zip",
             )
     except Exception as exc:
         st.info(f"Mobile package is not available in this runtime: {exc}")
@@ -52812,16 +52793,15 @@ def _impl_render_kproj_tab_08(board):
 
     try:
         total = len(main)
-        states = main["Final Decision State"].astype(str) if "Final Decision State" in main else main["Pick"].astype(str)
-        play = int(states.str.startswith("PLAY_").sum())
-        track = int(states.str.startswith("TRACK_").sum())
-        pass_ct = int(states.str.startswith("PASS_").sum())
-        no_line = int(states.eq("NO_LINE").sum())
+        states = main["Pick"].astype(str).str.upper()
+        over_count = int(states.eq("OVER").sum())
+        under_count = int(states.eq("UNDER").sum())
+        risk_count = int(main.get("Risk Warning", pd.Series(index=main.index, dtype=str)).astype(str).str.len().gt(0).sum())
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Pitchers", total)
-        m2.metric("Play", play)
-        m3.metric("Track", track)
-        m4.metric("Pass / No Line", pass_ct + no_line)
+        m2.metric("Over", over_count)
+        m3.metric("Under", under_count)
+        m4.metric("Risk Warnings", risk_count)
     except Exception:
         pass
 
@@ -58599,14 +58579,15 @@ def apply_v265_canonical_runtime(df, board=None):
 
 
 # =============================================================================
-# MERGE V2.6.7 DECISION-SYNC / LINE-INDEPENDENCE ENRICHMENT
+# MERGE V2.6.8 DIRECTIONAL PUBLIC OUTPUT / DECISION-AUDIT ENRICHMENT
 #
 # This layer is intentionally downstream of the locked biological projection.
 # It adds diagnostics, a real order-aware first-inning K expectation, and
 # fail-closed decision guards. It never reads a sportsbook line while building
 # the biological projection or the order-aware pitcher profile.
 # =============================================================================
-MERGE_V267_RUNTIME_VERSION = "MERGE_V2_6_7_DECISION_SYNC_LINE_INDEPENDENCE_2026_08_11"
+MERGE_V268_RUNTIME_VERSION = "MERGE_V2_6_8_DIRECTIONAL_PUBLIC_OUTPUT_2026_08_11"
+MERGE_V267_RUNTIME_VERSION = MERGE_V268_RUNTIME_VERSION
 MERGE_V266_RUNTIME_VERSION = MERGE_V267_RUNTIME_VERSION
 MERGE_V266_CONFIG = {
     "lineup_reconciliation_tolerance_pp": 0.30,
@@ -59366,9 +59347,10 @@ def build_k_projection_pipeline(board):
     except Exception:
         pass
     df = _canonicalize_k_table(df, board=board, relock=True)
-    # V2.6.5 locks the synchronized exact-line state. V2.6.7 adds the profile,
-    # first-inning K, decision sync, and real line-independence guards without
-    # allowing the sportsbook threshold to alter the biological mean.
+    # V2.6.5 locks the synchronized exact-line state. V2.6.8 keeps those
+    # internal risk diagnostics while exposing an Over/Under recommendation
+    # on cards and public exports. The sportsbook threshold cannot alter the
+    # biological mean.
     df = apply_v265_canonical_runtime(df, board=board)
     df = apply_v266_profile_runtime(df, board=board)
     if isinstance(df, pd.DataFrame):
