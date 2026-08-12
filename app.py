@@ -49242,8 +49242,10 @@ DATA_PACK_FILE_MAP = {
     "confirmed_lineups_daily_template.csv": "confirmed_lineups_daily.csv",
     "savant_pitcher_stats.csv": "savant_pitcher_stats.csv",
     "savant_pitcher_stats_template.csv": "savant_pitcher_stats.csv",
+    "savant_pitcher_stats.last_good.csv": "savant_pitcher_stats.last_good.csv",
     "pitch_mix_matchups.csv": "pitch_mix_matchups.csv",
     "pitch_mix_matchups_template.csv": "pitch_mix_matchups.csv",
+    "pitch_mix_matchups.last_good.csv": "pitch_mix_matchups.last_good.csv",
     "savant_pitch_level_heatmap_foul.csv": "savant_pitch_level_heatmap_foul.csv",
     "savant_pitch_level_heatmap_foul_template.csv": "savant_pitch_level_heatmap_foul.csv",
     "foul_workload_savant.csv": "foul_workload_savant.csv",
@@ -49251,8 +49253,20 @@ DATA_PACK_FILE_MAP = {
     "Batter.csv": "Batter.csv",
     "Batter_template.csv": "Batter.csv",
     "savant_batter_profiles.csv": "savant_batter_profiles.csv",
+    "savant_batter_profiles.last_good.csv": "savant_batter_profiles.last_good.csv",
+    "savant_batter_platoon_2026.csv": "savant_batter_platoon_2026.csv",
+    "savant_batter_platoon_2026.last_good.csv": "savant_batter_platoon_2026.last_good.csv",
+    "savant_refresh_manifest.json": "savant_refresh_manifest.json",
+    "savant_aux_refresh_manifest.json": "savant_aux_refresh_manifest.json",
     "graded_history.csv": "graded_history.csv",
     "graded_history_template.csv": "graded_history.csv",
+}
+
+DATA_PACK_VALIDATION_NAME = {
+    "savant_pitcher_stats.last_good.csv": "savant_pitcher_stats.csv",
+    "pitch_mix_matchups.last_good.csv": "pitch_mix_matchups.csv",
+    "savant_batter_profiles.last_good.csv": "savant_batter_profiles.csv",
+    "savant_batter_platoon_2026.last_good.csv": "savant_batter_platoon_2026.csv",
 }
 
 
@@ -49341,6 +49355,51 @@ def _data_pack_install(uploaded_files):
         if not target_name:
             status.append({"File": original_name, "Saved As": "", "Rows": 0, "Status": "SKIPPED", "Note": "not one of the starter data-pack files"})
             continue
+
+        # Manifest JSON files are part of the Savant cache/recovery pack.
+        if target_name.endswith(".json"):
+            try:
+                raw = up.getvalue() if hasattr(up, "getvalue") else up.read()
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8")
+                payload = json.loads(raw)
+                if not isinstance(payload, dict):
+                    raise ValueError("manifest must contain a JSON object")
+                if target_name == "savant_refresh_manifest.json":
+                    required = {"dataset", "schema_version", "season", "status"}
+                    missing = sorted(required - set(payload.keys()))
+                    if missing:
+                        raise ValueError("missing manifest fields: " + ", ".join(missing))
+                elif target_name == "savant_aux_refresh_manifest.json":
+                    required = {"datasets", "schema_version", "season", "status"}
+                    missing = sorted(required - set(payload.keys()))
+                    if missing:
+                        raise ValueError("missing manifest fields: " + ", ".join(missing))
+            except Exception as e:
+                status.append({"File": original_name, "Saved As": target_name, "Rows": 0, "Status": "SCHEMA_REJECTED", "Note": str(e)[:140]})
+                continue
+
+            saved = []
+            for d in _data_pack_target_dirs():
+                try:
+                    d.mkdir(parents=True, exist_ok=True)
+                    out_path = d / target_name
+                    temp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+                    with open(temp_path, "w", encoding="utf-8") as f:
+                        json.dump(payload, f, indent=2)
+                    os.replace(temp_path, out_path)
+                    saved.append(str(out_path))
+                except Exception:
+                    continue
+            status.append({
+                "File": original_name,
+                "Saved As": target_name,
+                "Rows": int(len(payload.get("datasets", {}))) if isinstance(payload.get("datasets"), dict) else int(payload.get("row_count", 0) or 0),
+                "Status": "INSTALLED" if saved else "NOT_SAVED",
+                "Note": "; ".join(saved[:3]) if saved else "no writable learning_data target",
+            })
+            continue
+
         try:
             df = pd.read_csv(up)
         except Exception as e:
@@ -49349,7 +49408,9 @@ def _data_pack_install(uploaded_files):
         if _data_pack_is_template_only(df):
             status.append({"File": original_name, "Saved As": target_name, "Rows": 0, "Status": "TEMPLATE_ONLY", "Note": "header-only template was not installed"})
             continue
-        validation = validate_data_pack_frame(target_name, df, season=datetime.now().year)
+
+        validation_name = DATA_PACK_VALIDATION_NAME.get(target_name, target_name)
+        validation = validate_data_pack_frame(validation_name, df, season=datetime.now().year)
         if not validation.get("ok"):
             status.append({
                 "File": original_name,
@@ -49382,16 +49443,16 @@ def _data_pack_install(uploaded_files):
 
 def render_data_pack_installer_panel():
     st.markdown('<div class="section-title-pro">Starter Data Pack Installer</div>', unsafe_allow_html=True)
-    st.caption("Upload the filled CSVs here. Header-only templates are rejected so they cannot hurt projections. Installed files are support-first unless the app finds clean matching rows.")
-    with st.expander("Upload filled starter CSVs", expanded=False):
-        st.write("Accepted after purpose-specific schema validation: Pitch.csv, Batter.csv, confirmed_lineups_daily.csv, savant_pitcher_stats.csv, pitch_mix_matchups.csv, savant_pitch_level_heatmap_foul.csv, foul_workload_savant.csv, savant_batter_profiles.csv, graded_history.csv. The unsafe savant_data (3).csv alias is disabled.")
+    st.caption("Upload the filled CSV/JSON data-pack files here. Header-only templates are rejected so they cannot hurt projections. Installed files are support-first unless the app finds clean matching rows.")
+    with st.expander("Upload filled starter data files", expanded=False):
+        st.write("Accepted after purpose-specific schema validation include the Savant current/LAST_GOOD cache files, Savant refresh manifests, graded_history.csv, and the existing starter data-pack files. The unsafe savant_data (3).csv alias remains disabled.")
         ups = st.file_uploader(
-            "Upload filled data-pack CSVs",
-            type=["csv"],
+            "Upload filled data-pack CSV/JSON files",
+            type=["csv", "json"],
             accept_multiple_files=True,
             key="starter_data_pack_uploads",
         )
-        if st.button("Install uploaded CSVs", key="starter_data_pack_install_btn"):
+        if st.button("Install uploaded data files", key="starter_data_pack_install_btn"):
             result = _data_pack_install(ups)
             if result:
                 st.dataframe(pd.DataFrame(result), use_container_width=True, hide_index=True)
