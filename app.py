@@ -26,8 +26,22 @@ from math import exp, factorial
 from datetime import datetime, timedelta
 from pathlib import Path
 
-APP_VERSION = "ONE WAY PICKZ MASTER PO MERGE V2.6.8 DIRECTIONAL CARDS + DECISION AUDIT 2026-08-11"
+from merge_v269_safe_update import (
+    SAVANT_SCHEMA_VERSION,
+    SavantDataService,
+    attach_savant_shadow,
+    is_first_inning_k_market,
+    line_difficulty,
+    opportunity_conversion_audit,
+    validate_data_pack_frame,
+)
+from savant_aux_service import SavantAuxDataService
+from merge_v2610_validation import build_unified_post_grade_report, validate_graded_history
+
+APP_VERSION = "ONE WAY PICKZ MASTER PO MERGE V2.6.10 VERIFIED SAVANT DATA + SAFE SHADOW 2026-08-11"
 FULL_APP_UPDATE_MARKER = "FULL_APP_CANONICAL_K_PIPELINE_2026_07_30"
+MERGE_V269_SAFE_UPDATE_MARKER = "V269_SAFE_SAVANT_ORDER_SHADOW_NO_CONTROL_PROJECTION_CHANGE"
+MERGE_V2610_DATA_HARDENING_MARKER = "V2610_MLBAM_HAND_FAIL_CLOSED_AUX_LAST_GOOD_NO_PRODUCTION_PROMOTION"
 # =========================
 # STABLE PROJECTION SEEDING
 # =========================
@@ -31713,6 +31727,37 @@ def _impl_std_pull_batter_logs_02(start_date=None, end_date=None, max_games=2600
     _std_debug(f"Batter rows built: {len(df)}")
     return df
 
+
+def _std_persist_validated_logs(pdf, bdf):
+    """Atomically persist only schema-valid season logs and retain LAST_GOOD."""
+    base = Path(__file__).resolve().parent / "learning_data"
+    base.mkdir(parents=True, exist_ok=True)
+    status = {"timestamp": now_iso(), "pitch": {}, "batter": {}}
+    for filename, frame, key in (("Pitch.csv", pdf, "pitch"), ("Batter.csv", bdf, "batter")):
+        validation = validate_data_pack_frame(filename, frame, season=datetime.now().year)
+        status[key] = validation
+        if not validation.get("ok"):
+            continue
+        target = base / filename
+        last_good = base / filename.replace(".csv", ".last_good.csv")
+        temporary = base / filename.replace(".csv", ".refreshing.csv")
+        try:
+            if target.exists():
+                last_good.write_bytes(target.read_bytes())
+            frame.to_csv(temporary, index=False)
+            os.replace(temporary, target)
+            last_good.write_bytes(target.read_bytes())
+            status[key].update({"active_path": str(target), "last_good_path": str(last_good), "saved": True})
+        except Exception as exc:
+            temporary.unlink(missing_ok=True)
+            status[key].update({"saved": False, "error": str(exc)[:180]})
+    manifest = base / "season_game_log_manifest.json"
+    temporary_manifest = base / "season_game_log_manifest.refreshing.json"
+    temporary_manifest.write_text(json.dumps(status, indent=2, default=str), encoding="utf-8")
+    os.replace(temporary_manifest, manifest)
+    return status
+
+
 def _impl_render_season_to_date_puller_03():
     st.markdown("### 📥 MLB Season-To-Date Puller")
     st.caption("Pulls completed MLB games from season start through end date. Uses real boxscore logs for Learning IQ.")
@@ -31746,11 +31791,19 @@ def _impl_render_season_to_date_puller_03():
             off, bp = std_make_team_context(pdf, bdf)
             st.session_state["season_team_offense_df"] = off
             st.session_state["season_team_bullpen_df"] = bp
+            persistence = _std_persist_validated_logs(pdf, bdf)
+            st.session_state["season_log_persistence"] = persistence
 
         if len(pdf) == 0 and len(bdf) == 0:
             st.error("Season pull returned 0 rows. Open the diagnostics below — this usually means MLB API request failed or no completed games were returned for the selected dates.")
         else:
-            st.success(f"Loaded pitcher season rows: {len(pdf)} | batter season rows: {len(bdf)} | team offense: {len(off)} | bullpen: {len(bp)}")
+            pitch_saved = bool((persistence.get("pitch") or {}).get("saved"))
+            batter_saved = bool((persistence.get("batter") or {}).get("saved"))
+            st.success(
+                f"Loaded pitcher season rows: {len(pdf)} | batter season rows: {len(bdf)} | "
+                f"team offense: {len(off)} | bullpen: {len(bp)} | "
+                f"validated cache: Pitch {'PASS' if pitch_saved else 'FAIL'}, Batter {'PASS' if batter_saved else 'FAIL'}"
+            )
 
     with st.expander("Season Pull Diagnostics", expanded=False):
         for msg in st.session_state.get("std_debug_log", []):
@@ -39049,6 +39102,20 @@ def _beta_fetch_underdog_pitcher_market(player_name, market_kind):
             "first-inning", "1st-inning", "inning 1 pitches", "1st inning pitches"
         ]
         lo, hi = 6.5, 24.5
+    elif mk in ["FI_K", "FIRST_INNING_STRIKEOUTS", "1ST_INNING_STRIKEOUTS"]:
+        market_label = "1st Inning Strikeouts"
+        market_terms = [
+            "1st inning strikeouts", "first inning strikeouts", "1st-inning strikeouts",
+            "first-inning strikeouts", "pitcher 1st inning strikeouts",
+            "pitcher first inning strikeouts", "1st inning pitcher ks",
+            "first inning pitcher ks",
+        ]
+        bad_terms = [
+            "pitch count", "pitchcount", "pitches thrown", "pitching outs",
+            "outs recorded", "earned runs", "hits allowed", "walks allowed",
+            "fantasy points", "full game strikeouts",
+        ]
+        lo, hi = 0.5, 3.5
     elif mk in ["FI_PITCHES", "FIRST_INNING_PITCH_COUNT", "1ST_INNING_PITCH_COUNT"]:
         market_label = "1st Inning Pitch Count"
         market_terms = [
@@ -39426,7 +39493,14 @@ def _beta_fetch_underdog_pitcher_market(player_name, market_kind):
     sorted_rows = sorted(rows, key=rank_row, reverse=True)
     best = sorted_rows[0]
     debug_lines = ", ".join([f"{float(r.get('Line', 0)):.1f}({str(r.get('Line Evidence',''))[:18]})" for r in sorted_rows[:5]])
-    return {"status": "FOUND", "line": float(best["Line"]), "rows": sorted_rows, "message": f"Matched Underdog {market_label} {float(best['Line']):.1f}", "debug_lines": debug_lines}
+    return {
+        "status": "FOUND",
+        "line": float(best["Line"]),
+        "rows": sorted_rows,
+        "message": f"Matched Underdog {market_label} {float(best['Line']):.1f}",
+        "debug_lines": debug_lines,
+        "source_timestamp": now_iso(),
+    }
 
 
 def _impl_beta_projection_rows_01(board, market_kind="OUTS"):
@@ -39510,6 +39584,8 @@ def _beta_market_slug(market_kind):
     mk = str(market_kind or "").upper()
     if mk == "OUTS":
         return "outs"
+    if mk in ["FI_K", "FIRST_INNING_STRIKEOUTS", "1ST_INNING_STRIKEOUTS"]:
+        return "first_inning_strikeouts"
     if mk in ["FI_PITCHES", "FIRST_INNING_PITCH_COUNT", "1ST_INNING_PITCH_COUNT"]:
         return "first_inning_pitch_count"
     return "er_allowed"
@@ -39569,12 +39645,12 @@ def _beta_grade_saved_board(df, market_kind):
         if d.empty:
             return {"graded": 0, "message": "No numeric final results found yet."}
         def win_row(r):
-            line = _beta_num(r.get("UD Line"), None)
+            line = _beta_num(r.get("Sportsbook Line") if str(market_kind).upper() == "FI_K" else r.get("UD Line"), None)
             if str(market_kind).upper() == "OUTS":
                 active_lean = r.get("PO Active Lean", "")
                 lean = str(active_lean if active_lean not in [None, "", "—", "-", "nan", "NaN"] else r.get("Beta Lean", "")).upper()
             else:
-                lean = str(r.get("Beta Lean", "")).upper()
+                lean = str(r.get("Side") if str(market_kind).upper() == "FI_K" else r.get("Beta Lean", "")).upper()
             actual = _beta_num(r.get("Actual Value"), None)
             if line is None or actual is None or "NO LINE" in lean or lean in ["", "—"]:
                 return None
@@ -48435,11 +48511,9 @@ DATA_PACK_FILE_MAP = {
     "savant_pitch_level_heatmap_foul_template.csv": "savant_pitch_level_heatmap_foul.csv",
     "foul_workload_savant.csv": "foul_workload_savant.csv",
     "foul_workload_savant_template.csv": "foul_workload_savant.csv",
-    "savant_data (3).csv": "foul_workload_savant.csv",
     "Batter.csv": "Batter.csv",
     "Batter_template.csv": "Batter.csv",
-    "batter_profiles.csv": "Batter.csv",
-    "batter_profiles (1).csv": "Batter.csv",
+    "savant_batter_profiles.csv": "savant_batter_profiles.csv",
     "graded_history.csv": "graded_history.csv",
     "graded_history_template.csv": "graded_history.csv",
 }
@@ -48538,12 +48612,24 @@ def _data_pack_install(uploaded_files):
         if _data_pack_is_template_only(df):
             status.append({"File": original_name, "Saved As": target_name, "Rows": 0, "Status": "TEMPLATE_ONLY", "Note": "header-only template was not installed"})
             continue
+        validation = validate_data_pack_frame(target_name, df, season=datetime.now().year)
+        if not validation.get("ok"):
+            status.append({
+                "File": original_name,
+                "Saved As": target_name,
+                "Rows": len(df),
+                "Status": "SCHEMA_REJECTED",
+                "Note": "; ".join(validation.get("errors") or ["schema validation failed"]),
+            })
+            continue
         saved = []
         for d in _data_pack_target_dirs():
             try:
                 d.mkdir(parents=True, exist_ok=True)
                 out_path = d / target_name
-                df.to_csv(out_path, index=False)
+                temp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+                df.to_csv(temp_path, index=False)
+                os.replace(temp_path, out_path)
                 saved.append(str(out_path))
             except Exception:
                 continue
@@ -48561,7 +48647,7 @@ def render_data_pack_installer_panel():
     st.markdown('<div class="section-title-pro">Starter Data Pack Installer</div>', unsafe_allow_html=True)
     st.caption("Upload the filled CSVs here. Header-only templates are rejected so they cannot hurt projections. Installed files are support-first unless the app finds clean matching rows.")
     with st.expander("Upload filled starter CSVs", expanded=False):
-        st.write("Accepted: Pitch.csv, Batter.csv, confirmed_lineups_daily.csv, savant_pitcher_stats.csv, pitch_mix_matchups.csv, savant_pitch_level_heatmap_foul.csv, foul_workload_savant.csv, graded_history.csv. Template filenames are accepted only after they contain real rows.")
+        st.write("Accepted after purpose-specific schema validation: Pitch.csv, Batter.csv, confirmed_lineups_daily.csv, savant_pitcher_stats.csv, pitch_mix_matchups.csv, savant_pitch_level_heatmap_foul.csv, foul_workload_savant.csv, savant_batter_profiles.csv, graded_history.csv. The unsafe savant_data (3).csv alias is disabled.")
         ups = st.file_uploader(
             "Upload filled data-pack CSVs",
             type=["csv"],
@@ -51396,6 +51482,18 @@ def _kclean_main_df(df):
             "Pitcher Hand": _kclean_pick(row, ["APP100 Pitcher Hand", "Pitcher Hand", "Hand", "Throws"], ""),
             "Opp K%": _kclean_pick(row, ["Opponent K% vs Pitcher Hand", "APP97 Opponent K Environment", "APP88 Batter Lineup K%", "Lineup K%", "Opponent K% Used"], ""),
             "Opp K Source": _kclean_pick(row, ["Opponent K% vs Pitcher Hand Source", "Handedness Source"], ""),
+            "Opp K L15 vs Hand": _kclean_pick(row, ["Team K% L15 vs Hand"], ""),
+            "Opp K L10 vs Hand": _kclean_pick(row, ["Team K% L10 vs Hand"], ""),
+            "Opp K L5 vs Hand": _kclean_pick(row, ["Team K% L5 vs Hand"], ""),
+            "Savant Raw Lineup K%": _kclean_pick(row, ["Savant Raw Simple K%"], ""),
+            "Savant Raw Order K%": _kclean_pick(row, ["Savant Raw Order-Weighted K%"], ""),
+            "Savant Shadow": _kclean_pick(row, ["Savant Shadow Status"], ""),
+            "K Opportunity": _kclean_pick(row, ["K Opportunity Score"], ""),
+            "K Conversion": _kclean_pick(row, ["K Conversion Score"], ""),
+            "Over Gate": _kclean_pick(row, ["Over Validation Gate"], ""),
+            "Line Context": _kclean_pick(row, ["Line Difficulty State"], ""),
+            "Low-Line Under Risk": _kclean_pick(row, ["LOW_LINE_UNDER_DANGER"], ""),
+            "Suppression Audit": _kclean_pick(row, ["Suppression Audit State"], ""),
             "Pitcher K%": pitcher_k_display,
             "K/9": _kclean_pick(row, ["APP100 Pitcher K/9", "APP97 Live Pitcher K/9", "Pitcher K/9 Used"], ""),
             "BB/9": _kclean_pick(row, ["APP100 Pitcher BB/9", "APP97 Live Pitcher BB/9", "Pitcher BB/9 Used", "Run Damage BB9"], ""),
@@ -52121,6 +52219,184 @@ def _v265_pct_text(value):
     return f"{value:.0f}%"
 
 
+@st.cache_resource(show_spinner=False)
+def _v269_savant_service():
+    cache_dir = Path(__file__).resolve().parent / "learning_data"
+    return SavantDataService(cache_dir=cache_dir, season=datetime.now().year)
+
+
+@st.cache_resource(show_spinner=False)
+def _v2610_savant_aux_service():
+    cache_dir = Path(__file__).resolve().parent / "learning_data"
+    return SavantAuxDataService(cache_dir=cache_dir, season=datetime.now().year)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _v269_load_savant_platoon(active_mtime=0.0, targeted_mtime=0.0):
+    del active_mtime, targeted_mtime
+    return _v269_savant_service().load()
+
+
+def _v2610_lineup_mlbam_ids(board=None):
+    identifiers = set()
+    for pitcher in board or []:
+        if not isinstance(pitcher, dict):
+            continue
+        for hitter in _v266_lineup_rows(pitcher):
+            if not isinstance(hitter, dict):
+                continue
+            value = next(
+                (
+                    hitter.get(key)
+                    for key in ("mlbam_id", "MLBAM ID", "player_id", "Player ID", "Batter ID")
+                    if hitter.get(key) not in (None, "")
+                ),
+                None,
+            )
+            try:
+                if value not in (None, ""):
+                    identifiers.add(str(int(float(value))))
+            except (TypeError, ValueError):
+                pass
+    return sorted(identifiers)
+
+
+def _v2610_refresh_savant_worker(platoon_service, aux_service, player_ids):
+    """Network worker: one controlled refresh path, never one call per card."""
+    try:
+        platoon_service.refresh(force=False)
+        platoon_service.refresh_missing_players(player_ids, force=False)
+    except Exception:
+        pass
+    try:
+        aux_service.refresh(force=False)
+    except Exception:
+        pass
+
+
+def _v269_start_savant_refresh_if_needed(board=None):
+    """Launch one non-blocking data refresh; cards immediately use LAST_GOOD."""
+    try:
+        service = _v269_savant_service()
+        aux_service = _v2610_savant_aux_service()
+        health = service.health()
+        aux_health = aux_service.health_all()
+        player_ids = _v2610_lineup_mlbam_ids(board)
+        cached = service.load()
+        cached_ids = set(cached.get("mlbam_id", pd.Series(dtype=str)).astype(str)) if not cached.empty else set()
+        unresolved = [player_id for player_id in player_ids if player_id not in cached_ids]
+        all_aux_current = bool(aux_health) and all(item.get("status") == "CURRENT" for item in aux_health.values())
+        if st.session_state.get("v269_savant_refresh_started"):
+            return {**health, "aux_status": "CURRENT" if all_aux_current else "REFRESH_PENDING", "targeted_missing": len(unresolved)}
+        if health.get("status") == "CURRENT" and all_aux_current and not unresolved:
+            return {**health, "aux_status": "CURRENT", "targeted_missing": 0}
+        st.session_state["v269_savant_refresh_started"] = True
+        import threading
+        threading.Thread(
+            target=_v2610_refresh_savant_worker,
+            args=(service, aux_service, player_ids),
+            daemon=True,
+        ).start()
+        return {
+            **health,
+            "background_refresh": "STARTED",
+            "aux_status": "CURRENT" if all_aux_current else "REFRESH_PENDING",
+            "targeted_missing": len(unresolved),
+        }
+    except Exception as exc:
+        return {"status": "FAILED", "error": str(exc)[:180]}
+
+
+def _v269_savant_shadow_rows(lineup_rows, pitcher_hand, expected_bf, board_row=None):
+    try:
+        service = _v269_savant_service()
+        mtime = service.active_path.stat().st_mtime if service.active_path.exists() else 0.0
+        targeted_mtime = service.targeted_path.stat().st_mtime if service.targeted_path.exists() else 0.0
+        platoon = _v269_load_savant_platoon(mtime, targeted_mtime)
+        enriched, audit = attach_savant_shadow(lineup_rows, pitcher_hand, platoon, expected_bf)
+        if isinstance(board_row, dict):
+            board_row.update({
+                "savant_enriched_lineup_rows": [dict(item) for item in enriched if isinstance(item, dict)],
+                "savant_shadow_status": audit.get("status"),
+                "savant_shadow_matched_hitters": audit.get("matched"),
+                "simple_savant_lineup_k_pct": audit.get("simple_savant_lineup_k_pct"),
+                "raw_savant_order_weighted_k_exposure": audit.get("order_weighted_savant_k_pct"),
+                "top3_savant_k_pct": audit.get("top3_savant_k_pct"),
+                "middle3_savant_k_pct": audit.get("middle3_savant_k_pct"),
+                "bottom3_savant_k_pct": audit.get("bottom3_savant_k_pct"),
+                "savant_shadow_projection_effect_k": 0.0,
+                "savant_shadow_mode": "SHADOW_NO_PRODUCTION_EFFECT",
+            })
+        return enriched, audit
+    except Exception as exc:
+        return list(lineup_rows or []), {"status": "UNAVAILABLE", "error": str(exc)[:140], "matched": 0}
+
+
+def _v269_render_savant_health_panel(board=None):
+    service = _v269_savant_service()
+    aux_service = _v2610_savant_aux_service()
+    health = service.health()
+    aux_health = aux_service.health_all()
+    st.markdown("#### Savant Data Health")
+    h1, h2, h3, h4 = st.columns(4)
+    h1.metric("Batter platoon", health.get("status", "UNKNOWN"))
+    h2.metric("Rows", health.get("row_count", 0))
+    h3.metric("Age days", health.get("age_days") if health.get("age_days") is not None else "—")
+    h4.metric("Schema", SAVANT_SCHEMA_VERSION.rsplit("_", 1)[-1])
+    st.caption(f"Last success: {health.get('last_success_at') or '—'} · fallback: {health.get('fallback_status') or '—'}")
+    data_root = Path(__file__).resolve().parent / "learning_data"
+    dataset_rows = [{
+        "Dataset": "Batter vs RHP/LHP",
+        "Status": health.get("status", "UNKNOWN"),
+        "Rows": health.get("row_count", 0),
+        "Freshness": health.get("last_success_at") or "—",
+    }]
+    for dataset, label in (
+        ("batter_profiles", "Batter overall"),
+        ("pitcher_stats", "Pitcher"),
+        ("pitch_mix_matchups", "Pitch arsenal"),
+    ):
+        item = aux_health.get(dataset) or {}
+        dataset_rows.append({
+            "Dataset": label,
+            "Status": item.get("status", "FAILED"),
+            "Rows": item.get("row_count", 0),
+            "Freshness": "—" if item.get("age_days") is None else f"{item.get('age_days')} days",
+        })
+    for filename, label in (
+        ("savant_pitch_level_heatmap_foul.csv", "Pitch/foul"),
+        ("Pitch.csv", "Pitch game logs"),
+    ):
+        path = data_root / filename
+        if not path.exists():
+            dataset_rows.append({"Dataset": label, "Status": "MISSING", "Rows": 0, "Freshness": "—"})
+            continue
+        try:
+            frame = pd.read_csv(path)
+            validation = validate_data_pack_frame(filename, frame, season=datetime.now().year)
+            errors = " | ".join(validation.get("errors") or [])
+            status = "READY" if validation.get("ok") else "STALE" if "STALE PITCH" in errors else "FAILED"
+            freshness = "—"
+            if filename == "Pitch.csv" and "Date" in frame.columns:
+                parsed_dates = pd.to_datetime(frame["Date"], errors="coerce")
+                if parsed_dates.notna().any():
+                    freshness = str(parsed_dates.max().date())
+            else:
+                freshness = datetime.fromtimestamp(path.stat().st_mtime).astimezone().strftime("%Y-%m-%d")
+            dataset_rows.append({"Dataset": label, "Status": status, "Rows": len(frame), "Freshness": freshness})
+        except Exception:
+            dataset_rows.append({"Dataset": label, "Status": "FAILED", "Rows": 0, "Freshness": "—"})
+    st.dataframe(pd.DataFrame(dataset_rows), use_container_width=True, hide_index=True)
+    if st.button("Refresh Savant Data", key="v269_refresh_savant", use_container_width=True):
+        with st.spinner("Refreshing current-season Savant data..."):
+            result = service.refresh(force=True)
+            targeted = service.refresh_missing_players(_v2610_lineup_mlbam_ids(board), force=False)
+            auxiliary = aux_service.refresh(force=True)
+        _v269_load_savant_platoon.clear()
+        ok = result.get("refresh") == "SUCCESS" and auxiliary.get("status") == "SUCCESS"
+        (st.success if ok else st.warning)(json.dumps({"platoon": result, "targeted": targeted, "auxiliary": auxiliary}, default=str))
+
+
 def _v265_history_summary_html(label, summary, clearance, games, line):
     summary = summary if isinstance(summary, dict) else {}
     clearance = clearance if isinstance(clearance, dict) else {}
@@ -52138,9 +52414,15 @@ def _v265_history_summary_html(label, summary, clearance, games, line):
         f"<div><span>Median K</span><b>{'—' if median is None else f'{median:.1f}'}</b></div>"
         f"</div>"
     )
-    chips = []
+    bars = []
     rows = []
     line_num = _canonical_k_num(line, None)
+    valid_values = []
+    for game in (games or []):
+        value = _canonical_k_num((game or {}).get("Ks") if isinstance(game, dict) else game, None)
+        if value is not None:
+            valid_values.append(value)
+    chart_max = max([line_num or 0.0, 1.0] + valid_values) + 1.0
     for game in (games or []):
         if isinstance(game, dict):
             k_value = _canonical_k_num(game.get("Ks"), None)
@@ -52158,10 +52440,30 @@ def _v265_history_summary_html(label, summary, clearance, games, line):
         if k_value is None:
             continue
         hit = bool(line_num is not None and k_value > line_num)
-        chips.append(f"<span class='kc-kchip {'hit' if hit else 'miss'}'>{k_value:g}K</span>")
+        bar_height = max(4.0, min(100.0, k_value / chart_max * 100.0))
+        short_date = date[-5:] if len(date) >= 5 else date
+        bars.append(
+            f"<div class='kc-hbarcol'><b>{k_value:g}</b><div class='kc-hbar {'hit' if hit else 'miss'}' style='height:{bar_height:.1f}%'></div>"
+            f"<small>{opponent or '—'}<br>{short_date}</small></div>"
+        )
         context_bits = [bit for bit in [f"{ip} IP" if ip not in (None, "") else "", f"{bf} BF" if bf not in (None, "") else "", f"{pitches} P" if pitches not in (None, "") else "", f"vs {opponent}" if opponent else "", role] if bit]
         rows.append(f"<div class='kc-game'><b>{k_value:g} K</b><span>{' · '.join(context_bits) or date}</span></div>")
-    return f"<div class='kc-hpanel'><div class='kc-section-title'><span>{html.escape(label)}</span><span class='kc-chip'>vs today's line</span></div>{stats}<div class='kc-kstrip'>{''.join(chips) or '<span class=kc-empty>No completed starts</span>'}</div><div class='kc-gamelog'>{''.join(rows)}</div></div>"
+    line_bottom = 0.0 if line_num is None else max(0.0, min(100.0, line_num / chart_max * 100.0))
+    chart = (
+        "<div class='kc-hchart-scroll'><div class='kc-hchart'>"
+        f"<div class='kc-today-line' style='bottom:{line_bottom:.1f}%'><span>Today {html.escape(str(line))}</span></div>"
+        f"{''.join(bars) or '<span class=kc-empty>No completed starts</span>'}</div></div>"
+    )
+    chart_css = """
+    <style>
+    .kc-hchart-scroll{overflow-x:auto;overflow-y:hidden;padding:22px 2px 6px;-webkit-overflow-scrolling:touch}
+    .kc-hchart{height:158px;min-width:430px;display:flex;align-items:flex-end;gap:8px;position:relative;border-bottom:1px solid rgba(255,255,255,.14);padding:0 8px}
+    .kc-today-line{position:absolute;left:0;right:0;border-top:2px dashed #ffd34e;z-index:3;pointer-events:none}.kc-today-line span{position:absolute;right:3px;top:-17px;color:#ffd34e;font-size:8px;font-weight:900;background:#10101a;padding:1px 4px}
+    .kc-hbarcol{width:36px;min-width:36px;height:100%;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;position:relative}.kc-hbarcol>b{font-size:10px;color:#fff;margin-bottom:3px}.kc-hbar{width:25px;min-height:4px;border-radius:4px 4px 1px 1px;box-shadow:0 0 10px rgba(0,0,0,.25)}.kc-hbar.hit{background:#18d594}.kc-hbar.miss{background:#f05267}.kc-hbarcol small{height:27px;margin-top:4px;text-align:center;font-size:7px;color:#aeb5c3;line-height:1.15}
+    @media(max-width:430px){.kc-hchart{min-width:410px}.kc-hbarcol{width:34px;min-width:34px}}
+    </style>
+    """
+    return f"<div class='kc-hpanel'><div class='kc-section-title'><span>{html.escape(label)}</span><span class='kc-chip'>actual Ks vs today's line</span></div>{stats}{chart}{chart_css}<div class='kc-gamelog'>{''.join(rows)}</div></div>"
 
 
 def _v265_recent_history_html(row, p, line, card_id):
@@ -52235,7 +52537,7 @@ def _v265_recent_history_html(row, p, line, card_id):
     inputs = []
     for index, (key, label) in enumerate(tab_specs):
         tab_id = f"kh-{card_id}-{key.lower()}"
-        inputs.append(f"<input {'checked' if key == 'L5' else ''} type='radio' name='kh-{card_id}' id='{tab_id}'>")
+        inputs.append(f"<input {'checked' if key == 'L10' else ''} type='radio' name='kh-{card_id}' id='{tab_id}'>")
         labels.append(f"<label for='{tab_id}'>{label}</label>")
         if key == "H2H":
             h2h_context = context.get("h2h") if isinstance(context.get("h2h"), dict) else {}
@@ -52284,8 +52586,23 @@ def _v266_timing_html(row, p):
                 if value not in (None, "", "nan", "NaN"):
                     return html.escape(str(value))
         return default
+    raw_profile = item(["timing_profile"])
+    readable_profile = {
+        "QUICK_STRIKEOUT_STARTER": "FAST START",
+        "EARLY_K_LEAN": "FAST START",
+        "BALANCED_K_TIMING": "NORMAL",
+        "SECOND_TURN_RISER": "SLOW START",
+        "LATE_K_DEPENDENT": "SLOW START",
+        "INSUFFICIENT_TIMING_SAMPLE": "NOT ENOUGH VERIFIED STARTS",
+    }.get(raw_profile, raw_profile.replace("_", " "))
+    explanation = (
+        "Pitcher historically creates a larger share of strikeouts early." if readable_profile == "FAST START" else
+        "More of this pitcher's strikeouts tend to accumulate after the early innings." if readable_profile == "SLOW START" else
+        "No strong early-versus-late strikeout concentration is verified." if readable_profile == "NORMAL" else
+        "Timing remains diagnostic until more inning-level starts are verified."
+    )
     cells = [
-        ("Timing profile", item(["timing_profile"])),
+        ("Early K profile", readable_profile),
         ("1st inning K", item(["projected_1st_inning_K"])),
         ("Expected 1st BF", item(["expected_1st_inning_BF"])),
         ("First 9 BF", item(["K_first_9_BF_avg"])),
@@ -52303,7 +52620,7 @@ def _v266_timing_html(row, p):
         "<div class='kc-section-title'><span>K Timing</span>"
         f"<span class='kc-chip'>{confidence}</span></div>"
         f"<div class='kc-auditgrid'>{''.join(f'<div><span>{label}</span><b>{value}</b></div>' for label, value in cells)}</div>"
-        f"<div class='kc-mini-note'>Source: {source}. EARLY_K_TIMING and K_EFFICIENCY are each counted once; projection effect remains validation-gated.</div>"
+        f"<div class='kc-mini-note'>{html.escape(explanation)} Source: {source}. Timing and K efficiency are each counted once; projection effect remains validation-gated.</div>"
         "</div>"
     )
 
@@ -52323,6 +52640,9 @@ def _v265_threshold_html(row, p):
         f"<div><span>Distribution sigma</span><b>{html.escape(str(distribution.get('sigma') or '—'))}</b></div>"
         f"{''.join(cells)}</div>"
     )
+
+
+MODEL_AUDIT_INTERNAL_LABEL = "Model Audit / Why This Pick"
 
 
 def _v265_model_audit_html(row, p):
@@ -52405,25 +52725,25 @@ def _kcard_lineup_html(rows):
         batter = html.escape(str(r.get("Batter") or r.get("Player") or r.get("Name") or ""))
         hand = html.escape(str(r.get("Hand") or r.get("Bats") or ""))
         used = _kclean_fmt(r.get("Used K%") if r.get("Used K%") is not None else r.get("K% Used"), 1)
-        split_raw = r.get("Split K%") if r.get("Split K%") is not None else r.get("K% vs Hand")
-        if split_raw in (None, "", "—", "-", "nan", "NaN"):
-            split_raw = r.get("Used K%") if r.get("Used K%") is not None else r.get("K% Used")
-        split = _kclean_fmt(split_raw, 1)
-        season = _kclean_fmt(r.get("Season K%") if r.get("Season K%") is not None else r.get("K%"), 1)
+        savant_raw = _kclean_fmt(r.get("savant_raw_vs_hand_k_pct"), 1)
+        savant_sample = "—"
+        if r.get("savant_raw_vs_hand_pa") not in (None, ""):
+            savant_sample = f"{safe_int(r.get('savant_raw_vs_hand_pa'), 0)} PA / {safe_int(r.get('savant_raw_vs_hand_so'), 0)} SO"
+        delta = _kclean_fmt(r.get("model_minus_savant_pp"), 1)
         starter_conf = _kclean_fmt(r.get("Expected Starter Confidence"), 0)
         order_conf = _kclean_fmt(r.get("Expected Order Confidence"), 0)
-        src = html.escape(str(r.get("Expected Lineup Sources") or r.get("K Source") or r.get("Lineup Source") or "")[:34])
+        src = html.escape(str(r.get("Savant Match Status") or r.get("Expected Lineup Sources") or r.get("K Source") or r.get("Lineup Source") or "")[:34])
         val = _kclean_num(r.get("Used K%") if r.get("Used K%") is not None else r.get("K% Used"), np.nan)
         flag = "★" if np.isfinite(val) and val >= 25 else "△" if np.isfinite(val) and val <= 16 else ""
         cls = "hi" if np.isfinite(val) and val >= 25 else "lo" if np.isfinite(val) and val <= 16 else ""
         trs.append(
             f"<tr><td>{order}</td><td>{batter} <b class='{cls}'>{flag}</b></td><td>{hand}</td>"
-            f"<td class='{cls}'>{used}</td><td>{split}</td><td>{season}</td>"
+            f"<td>{savant_raw}</td><td>{savant_sample}</td><td class='{cls}'>{used}</td><td>{delta}</td>"
             f"<td>{starter_conf}%</td><td>{order_conf}%</td><td>{src}</td></tr>"
         )
     return (
         "<table class='kc-lineup'><thead><tr><th>Slot</th><th>Batter</th><th>Hand</th>"
-        "<th>K% Used</th><th>vs Hand</th><th>Season</th><th>Start</th><th>Order</th><th>Source</th>"
+        "<th>Savant Raw vs Hand</th><th>PA / SO</th><th>Model K% Used</th><th>Delta pp</th><th>Start</th><th>Order</th><th>Match</th>"
         "</tr></thead><tbody>" + "".join(trs) + "</tbody></table>"
     )
 
@@ -52526,6 +52846,16 @@ def _kclean_render_player_cards(df, board=None, limit=None):
             prob_width = 0 if not np.isfinite(prob) else max(0, min(100, prob))
             edge_txt = "—" if not np.isfinite(edge) else f"{edge:+.2f} vs {line}"
             opp_k = _kclean_fmt(_kclean_pick(row, ["Opponent K% vs Pitcher Hand", "APP97 Opponent K Environment", "APP88 Batter Lineup K%"], ""), 1)
+            hand_window = "LHP" if str(hand).upper().startswith("L") else "RHP"
+            opp_l10 = _kclean_fmt(_kclean_pick(row, [f"Opp L10 K% vs {hand_window} Official", "Team K% L10 vs Hand"], ""), 1)
+            opp_l5 = _kclean_fmt(_kclean_pick(row, [f"Opp L5 K% vs {hand_window} Official", "Team K% L5 vs Hand"], ""), 1)
+            opp_primary = f"{opp_k}%" if opp_k != "—" else "—"
+            recent_bits = []
+            if opp_l10 != "—":
+                recent_bits.append(f"{opp_l10}% L10")
+            if opp_l5 != "—":
+                recent_bits.append(f"{opp_l5}% L5")
+            opp_k_context = opp_primary + (f"<br><small>{' · '.join(recent_bits)}</small>" if recent_bits else "")
             pk = str(_kclean_pct_display(_kclean_pick(row, ["APP97 Raw MLB Season Pitcher K%", "APP97 Live Pitcher K%", "Savant Custom K%", "Pitcher K% Used", "Pitcher K%", "Official Savant K%"], "")))
             whiff = _kclean_fmt(_kclean_pick(row, ["Savant Custom Whiff%", "Official Savant Whiff%", "Whiff%", "APP85 PutAway Rate"], ""), 1)
             bf = _kclean_fmt(_kclean_pick(row, ["APP97 Reconciled Expected BF", "Exp BF", "Projected BF"], ""), 1)
@@ -52587,7 +52917,6 @@ def _kclean_render_player_cards(df, board=None, limit=None):
             quality_gate_score = html.escape(str((p or {}).get("data_quality_gate_score") if (p or {}).get("data_quality_gate_score") is not None else _kclean_pick(row, ["Data Quality Score"], "—")))
             resolved_hitters = html.escape(str((p or {}).get("resolved_hitter_count") if (p or {}).get("resolved_hitter_count") is not None else _kclean_pick(row, ["Resolved Hitter Profiles"], "—")))
             lineup_rows, lineup_src = _kcard_lineup_rows(row, p)
-            lineup_table = _kcard_lineup_html(lineup_rows)
             _card_expected_bf = _kclean_num(
                 _kclean_pick(
                     row,
@@ -52598,6 +52927,18 @@ def _kclean_render_player_cards(df, board=None, limit=None):
             )
             if not np.isfinite(_card_expected_bf):
                 _card_expected_bf = DEFAULT_BF
+            lineup_rows, savant_shadow = _v269_savant_shadow_rows(
+                lineup_rows,
+                str(_kclean_pick(row, ["Pitcher Hand", "Hand", "Throws"], (p or {}).get("hand", ""))),
+                float(_card_expected_bf),
+                board_row=p,
+            )
+            lineup_table = _kcard_lineup_html(lineup_rows)
+            savant_shadow_note = html.escape(
+                f"Savant shadow {savant_shadow.get('status', 'UNAVAILABLE')} {savant_shadow.get('matched', 0)}/9 · "
+                f"raw simple {_kclean_fmt(savant_shadow.get('simple_savant_lineup_k_pct'), 1)}% · "
+                f"raw order {_kclean_fmt(savant_shadow.get('order_weighted_savant_k_pct'), 1)}% · production effect 0.00 K"
+            )
             _slot_lineup_k = _weighted_lineup_k_from_rows(
                 lineup_rows,
                 expected_bf=float(_card_expected_bf),
@@ -52634,7 +52975,6 @@ def _kclean_render_player_cards(df, board=None, limit=None):
             card_id = hashlib.sha256(f"{raw_pitcher}|{raw_matchup}|{line}".encode("utf-8")).hexdigest()[:12]
             history_html = _v265_recent_history_html(row, p, line, card_id)
             threshold_html = _v265_threshold_html(row, p)
-            model_audit_html = _v265_model_audit_html(row, p)
             cards.append(f"""
             <div class="kcard">
               <div class="kc-top">
@@ -52653,7 +52993,7 @@ def _kclean_render_player_cards(df, board=None, limit=None):
                 <div class="kc-stat"><span>K Grade</span><b>{arsenal_grade}</b></div>
                 <div class="kc-stat"><span>Ceiling</span><b>{ceiling}</b></div>
                 <div class="kc-stat"><span>Pitch K%</span><b>{pk}</b></div>
-                <div class="kc-stat"><span>Opp K%</span><b>{opp_k}</b></div>
+                <div class="kc-stat"><span>Opp K%</span><b>{opp_k_context}</b></div>
                 <div class="kc-stat"><span title="1st Inning Strikeouts">BF / IP / 1st Inning K</span><b>{bf} / {ip} / {first_inning_k}</b></div>
                 <div class="kc-stat"><span>Lineup</span><b>{lineup_display}</b></div>
               </div>
@@ -52672,11 +53012,9 @@ def _kclean_render_player_cards(df, board=None, limit=None):
               <details class="kc-details">
                 <summary>Batter-by-Batter</summary><div class="kc-detail-body">
                 <div class="kc-section-title"><span>Batter-by-batter K matchup</span><span class="kc-chip">{lineup_display} · exposure K {avg_lineup_k} · BF {_kclean_fmt(_card_expected_bf, 1)} · order {order_conf_card}% · high-K {high_bats} · low-K {low_bats}</span></div>
+                <div class="kc-mini-note">{savant_shadow_note}</div>
                 {lineup_table}
                 </div>
-              </details>
-              <details class="kc-details">
-                <summary>Model Audit / Why This Pick</summary><div class="kc-detail-body">{model_audit_html}</div>
               </details>
               <details class="kc-details">
                 <summary>Recent K History</summary><div class="kc-detail-body">{history_html}</div>
@@ -52700,7 +53038,7 @@ def _kclean_render_player_cards(df, board=None, limit=None):
 def _v265_mobile_package_bytes():
     """Return a mobile-safe package without depending on a developer path."""
     root = Path(__file__).resolve().parent
-    archive_name = "Merge_V2_6_8_MLB_FINAL_MOBILE.zip"
+    archive_name = "Merge_V2_6_10_MLB_FINAL_MOBILE.zip"
     prebuilt = root / archive_name
     if prebuilt.exists() and prebuilt.is_file():
         payload = prebuilt.read_bytes()
@@ -52711,11 +53049,27 @@ def _v265_mobile_package_bytes():
             for name in (
                 "requirements.txt", "runtime.txt", "README_MOBILE.txt",
                 "CHANGE_AUDIT.txt", "TEST_REPORT.txt", "VERSION.txt",
-                "mobile_download.html",
+                "mobile_download.html", "merge_v269_safe_update.py",
+                "savant_aux_service.py", "merge_v2610_validation.py",
             ):
                 candidate = root / name
                 if candidate.exists() and candidate.is_file():
                     zf.writestr(name, candidate.read_bytes())
+            for name in (
+                "savant_batter_platoon_2026.csv",
+                "savant_batter_platoon_2026.last_good.csv",
+                "savant_refresh_manifest.json",
+                "savant_batter_profiles.csv",
+                "savant_batter_profiles.last_good.csv",
+                "savant_pitcher_stats.csv",
+                "savant_pitcher_stats.last_good.csv",
+                "pitch_mix_matchups.csv",
+                "pitch_mix_matchups.last_good.csv",
+                "savant_aux_refresh_manifest.json",
+            ):
+                candidate = root / "learning_data" / name
+                if candidate.exists() and candidate.is_file():
+                    zf.writestr(f"learning_data/{name}", candidate.read_bytes())
         payload = payload_io.getvalue()
     integrity = "PASS"
     try:
@@ -52732,11 +53086,11 @@ def render_v265_download_panel():
         payload, checksum, integrity = _v265_mobile_package_bytes()
         size_mb = len(payload) / (1024.0 * 1024.0)
         build_stamp = datetime.fromtimestamp(Path(__file__).stat().st_mtime).astimezone().strftime("%Y-%m-%d %I:%M %p %Z")
-        with st.expander("CURRENT VERIFIED FILES · Merge V2.6.8 MLB", expanded=False):
+        with st.expander("CURRENT VERIFIED FILES · Merge V2.6.10 MLB", expanded=False):
             st.markdown("### Engine Downloads")
-            st.caption("Lineup resolver + pitcher profiles + first-inning K + model audit + canonical decision sync")
+            st.caption("Protected Underdog resolver + first-inning K market + Savant vs-hand shadow + visual K history")
             st.markdown(
-                f"**Merge V2.6.8 MLB** · `CURRENT`  \n"
+                f"**Merge V2.6.10 MLB** · `CURRENT`  \n"
                 f"Package size: **{size_mb:.2f} MB**  \n"
                 f"Archive integrity: **{integrity}**  \n"
                 f"Build: **{build_stamp}**  \n"
@@ -52745,17 +53099,18 @@ def render_v265_download_panel():
             st.download_button(
                 "DOWNLOAD MLB ZIP",
                 data=payload,
-                file_name="Merge_V2_6_8_MLB_FINAL_MOBILE.zip",
+                file_name="Merge_V2_6_10_MLB_FINAL_MOBILE.zip",
                 mime="application/zip",
                 use_container_width=True,
                 disabled=integrity != "PASS",
-                key="download_merge_v268_mobile_zip",
+                key="download_merge_v2610_mobile_zip",
             )
     except Exception as exc:
         st.info(f"Mobile package is not available in this runtime: {exc}")
 
 
 def _impl_render_kproj_tab_08(board):
+    _v269_start_savant_refresh_if_needed(board)
     st.markdown('<div class="section-title-pro">K Upside Board</div>', unsafe_allow_html=True)
     st.caption("Copy/paste slate first. Diagnostics stay collapsed below the board.")
 
@@ -52816,6 +53171,7 @@ def _impl_render_kproj_tab_08(board):
     )
 
     with st.expander("Data controls / diagnostics", expanded=False):
+        _v269_render_savant_health_panel(board)
         try:
             _xk_render_override_panel(df)
         except Exception as _xk_e:
@@ -52863,6 +53219,17 @@ def _impl_render_kproj_tab_08(board):
             "Opponent K% vs Pitcher Hand Source", "Handedness Split Warning",
             "Opp K% vs RHP Official", "Opp K% vs LHP Official",
             "Opp L30 K% vs RHP Official", "Opp L30 K% vs LHP Official",
+            "Team K% Season vs Hand", "Team K% L15 vs Hand", "Team K% L10 vs Hand", "Team K% L5 vs Hand",
+            "Team K Trend Delta L15", "Team K Trend Delta L10", "Team K Trend Delta L5",
+            "Savant Shadow Status", "Savant Shadow Matched Hitters",
+            "Savant Raw Simple K%", "Savant Raw Order-Weighted K%",
+            "Savant Raw Top 3 K%", "Savant Raw Middle 3 K%", "Savant Raw Bottom 3 K%",
+            "Existing Merge Control Projection", "Savant Shadow Projection", "Savant Shadow Delta",
+            "Savant-Driven Side Flip", "Savant Shadow Mode",
+            "K Opportunity Score", "K Conversion Score", "Over Validation Gate", "MARGINAL_OVER_REVIEW",
+            "Line Difficulty State", "Line Percentile of Pitcher Distribution", "LOW_LINE_UNDER_DANGER",
+            "Suppression Adjustment Audit", "Suppression Audit State",
+            "V269 Control Projection Preserved", "V269 Production Projection Changed", "V269 Promotion Status",
             "Projection Data Gate", "Projection Data Issues", "Projection Data Cautions",
             "APP98 Loss Target Projection", "APP98 Loss Target Adjustment", "APP98 Loss Target Reason",
             "K Sim Pick", "K Sim True Prob %", "K Sim Current Side Prob %",
@@ -54900,7 +55267,9 @@ def _po_fill_name_key_with_comma(value):
 
 def _po_fill_foul_workload_data():
     frames = []
-    for name in ["foul_workload_savant.csv", "savant_data (3).csv"]:
+    # Raw savant_data (3).csv is intentionally excluded. It previously mapped
+    # into this PO support path without proving the foul-workload schema.
+    for name in ["foul_workload_savant.csv", "savant_pitch_level_heatmap_foul.csv"]:
         try:
             df, _path = _hadb_read_csv(name) if "_hadb_read_csv" in globals() else (pd.DataFrame(), "")
             if isinstance(df, pd.DataFrame) and not df.empty:
@@ -56719,6 +57088,23 @@ def _k_stage_48_mifs(df, board):
     return _mifs_apply(base)
 
 
+def _lta_snapshot_json(value, empty="[]"):
+    """Serialize nested audit values deterministically for the flat snapshot CSV."""
+    if value is None:
+        return empty
+    if isinstance(value, str):
+        if not value.strip():
+            return empty
+        try:
+            value = json.loads(value)
+        except Exception:
+            return json.dumps(value, ensure_ascii=True)
+    try:
+        return json.dumps(value, ensure_ascii=True, sort_keys=True, default=str)
+    except Exception:
+        return empty
+
+
 def _lta_snapshot_rows(board=None):
     df = build_kproj_table(board) if "build_kproj_table" in globals() else pd.DataFrame()
     if not isinstance(df, pd.DataFrame) or df.empty:
@@ -56741,11 +57127,35 @@ def _lta_snapshot_rows(board=None):
             "lineup_avg_k": _lta_num(r.get("Lineup Trace Avg K%"), np.nan),
             "lineup_weighted_k": _lta_num(r.get("Lineup Trace Weighted K%"), np.nan),
             "lineup_top4_k": _lta_num(r.get("Lineup Trace Top4 K%"), np.nan),
+            "savant_enriched_lineup_rows": _lta_snapshot_json(r.get("Savant Enriched Lineup Rows")),
+            "ud_expected_hitters": _lta_snapshot_json(r.get("ud_expected_hitters")),
+            "ud_expected_order": _lta_snapshot_json(r.get("ud_expected_order")),
+            "projected_resolved_order": _lta_snapshot_json(r.get("projected_resolved_order")),
+            "official_hitters": _lta_snapshot_json(r.get("official_hitters")),
+            "official_order": _lta_snapshot_json(r.get("official_order")),
+            "player_membership_match_count": _lta_num(r.get("player_membership_match_count"), np.nan),
+            "exact_order_match_count": _lta_num(r.get("exact_order_match_count"), np.nan),
+            "order_confidence_pct": _lta_num(r.get("order_confidence_pct"), np.nan),
+            "simple_lineup_k_pct": _lta_num(r.get("simple_lineup_k_pct"), np.nan),
+            "order_weighted_k_pct": _lta_num(r.get("order_weighted_k_pct"), np.nan),
+            "top3_k_pct": _lta_num(r.get("top3_k_pct"), np.nan),
+            "middle3_k_pct": _lta_num(r.get("middle3_k_pct"), np.nan),
+            "bottom3_k_pct": _lta_num(r.get("bottom3_k_pct"), np.nan),
             "high_k_count": _lta_num(r.get("Lineup Trace High-K"), np.nan),
             "low_k_count": _lta_num(r.get("Lineup Trace Low-K"), np.nan),
             "opp_k": _lta_num(r.get("Lineup Trace Opp K%"), np.nan),
             "opp_vs_weighted_delta": _lta_num(r.get("Lineup Trace Opp-vs-Weighted Delta"), np.nan),
             "projection": proj,
+            "base_merge_projection": _lta_num(r.get("base_merge_projection"), proj),
+            "order_adjusted_projection": _lta_num(r.get("order_adjusted_projection"), proj),
+            "final_projection": _lta_num(r.get("final_projection"), proj),
+            "order_delta": _lta_num(r.get("order_delta"), 0.0),
+            "order_delta_classification": _lta_text(r.get("order_delta_classification"), "ORDER_DATA_UNAVAILABLE"),
+            "order_impact_review": bool(r.get("ORDER_IMPACT_REVIEW") is True),
+            "order_driven_side_flip": bool(r.get("ORDER_DRIVEN_SIDE_FLIP") is True),
+            "order_projection_fallback_to_base": bool(r.get("order_projection_fallback_to_base") is True),
+            "pre_confirm_projection": _lta_num(r.get("pre_confirm_projection"), np.nan),
+            "post_confirm_projection": _lta_num(r.get("post_confirm_projection"), np.nan),
             "true_advisor_projection": _lta_num(r.get("True K Advisor Projection"), np.nan),
             "true_advisor_adj": _lta_num(r.get("True K Advisor Adj"), np.nan),
             "true_advisor_read": _lta_text(r.get("True K Advisor Read"), ""),
@@ -56762,6 +57172,14 @@ def _lta_snapshot_rows(board=None):
             "thin_edge_gate": _lta_text(r.get("Lineup Trace Thin Edge Gate"), ""),
             "upside_watch": _lta_text(r.get("Lineup Trace Upside Watch"), ""),
             "stale_expected_flag": _lta_text(r.get("Lineup Trace Stale Expected Flag"), ""),
+            "first_inning_k_projection": _lta_num(r.get("first_inning_k_projection"), np.nan),
+            "first_inning_k_line": _lta_num(r.get("first_inning_k_line"), np.nan),
+            "first_inning_k_side": _lta_text(r.get("first_inning_k_side"), "NO_LINE"),
+            "first_inning_expected_bf": _lta_num(r.get("first_inning_expected_bf"), np.nan),
+            "first_inning_top_order_k_exposure": _lta_num(r.get("first_inning_top_order_k_exposure"), np.nan),
+            "first_inning_k_data_source": _lta_text(r.get("first_inning_k_data_source"), "UNAVAILABLE"),
+            "first_inning_k_source_timestamp": _lta_text(r.get("first_inning_k_source_timestamp"), ""),
+            "first_inning_k_line_timestamp": _lta_text(r.get("first_inning_k_line_timestamp"), ""),
             "version": LINEUP_TRACE_AUDIT_VERSION,
         })
     return pd.DataFrame(rows)
@@ -59295,6 +59713,386 @@ def apply_v266_profile_runtime(df, board=None):
     return out
 
 
+def _v269_order_delta_classification(delta):
+    if delta is None:
+        return "ORDER_DATA_UNAVAILABLE"
+    movement = abs(float(delta))
+    if movement < 0.15:
+        return "NEGLIGIBLE"
+    if movement < 0.35:
+        return "SMALL"
+    if movement < 0.60:
+        return "MEANINGFUL"
+    return "MAJOR"
+
+
+def _v269_order_projection_trace(base_projection, order_candidate, final_projection, line, order_available):
+    """Build an audit-only order trace; never writes a production projection."""
+    def finite_number(value):
+        try:
+            result = float(value)
+            return result if math.isfinite(result) else None
+        except Exception:
+            return None
+
+    base = finite_number(base_projection)
+    final = finite_number(final_projection)
+    if base is None:
+        base = final
+    if final is None:
+        final = base
+    candidate = finite_number(order_candidate)
+    fallback = not bool(order_available) or candidate is None
+    order_adjusted = base if fallback else candidate
+    delta = None if base is None or order_adjusted is None else round(order_adjusted - base, 3)
+    line_value = finite_number(line)
+
+    def threshold_side(value):
+        if value is None or line_value is None or value == line_value:
+            return None
+        return "OVER" if value > line_value else "UNDER"
+
+    base_side = threshold_side(base)
+    order_side = threshold_side(order_adjusted)
+    side_flip = bool(not fallback and base_side and order_side and base_side != order_side)
+    impact_review = bool(delta is not None and abs(delta) > 0.75)
+    return {
+        "base_merge_projection": None if base is None else round(base, 3),
+        "order_adjusted_projection": None if order_adjusted is None else round(order_adjusted, 3),
+        "final_projection": None if final is None else round(final, 3),
+        "order_delta": delta,
+        "order_delta_classification": _v269_order_delta_classification(delta),
+        "order_projection_fallback_to_base": fallback,
+        "order_projection_diagnostic_only": True,
+        "ORDER_IMPACT_REVIEW": impact_review,
+        "ORDER IMPACT REVIEW": impact_review,
+        "ORDER_DRIVEN_SIDE_FLIP": side_flip,
+        "ORDER-DRIVEN SIDE FLIP": side_flip,
+        "base_projection_side": base_side,
+        "order_adjusted_projection_side": order_side,
+    }
+
+
+def _v269_part_i_audit_fields(row, board_row, projection, line, enriched_lineup_rows=None):
+    """Persist Part-I aliases from existing runtime state without changing model inputs."""
+    board_row = board_row if isinstance(board_row, dict) else {}
+    trace = board_row.get("lineup_runtime_trace_v255")
+    trace = trace if isinstance(trace, dict) else {}
+    lineup_rows = sorted(
+        _v266_lineup_rows(board_row),
+        key=lambda item: safe_int(item.get("Order"), 99) or 99,
+    )
+
+    def row_name(item):
+        return str((item or {}).get("Batter") or (item or {}).get("Player") or (item or {}).get("Name") or "").strip()
+
+    def unique_names(values):
+        if isinstance(values, str):
+            try:
+                values = json.loads(values)
+            except Exception:
+                values = [values]
+        if not isinstance(values, (list, tuple, set)):
+            values = []
+        output, seen = [], set()
+        for value in values or []:
+            if isinstance(value, dict):
+                value = value.get("hitter") or value.get("Batter") or value.get("Player") or value.get("Name")
+            name = str(value or "").strip()
+            key = normalize_name(name)
+            if name and key and key not in seen:
+                seen.add(key)
+                output.append(name)
+        return output
+
+    def order_names(value):
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except Exception:
+                value = []
+        if not isinstance(value, (list, tuple)):
+            return []
+        ordered = []
+        for item in value:
+            if isinstance(item, dict):
+                slot = safe_int(item.get("slot", item.get("Order")), 99) or 99
+                name = row_name(item) or str(item.get("hitter") or "").strip()
+            else:
+                slot = len(ordered) + 1
+                name = str(item or "").strip()
+            if name:
+                ordered.append((slot, name))
+        return [name for _, name in sorted(ordered, key=lambda pair: pair[0])]
+
+    resolved_order = unique_names([row_name(item) for item in lineup_rows])
+    resolved_keys = {normalize_name(name) for name in resolved_order}
+    ud_hitters = unique_names(
+        trace.get("underdog_team_pool")
+        or board_row.get("underdog_expected_players")
+        or []
+    )
+    ud_keys = {normalize_name(name) for name in ud_hitters}
+    ud_order = [name for name in resolved_order if normalize_name(name) in ud_keys]
+    lineup_status = str(
+        board_row.get("lineup_status")
+        or board_row.get("lineup_resolver_source")
+        or trace.get("lineup_source")
+        or ""
+    ).upper()
+    official = bool(
+        board_row.get("lineup_locked")
+        or "CONFIRMED" in lineup_status
+        or "OFFICIAL" in lineup_status
+        or any("CONFIRMED" in str(item.get("Lineup Source") or "").upper() for item in lineup_rows)
+    )
+    official_order = resolved_order if official else []
+    official_hitters = list(official_order)
+
+    expected_pre = unique_names(
+        board_row.get("pre_confirm_expected_hitters")
+        or board_row.get("expected_lineup_players")
+        or []
+    )
+    comparison_pool = expected_pre if official and expected_pre else ud_hitters
+    comparison_keys = {normalize_name(name) for name in comparison_pool}
+    membership_match = len(comparison_keys.intersection(resolved_keys)) if comparison_keys else None
+    membership_confidence = None
+    if membership_match is not None:
+        membership_confidence = round(membership_match / max(1, min(9, len(comparison_keys))) * 100.0, 1)
+
+    expected_order = order_names(
+        board_row.get("pre_confirm_projected_order")
+        or board_row.get("expected_lineup_order")
+        or board_row.get("expected_lineup_rows")
+        or []
+    )
+    exact_order_match = None
+    if official and expected_order:
+        exact_order_match = sum(
+            1 for expected_name, official_name in zip(expected_order[:9], official_order[:9])
+            if normalize_name(expected_name) == normalize_name(official_name)
+        )
+
+    order_conf_values = [
+        _v266_number(item.get("Expected Order Confidence Overall"), _v266_number(item.get("Expected Order Confidence"), None))
+        for item in lineup_rows
+    ]
+    order_conf_values = [value for value in order_conf_values if value is not None]
+    order_confidence = 100.0 if official and len(lineup_rows) == 9 else (
+        round(float(np.mean(order_conf_values)), 1) if order_conf_values else None
+    )
+    valid_slots = [safe_int(item.get("Order"), None) for item in lineup_rows]
+    valid_slots = [slot for slot in valid_slots if slot is not None and 1 <= slot <= 9]
+    order_available = len(lineup_rows) >= 5 and len(set(valid_slots)) >= 5
+
+    base_projection = projection
+    order_candidate = _v266_first(
+        row,
+        ["order_aware_expected_K", "Order Adjusted Projection Input"],
+        board_row.get("order_aware_expected_K"),
+    )
+    projection_trace = _v269_order_projection_trace(
+        base_projection,
+        order_candidate,
+        projection,
+        line,
+        order_available,
+    )
+
+    first_inning_projection = _v266_number(
+        _v266_first(row, ["first_inning_k_projection", "projected_1st_inning_K"], board_row.get("projected_1st_inning_K")),
+        None,
+    )
+    first_inning_line = _v266_number(
+        _v266_first(board_row, ["first_inning_k_line", "first_inning_strikeout_line"], _v266_first(row, ["first_inning_k_line"], None)),
+        None,
+    )
+    first_inning_side = str(
+        _v266_first(board_row, ["first_inning_k_side"], _v266_first(row, ["first_inning_k_side"], ""))
+        or ""
+    ).upper()
+    if first_inning_side not in {"OVER", "UNDER"}:
+        first_inning_side = "NO_LINE" if first_inning_line is None else "UNRESOLVED"
+
+    return {
+        "savant_enriched_lineup_rows": [dict(item) for item in (enriched_lineup_rows or []) if isinstance(item, dict)],
+        "Savant Enriched Lineup Rows": json.dumps(enriched_lineup_rows or [], sort_keys=True, default=str),
+        "ud_expected_hitters": ud_hitters,
+        "ud_expected_order": ud_order,
+        "ud_expected_order_source": "PROJECTED_RESOLVER_FOR_UD_POOL" if ud_order else "UNAVAILABLE",
+        "projected_resolved_order": resolved_order,
+        "official_hitters": official_hitters,
+        "official_order": official_order,
+        "player_membership_match_count": membership_match,
+        "lineup_player_match_confidence": membership_confidence,
+        "exact_order_match_count": exact_order_match,
+        "exact_order_match_state": "AVAILABLE" if exact_order_match is not None else "PENDING_OFFICIAL_COMPARISON",
+        "order_confidence_pct": order_confidence,
+        "batting_order_confidence": order_confidence,
+        "simple_lineup_k_pct": _v266_number(_v266_first(row, ["simple_lineup_K_pct"], None), None),
+        "order_weighted_k_pct": _v266_number(_v266_first(row, ["weighted_lineup_exposure_K_pct"], None), None),
+        "top3_k_pct": _v266_number(_v266_first(row, ["top_3_weighted_K_pct"], None), None),
+        "middle3_k_pct": _v266_number(_v266_first(row, ["middle_3_weighted_K_pct"], None), None),
+        "bottom3_k_pct": _v266_number(_v266_first(row, ["bottom_3_weighted_K_pct"], None), None),
+        "pre_confirm_projection": _v266_number(_v266_first(board_row, ["pre_lineup_projection"], _v266_first(row, ["pre_lineup_projection"], None)), None),
+        "post_confirm_projection": _v266_number(_v266_first(board_row, ["confirmed_lineup_projection"], _v266_first(row, ["confirmed_lineup_projection"], None)), None),
+        "first_inning_k_projection": first_inning_projection,
+        "first_inning_k_line": first_inning_line,
+        "first_inning_k_side": first_inning_side,
+        "first_inning_expected_bf": _v266_number(_v266_first(row, ["expected_1st_inning_BF"], board_row.get("expected_1st_inning_BF")), None),
+        "first_inning_top_order_k_exposure": _v266_number(_v266_first(row, ["first_inning_top3_weighted_K_pct"], board_row.get("first_inning_top3_weighted_K_pct")), None),
+        "first_inning_k_data_source": str(_v266_first(row, ["first_inning_K_data_source"], board_row.get("first_inning_K_data_source")) or "UNAVAILABLE"),
+        "first_inning_k_source_timestamp": _v266_first(
+            board_row,
+            ["first_inning_K_source_timestamp", "recent_game_log_timestamp", "Savant_timestamp"],
+            _v266_first(row, ["first_inning_K_source_timestamp"], ""),
+        ),
+        "first_inning_k_line_timestamp": _v266_first(
+            board_row,
+            ["first_inning_k_line_timestamp"],
+            _v266_first(row, ["first_inning_k_line_timestamp"], ""),
+        ),
+        **projection_trace,
+    }
+
+
+def apply_v269_shadow_audit_runtime(df, board=None):
+    """Attach source-truth and outcome diagnostics without moving production K."""
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    out = df.copy()
+    lookup = _canonical_k_board_lookup(board)
+    records = []
+    for idx, rr in out.iterrows():
+        row = rr.to_dict()
+        board_row = _canonical_k_pick_board_row(lookup, row)
+        projection = _canonical_k_num(row.get("Canonical Final K Projection"), None)
+        line = _canonical_k_num(row.get("Canonical Line"), _canonical_k_line(row, board_row))
+        hand = str(
+            board_row.get("hand")
+            or row.get("Pitcher Hand")
+            or row.get("Hand")
+            or ""
+        ).upper()
+        hand_key = "LHP" if hand.startswith("L") else "RHP" if hand.startswith("R") else ""
+        expected_bf = _canonical_k_num(
+            board_row.get("expected_bf"),
+            _canonical_k_num(row.get("Canonical Expected BF"), _canonical_k_num(row.get("APP100 Projected BF"), 20.0)),
+        ) or 20.0
+
+        lineup_rows = _v266_lineup_rows(board_row)
+        enriched_lineup_rows, savant = _v269_savant_shadow_rows(
+            lineup_rows, hand_key, expected_bf, board_row=board_row
+        )
+        savant_order = _canonical_k_num(savant.get("order_weighted_savant_k_pct"), None)
+        savant_simple = _canonical_k_num(savant.get("simple_savant_lineup_k_pct"), None)
+
+        l5 = _canonical_k_num(row.get(f"Opp L5 K% vs {hand_key} Official"), None)
+        l10 = _canonical_k_num(row.get(f"Opp L10 K% vs {hand_key} Official"), None)
+        l15 = _canonical_k_num(row.get(f"Opp L15 K% vs {hand_key} Official"), None)
+        season_hand = _canonical_k_num(
+            row.get("Opponent K% vs Pitcher Hand"),
+            _canonical_k_num(row.get(f"Opp K% vs {hand_key} Official"), None),
+        )
+        audit_input = {
+            **row,
+            "raw_savant_lineup_k_pct": savant_simple,
+            "order_weighted_savant_k_pct": savant_order,
+            "team_k_pct_season_vs_hand": season_hand,
+            "team_k_pct_l15_vs_hand": l15,
+            "team_k_pct_l10_vs_hand": l10,
+            "team_k_pct_l5_vs_hand": l5,
+            "projected_bf": expected_bf,
+        }
+        opportunity = opportunity_conversion_audit(audit_input)
+
+        history = _v265_history_context(row, board_row)
+        game_log = history.get("game_log") if isinstance(history.get("game_log"), list) else []
+        recent_ks = []
+        for game in game_log:
+            value = _canonical_k_num(game.get("Ks") if isinstance(game, dict) else game, None)
+            if value is not None:
+                recent_ks.append(value)
+        difficulty = (
+            line_difficulty(projection, line, recent_ks)
+            if projection is not None and line is not None
+            else {"line_difficulty_state": "NO_LINE", "line_percentile_of_pitcher_distribution": None}
+        )
+        side = _v265_side_from_projection(projection, line)
+        low_line = difficulty.get("line_difficulty_state") in {"LOW_LINE", "VERY_LOW_LINE"}
+        low_line_under_danger = bool(
+            side == "UNDER"
+            and low_line
+            and (float(opportunity.get("k_opportunity_score") or 0.0) >= 45.0 or expected_bf >= 20.0)
+        )
+        over_review = bool(side == "OVER" and opportunity.get("over_validation_gate") != "SUPPORTED")
+        master = _canonical_k_num(row.get("Master Core Projection"), _canonical_k_num(board_row.get("master_core_projection"), projection))
+        suppression = None if projection is None or master is None else round(float(projection) - float(master), 3)
+        if side != "UNDER":
+            suppression_state = "NOT_AN_UNDER"
+        elif low_line_under_danger:
+            suppression_state = "OVER_SUPPRESSION_RISK"
+        elif suppression is not None and suppression <= -0.60:
+            suppression_state = "SUPPRESSION_REVIEW"
+        else:
+            suppression_state = "SUPPRESSION_WITHIN_GUARDS"
+
+        part_i_audit = _v269_part_i_audit_fields(
+            row,
+            board_row,
+            projection,
+            line,
+            enriched_lineup_rows=enriched_lineup_rows,
+        )
+
+        record = {
+            "_idx": idx,
+            "Savant Shadow Status": savant.get("status"),
+            "Savant Shadow Matched Hitters": savant.get("matched", 0),
+            "Savant Raw Simple K%": savant_simple,
+            "Savant Raw Order-Weighted K%": savant_order,
+            "Savant Raw Top 3 K%": savant.get("top3_savant_k_pct"),
+            "Savant Raw Middle 3 K%": savant.get("middle3_savant_k_pct"),
+            "Savant Raw Bottom 3 K%": savant.get("bottom3_savant_k_pct"),
+            "Existing Merge Control Projection": projection,
+            "Savant Shadow Projection": projection,
+            "Savant Shadow Delta": 0.0,
+            "Savant-Driven Side Flip": False,
+            "Savant Shadow Mode": "INPUT_TRUTH_ONLY_NO_UNVALIDATED_WEIGHT",
+            "Team K% Season vs Hand": season_hand,
+            "Team K% L15 vs Hand": l15,
+            "Team K% L10 vs Hand": l10,
+            "Team K% L5 vs Hand": l5,
+            "Team K Trend Delta L15": None if l15 is None or season_hand is None else round(l15 - season_hand, 3),
+            "Team K Trend Delta L10": None if l10 is None or season_hand is None else round(l10 - season_hand, 3),
+            "Team K Trend Delta L5": None if l5 is None or season_hand is None else round(l5 - season_hand, 3),
+            "K Opportunity Score": opportunity.get("k_opportunity_score"),
+            "K Conversion Score": opportunity.get("k_conversion_score"),
+            "Over Validation Gate": opportunity.get("over_validation_gate"),
+            "MARGINAL_OVER_REVIEW": over_review,
+            "Line Difficulty State": difficulty.get("line_difficulty_state"),
+            "Line Percentile of Pitcher Distribution": difficulty.get("line_percentile_of_pitcher_distribution"),
+            "LOW_LINE_UNDER_DANGER": low_line_under_danger,
+            "Suppression Adjustment Audit": suppression,
+            "Suppression Audit State": suppression_state,
+            "V269 Control Projection Preserved": True,
+            "V269 Production Projection Changed": False,
+            "V269 Promotion Status": "SHADOW_ONLY_PENDING_UNTOUCHED_SLATES",
+            **part_i_audit,
+        }
+        records.append(record)
+        if isinstance(board_row, dict):
+            board_row.update({key: value for key, value in record.items() if key != "_idx"})
+            board_row["savant_enriched_lineup_rows"] = [
+                dict(item) for item in enriched_lineup_rows if isinstance(item, dict)
+            ]
+    add = pd.DataFrame(records).set_index("_idx")
+    for column in add.columns:
+        out[column] = add[column].reindex(out.index)
+    return out
+
+
 def _canonical_k_board_signature(board):
     rows = []
     for p in board or []:
@@ -59353,6 +60151,7 @@ def build_k_projection_pipeline(board):
     # biological mean.
     df = apply_v265_canonical_runtime(df, board=board)
     df = apply_v266_profile_runtime(df, board=board)
+    df = apply_v269_shadow_audit_runtime(df, board=board)
     if isinstance(df, pd.DataFrame):
         core_elapsed = round(max(0.0, _a86_time.perf_counter() - core_started), 4)
         df["projection_core_load_time"] = core_elapsed
@@ -59393,6 +60192,152 @@ def _impl_kclean_side_label_02(row):
         return "OVER" if proj > line else "UNDER"
     side = str(_kclean_pick(row, ["Canonical Side", "Model Lean"], "")).upper()
     return side if side in {"OVER", "UNDER"} else ""
+
+
+# ============================================================
+# V2.6.9 FIRST-INNING STRIKEOUT MARKET
+# Uses the existing order-aware first-inning K profile. The legacy pitch-count
+# model remains available to historical code only and is no longer routed to UI.
+# ============================================================
+FIRST_INNING_K_MARKET_VERSION = "FIRST_INNING_K_MARKET_V1_2026_08_11"
+
+
+def _v269_poisson_over_probability(mean, line):
+    mean = max(0.001, float(mean))
+    cutoff = int(math.floor(float(line)))
+    under_or_equal = sum(math.exp(-mean) * (mean ** value) / math.factorial(value) for value in range(cutoff + 1))
+    return max(0.0, min(1.0, 1.0 - under_or_equal))
+
+
+def _impl_build_first_inning_k_board_01(board):
+    rows = []
+    for p in board or []:
+        try:
+            name = str(_v266_first(p, ["pitcher", "Pitcher", "Player", "name"], "UNKNOWN"))
+            profile = _v266_first_inning_profile({}, p, {})
+            projection = _v266_number(profile.get("projected_1st_inning_K"), None)
+            line_info = _beta_fetch_underdog_pitcher_market(name, "FI_K")
+            line = _v266_number(line_info.get("line"), None) if str(line_info.get("status", "")).upper() == "FOUND" else None
+            if projection is not None and line is not None:
+                over_probability = _v269_poisson_over_probability(projection, line)
+                side = "OVER" if over_probability >= 0.5 else "UNDER"
+                hit_probability = over_probability if side == "OVER" else 1.0 - over_probability
+                edge = projection - line
+            else:
+                over_probability = None
+                side = "NO LINE"
+                hit_probability = None
+                edge = None
+            line_source_timestamp = str(
+                line_info.get("source_timestamp")
+                or _v266_first(p, ["first_inning_k_line_timestamp", "underdog_pull_time"], "")
+                or ""
+            )
+            projection_source_timestamp = str(
+                _v266_first(
+                    p,
+                    ["first_inning_K_source_timestamp", "recent_game_log_timestamp", "Savant_timestamp", "lineup_timestamp"],
+                    "",
+                )
+                or ""
+            )
+            audit_aliases = {
+                "first_inning_k_projection": projection,
+                "first_inning_k_line": line,
+                "first_inning_k_side": side,
+                "first_inning_expected_bf": profile.get("expected_1st_inning_BF"),
+                "first_inning_top_order_k_exposure": profile.get("first_inning_top3_weighted_K_pct"),
+                "first_inning_k_data_source": profile.get("first_inning_K_data_source"),
+                "first_inning_k_source_timestamp": projection_source_timestamp,
+                "first_inning_k_line_timestamp": line_source_timestamp,
+            }
+            if isinstance(p, dict):
+                p.update(audit_aliases)
+            rows.append({
+                "Pitcher": name,
+                "Matchup": str(_v266_first(p, ["matchup", "Matchup"], "")),
+                "Pitcher Hand": str(_v266_first(p, ["hand", "Pitcher Hand"], "UNK")),
+                "1st Inning K Projection": projection,
+                "Sportsbook Line": line if line is not None else "—",
+                "Side": side,
+                "Edge": None if edge is None else round(edge, 3),
+                "P(Over)": None if over_probability is None else round(over_probability * 100.0, 1),
+                "P(Under)": None if over_probability is None else round((1.0 - over_probability) * 100.0, 1),
+                "Hit %": None if hit_probability is None else round(hit_probability * 100.0, 1),
+                "Expected 1st Inning BF": profile.get("expected_1st_inning_BF"),
+                "Top 3 K Exposure": profile.get("first_inning_top3_weighted_K_pct"),
+                "Top 4 K Exposure": profile.get("first_inning_top4_weighted_K_pct"),
+                "Top 5 K Exposure": profile.get("first_inning_top5_weighted_K_pct"),
+                "Timing Profile": profile.get("first_inning_K_profile"),
+                "K Timing": profile.get("timing_profile"),
+                "K Efficiency": profile.get("K_efficiency_profile"),
+                "Workload Fit": profile.get("timing_workload_fit"),
+                "Lineup Source": str(_v266_first(p, ["lineup_resolver_source", "lineup_status"], "UNKNOWN")),
+                "Order Source": "OFFICIAL" if profile.get("first_inning_K_confidence") == "VERIFIED" and bool(p.get("lineup_locked")) else "PROJECTED_ORDER",
+                "Data Source": profile.get("first_inning_K_data_source"),
+                "Data Confidence": profile.get("first_inning_K_confidence"),
+                "Sample Size": profile.get("first_inning_K_sample_size"),
+                "Line Status": "FOUND" if line is not None else "NO LINE",
+                "Line Source": "Underdog" if line is not None else "UNAVAILABLE",
+                "Line Timestamp": line_source_timestamp if line is not None else "",
+                "Line Debug": line_info.get("rows") or line_info.get("message"),
+                "Production Full-Game K Impact": 0.0,
+                "Version": FIRST_INNING_K_MARKET_VERSION,
+                **audit_aliases,
+            })
+        except Exception as exc:
+            rows.append({"Pitcher": str((p or {}).get("pitcher") or "UNKNOWN"), "Side": "NO LINE", "Line Status": "NO LINE", "Error": str(exc)[:180], "Version": FIRST_INNING_K_MARKET_VERSION})
+    return pd.DataFrame(rows)
+
+
+def _v269_render_first_inning_k_cards(df):
+    if df is None or df.empty:
+        return
+    cards = []
+    for _, rr in df.iterrows():
+        row = rr.to_dict()
+        side = str(row.get("Side") or "NO LINE").upper()
+        side_class = "over" if side == "OVER" else "under" if side == "UNDER" else "noline"
+        projection = _kclean_fmt(row.get("1st Inning K Projection"), 2)
+        line = _kclean_fmt(row.get("Sportsbook Line"), 1)
+        hit = _kclean_fmt(row.get("Hit %"), 1)
+        cards.append(f"""
+        <article class="fik-card">
+          <header><div><h3>{html.escape(str(row.get('Pitcher') or '—'))}</h3><p>{html.escape(str(row.get('Matchup') or ''))}</p></div><span class="{side_class}">{side}</span></header>
+          <div class="fik-hero"><div><small>1st Inning K Projection</small><b>{projection} K</b></div><div><small>Real Line</small><b>{line}</b></div></div>
+          <div class="fik-grid">
+            <div><small>Hit %</small><b>{hit}%</b></div><div><small>Expected BF</small><b>{_kclean_fmt(row.get('Expected 1st Inning BF'), 2)}</b></div>
+            <div><small>Top 3 K Exposure</small><b>{_kclean_fmt(row.get('Top 3 K Exposure'), 1)}%</b></div><div><small>Timing</small><b>{html.escape(str(row.get('Timing Profile') or '—')).replace('_', ' ')}</b></div>
+            <div><small>Lineup</small><b>{html.escape(str(row.get('Lineup Source') or '—')).replace('_', ' ')}</b></div><div><small>Data</small><b>{html.escape(str(row.get('Data Confidence') or '—'))}</b></div>
+          </div>
+        </article>""")
+    document = """
+    <style>
+    *{box-sizing:border-box}body{margin:0;background:transparent;color:#edf7ff;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.fik-wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:13px}.fik-card{background:linear-gradient(180deg,#101a2c,#070b13);border:1px solid rgba(45,174,255,.55);border-radius:15px;padding:14px;box-shadow:0 12px 30px rgba(0,0,0,.3),0 0 18px rgba(25,157,255,.1)}.fik-card header{display:flex;justify-content:space-between;gap:8px;align-items:start}.fik-card h3{margin:0;font-size:18px}.fik-card p{margin:4px 0;color:#91a5bb;font-size:11px}.fik-card header span{border-radius:999px;border:1px solid #38bdf8;padding:5px 8px;font-size:10px;font-weight:900}.fik-card header .over{color:#4ade80;border-color:#22c55e}.fik-card header .under{color:#facc15;border-color:#eab308}.fik-card header .noline{color:#a9b6c7;border-color:#64748b}.fik-hero{display:grid;grid-template-columns:1.35fr .65fr;gap:8px;margin:12px 0}.fik-hero>div,.fik-grid>div{background:#0a1220;border:1px solid rgba(56,189,248,.16);border-radius:9px;padding:9px;min-width:0}.fik-hero small,.fik-grid small{display:block;color:#87a0b9;font-size:8px;font-weight:900;text-transform:uppercase}.fik-hero b{display:block;color:#38bdf8;font-size:27px;margin-top:3px}.fik-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.fik-grid b{display:block;font-size:12px;margin-top:3px;overflow-wrap:anywhere}.fik-grid div:nth-child(4) b{font-size:10px}@media(max-width:430px){.fik-wrap{grid-template-columns:1fr}.fik-card{padding:12px}}
+    </style><div class="fik-wrap">""" + "".join(cards) + "</div>"
+    try:
+        import streamlit.components.v1 as components
+        components.html(document, height=max(780, min(28000, 475 * len(cards) + 120)), scrolling=True)
+    except Exception:
+        st.markdown(document, unsafe_allow_html=True)
+
+
+def _impl_render_first_inning_k_tab_01(board):
+    st.markdown('<div class="section-title-pro">1st Inning Strikeouts</div>', unsafe_allow_html=True)
+    st.caption("Order-aware first-inning K expectation. A side appears only when a real provider first-inning strikeout line is matched; otherwise the card says NO LINE.")
+    df = _impl_build_first_inning_k_board_01(board)
+    if df.empty:
+        st.info("No first-inning strikeout projections yet. Refresh the main board first.")
+        return
+    found = int(df.get("Line Status", pd.Series(dtype=str)).astype(str).eq("FOUND").sum())
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Pitchers", len(df)); c2.metric("Real FI K Lines", found); c3.metric("No Line", len(df) - found)
+    if st.button("Save 1st Inning K Pregame Snapshot", key="save_fi_k_board", use_container_width=True):
+        ok, message = _beta_save_official_board(df, "FI_K")
+        (st.success if ok else st.warning)(message)
+    _v269_render_first_inning_k_cards(df)
+    columns = [column for column in ["Pitcher", "Matchup", "1st Inning K Projection", "Sportsbook Line", "Side", "Edge", "P(Over)", "P(Under)", "Expected 1st Inning BF", "Top 3 K Exposure", "Timing Profile", "Lineup Source", "Order Source", "Data Source", "Data Confidence", "Line Status"] if column in df.columns]
+    st.dataframe(df[columns], use_container_width=True, hide_index=True)
 
 
 
@@ -59454,6 +60399,9 @@ if build_copy_paste_k_slate is None:
 build_first_inning_pitch_count_board = globals().get('_impl_build_first_inning_pitch_count_board_02', globals().get('_impl_build_first_inning_pitch_count_board_01', None))
 if build_first_inning_pitch_count_board is None:
     raise RuntimeError("No implementation available for build_first_inning_pitch_count_board")
+build_first_inning_k_board = globals().get('_impl_build_first_inning_k_board_01', None)
+if build_first_inning_k_board is None:
+    raise RuntimeError("No implementation available for build_first_inning_k_board")
 build_pitcher_fs_board = globals().get('_impl_build_pitcher_fs_board_11', globals().get('_impl_build_pitcher_fs_board_10', globals().get('_impl_build_pitcher_fs_board_09', globals().get('_impl_build_pitcher_fs_board_08', globals().get('_impl_build_pitcher_fs_board_07', globals().get('_impl_build_pitcher_fs_board_06', globals().get('_impl_build_pitcher_fs_board_05', globals().get('_impl_build_pitcher_fs_board_04', globals().get('_impl_build_pitcher_fs_board_03', globals().get('_impl_build_pitcher_fs_board_02', globals().get('_impl_build_pitcher_fs_board_01', None)))))))))))
 if build_pitcher_fs_board is None:
     raise RuntimeError("No implementation available for build_pitcher_fs_board")
@@ -59478,9 +60426,9 @@ if render_batter_fs_tab is None:
 render_beta_pitching_outs_tab = globals().get('_impl_render_beta_pitching_outs_tab_06', globals().get('_impl_render_beta_pitching_outs_tab_05', globals().get('_impl_render_beta_pitching_outs_tab_04', globals().get('_impl_render_beta_pitching_outs_tab_03', globals().get('_impl_render_beta_pitching_outs_tab_02', globals().get('_impl_render_beta_pitching_outs_tab_01', None))))))
 if render_beta_pitching_outs_tab is None:
     raise RuntimeError("No implementation available for render_beta_pitching_outs_tab")
-render_first_inning_pitch_count_tab = globals().get('_impl_render_first_inning_pitch_count_tab_02', globals().get('_impl_render_first_inning_pitch_count_tab_01', None))
-if render_first_inning_pitch_count_tab is None:
-    raise RuntimeError("No implementation available for render_first_inning_pitch_count_tab")
+render_first_inning_k_tab = globals().get('_impl_render_first_inning_k_tab_01', None)
+if render_first_inning_k_tab is None:
+    raise RuntimeError("No implementation available for render_first_inning_k_tab")
 render_kproj_tab = globals().get('_impl_render_kproj_tab_09', globals().get('_impl_render_kproj_tab_08', globals().get('_impl_render_kproj_tab_07', globals().get('_impl_render_kproj_tab_06', globals().get('_impl_render_kproj_tab_05', globals().get('_impl_render_kproj_tab_04', globals().get('_impl_render_kproj_tab_03', globals().get('_impl_render_kproj_tab_02', globals().get('_impl_render_kproj_tab_01', None)))))))))
 if render_kproj_tab is None:
     raise RuntimeError("No implementation available for render_kproj_tab")
@@ -59509,10 +60457,10 @@ std_schedule_games = globals().get('_impl_std_schedule_games_02', globals().get(
 if std_schedule_games is None:
     raise RuntimeError("No implementation available for std_schedule_games")
 
-tab_kproj, tab_beta_outs, tab_first_inning_pc, tab_beta_ip_debug, tab_moneyline, tab_loss_lab, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab_kproj, tab_beta_outs, tab_first_inning_k, tab_beta_ip_debug, tab_moneyline, tab_loss_lab, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "🎯 OUTS BETA",
-    "⚾ 1ST INN PC",
+    "1ST INN K",
     "🧪 IP DEBUG BETA",
     "MONEYLINE EDGE",
     "LOSS LAB",
@@ -59533,8 +60481,8 @@ with tab_kproj:
 with tab_beta_outs:
     render_beta_pitching_outs_tab(board)
 
-with tab_first_inning_pc:
-    render_first_inning_pitch_count_tab(board)
+with tab_first_inning_k:
+    render_first_inning_k_tab(board)
 
 with tab_beta_ip_debug:
     render_beta_ip_debug_tab(board)
@@ -59916,12 +60864,12 @@ def build_projection_health_audit(board=None):
 
 
 def grade_all_markets_with_diagnostics(board=None):
-    """One after-games action that grades K, Pitching Outs, FI pitch count, and ML."""
+    """One after-games action that grades K, Pitching Outs, FI strikeouts, and ML."""
     diag = {
         "version": UNIFIED_ALL_MARKETS_GRADING_VERSION,
         "K": {},
         "Pitching Outs": {},
-        "First Inning Pitch Count": {},
+        "First Inning Strikeouts": {},
         "Moneyline": {},
         "Learning Refresh": {},
     }
@@ -59942,10 +60890,10 @@ def grade_all_markets_with_diagnostics(board=None):
         diag["Pitching Outs"] = {"graded": 0, "message": f"Pitching Outs grade failed: {e}"}
 
     try:
-        fi_df = build_first_inning_pitch_count_board(board) if "build_first_inning_pitch_count_board" in globals() else pd.DataFrame()
-        diag["First Inning Pitch Count"] = _beta_grade_saved_board(fi_df, "FI_PITCHES") if "_beta_grade_saved_board" in globals() else {"graded": 0, "message": "FI grader unavailable."}
+        fi_df = build_first_inning_k_board(board) if "build_first_inning_k_board" in globals() else pd.DataFrame()
+        diag["First Inning Strikeouts"] = _beta_grade_saved_board(fi_df, "FI_K") if "_beta_grade_saved_board" in globals() else {"graded": 0, "message": "FI K grader unavailable."}
     except Exception as e:
-        diag["First Inning Pitch Count"] = {"graded": 0, "message": f"FI pitch count grade failed: {e}"}
+        diag["First Inning Strikeouts"] = {"graded": 0, "message": f"FI strikeout grade failed: {e}"}
 
     try:
         diag["Moneyline"] = _ow_grade_moneyline_saved() if "_ow_grade_moneyline_saved" in globals() else {"graded": 0, "reason": "moneyline_grader_unavailable"}
@@ -59975,13 +60923,62 @@ def grade_all_markets_with_diagnostics(board=None):
     return diag
 
 
+def render_v2610_postgrade_validation(results):
+    """Render strict audit output after grading; never feeds the live model."""
+    source = pd.DataFrame(results or [])
+    with st.expander("V2.6.10 Strict Post-Grade Audit", expanded=False):
+        st.caption(
+            "Validation only. Results are recomputed from side, line, and exact actual K; "
+            "quarantined rows never enter this audit or alter production projections."
+        )
+        if source.empty:
+            st.info("No graded rows are available for strict validation yet.")
+            return
+        try:
+            validation = validate_graded_history(source, quarantine_result_conflicts=True)
+            report_source = validation.get("accepted")
+            report = build_unified_post_grade_report(report_source)
+            summary = validation.get("summary") or {}
+            record = report.get("record") or {}
+            projection = report.get("projection") or {}
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Validated", summary.get("accepted_rows", 0))
+            c2.metric("Quarantined", summary.get("quarantined_rows", 0))
+            c3.metric("Record", f"{record.get('wins', 0)}-{record.get('losses', 0)}")
+            c4.metric("MAE", "—" if projection.get("mae") is None else f"{projection.get('mae'):.2f} K")
+            st.json({
+                "record": record,
+                "over_record": report.get("over_record"),
+                "under_record": report.get("under_record"),
+                "projection": projection,
+                "confidence_buckets": report.get("confidence_buckets"),
+                "workload_conversion_classes": report.get("workload_conversion_classes"),
+                "model_disagreements": report.get("model_disagreements"),
+                "win_preservation": report.get("win_preservation"),
+            })
+            quarantine = validation.get("quarantine")
+            if isinstance(quarantine, pd.DataFrame) and not quarantine.empty:
+                st.warning("Invalid, contradictory, or duplicate rows were quarantined.")
+                st.dataframe(quarantine, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "Download graded-history quarantine CSV",
+                    quarantine.to_csv(index=False),
+                    file_name="graded_history_QUARANTINE.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="v2610_download_graded_quarantine",
+                )
+        except Exception as exc:
+            st.warning(f"Strict post-grade validation unavailable: {str(exc)[:180]}")
+
+
 with tab5:
     st.markdown('<div class="section-title-pro">After Games — Grade + Learn</div>', unsafe_allow_html=True)
     if st.button("✅ AFTER GAMES — Grade ALL Markets + Update Learning", use_container_width=True):
         diag = grade_all_markets_with_diagnostics(board)
         k_graded = int((diag.get("K") or {}).get("graded", 0) or 0)
         po_graded = int((diag.get("Pitching Outs") or {}).get("graded", 0) or 0)
-        fi_graded = int((diag.get("First Inning Pitch Count") or {}).get("graded", 0) or 0)
+        fi_graded = int((diag.get("First Inning Strikeouts") or {}).get("graded", 0) or 0)
         ml_graded = int((diag.get("Moneyline") or {}).get("graded", 0) or 0)
         graded = k_graded + po_graded + fi_graded + ml_graded
 
@@ -59993,7 +60990,7 @@ with tab5:
         st.write({
             "K": diag.get("K"),
             "Pitching Outs": diag.get("Pitching Outs"),
-            "First Inning Pitch Count": diag.get("First Inning Pitch Count"),
+            "First Inning Strikeouts": diag.get("First Inning Strikeouts"),
             "Moneyline": diag.get("Moneyline"),
             "Learning Refresh": diag.get("Learning Refresh"),
             "Version": diag.get("version"),
@@ -60072,6 +61069,7 @@ with tab5:
             st.warning(f"Restored graded history check failed: {_hist_e}")
 
     results = load_json(RESULT_LOG, [])
+    render_v2610_postgrade_validation(results)
     if results:
         df = pd.DataFrame(results)
         finished = df[df["graded_result"].isin(["WIN", "LOSS"])] if "graded_result" in df.columns else pd.DataFrame()
