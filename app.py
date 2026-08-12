@@ -496,8 +496,284 @@ except ModuleNotFoundError as _v269_import_error:
             "compatibility_fallback": True,
         }
 
-from savant_aux_service import SavantAuxDataService
-from merge_v2610_validation import build_unified_post_grade_report, validate_graded_history
+try:
+    from savant_aux_service import SavantAuxDataService
+except ModuleNotFoundError as _aux_import_error:
+    if getattr(_aux_import_error, "name", None) != "savant_aux_service":
+        raise
+
+    class SavantAuxDataService:
+        """Cache-backed compatibility fallback when savant_aux_service.py is absent.
+
+        This fallback is data-health/support only. It does NOT change Merge V2
+        production projection math. It reads the canonical current/LAST_GOOD files
+        already installed in learning_data/.
+        """
+
+        DATASETS = {
+            "batter_profiles": ("savant_batter_profiles.csv", "savant_batter_profiles.last_good.csv"),
+            "pitcher_stats": ("savant_pitcher_stats.csv", "savant_pitcher_stats.last_good.csv"),
+            "pitch_mix_matchups": ("pitch_mix_matchups.csv", "pitch_mix_matchups.last_good.csv"),
+        }
+
+        def __init__(self, cache_dir="learning_data", season=None):
+            self.cache_dir = Path(cache_dir)
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            self.season = int(season or datetime.now().year)
+            self.manifest_path = self.cache_dir / "savant_aux_refresh_manifest.json"
+
+        def _manifest(self):
+            try:
+                if self.manifest_path.exists():
+                    obj = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+                    return obj if isinstance(obj, dict) else {}
+            except Exception:
+                pass
+            return {}
+
+        def _dataset_health(self, key):
+            active_name, last_good_name = self.DATASETS[key]
+            active = self.cache_dir / active_name
+            last_good = self.cache_dir / last_good_name
+            source = active if active.exists() else last_good if last_good.exists() else None
+
+            row_count = 0
+            age_days = None
+            error = ""
+            if source is not None:
+                try:
+                    frame = pd.read_csv(source)
+                    row_count = int(len(frame))
+                except Exception as exc:
+                    error = str(exc)[:160]
+                try:
+                    age_days = max(
+                        0,
+                        int((datetime.now().timestamp() - source.stat().st_mtime) // 86400),
+                    )
+                except Exception:
+                    age_days = None
+
+            manifest = self._manifest()
+            mrec = ((manifest.get("datasets") or {}).get(key) or {}) if isinstance(manifest, dict) else {}
+            last_success = manifest.get("last_success_at") or manifest.get("refresh_completed_at")
+
+            if source is None or row_count <= 0:
+                status = "FAILED"
+            elif age_days is None or age_days <= 1:
+                status = "CURRENT"
+            elif age_days == 2:
+                status = "AGING"
+            else:
+                status = "STALE"
+
+            return {
+                "dataset": key,
+                "status": status,
+                "row_count": row_count,
+                "age_days": age_days,
+                "last_success_at": last_success,
+                "active_path": str(active),
+                "last_good_path": str(last_good),
+                "using_last_good": bool(source == last_good),
+                "manifest_status": mrec.get("status"),
+                "error": error or mrec.get("error", ""),
+                "compatibility_fallback": True,
+            }
+
+        def health_all(self):
+            return {key: self._dataset_health(key) for key in self.DATASETS}
+
+        def refresh(self, force=False):
+            # Emergency import fallback intentionally does not create a second,
+            # unverified Savant network client. The installed current/LAST_GOOD
+            # caches remain available and the normal projection pipeline is untouched.
+            health = self.health_all()
+            available = all((item or {}).get("row_count", 0) > 0 for item in health.values())
+            return {
+                "status": "SUCCESS" if available else "FAILED",
+                "refresh_mode": "LOCAL_CACHE_COMPATIBILITY_FALLBACK",
+                "force": bool(force),
+                "datasets": health,
+                "warning": "savant_aux_service.py was not deployed; using installed current/LAST_GOOD auxiliary caches",
+                "compatibility_fallback": True,
+            }
+
+try:
+    from merge_v2610_validation import build_unified_post_grade_report, validate_graded_history
+except ModuleNotFoundError as _validation_import_error:
+    if getattr(_validation_import_error, "name", None) != "merge_v2610_validation":
+        raise
+
+    def _v2610_fb_pick_side_line(row):
+        side = str(
+            row.get("pick_side")
+            or row.get("model_side")
+            or row.get("Side")
+            or ""
+        ).upper().strip()
+        line = None
+        for key in ("final_line", "line", "Line"):
+            try:
+                if row.get(key) not in (None, ""):
+                    line = float(row.get(key))
+                    break
+            except Exception:
+                pass
+
+        pick = str(row.get("Pick") or row.get("pick") or "").upper().strip()
+        if not side and pick:
+            if pick.startswith("O"):
+                side = "OVER"
+            elif pick.startswith("U"):
+                side = "UNDER"
+        if line is None and pick:
+            match = re.search(r"(-?\d+(?:\.\d+)?)", pick)
+            if match:
+                try:
+                    line = float(match.group(1))
+                except Exception:
+                    pass
+        return side, line
+
+    def _v2610_fb_num(row, keys):
+        for key in keys:
+            try:
+                value = row.get(key)
+                if value not in (None, ""):
+                    out = float(value)
+                    if math.isfinite(out):
+                        return out
+            except Exception:
+                pass
+        return None
+
+    def validate_graded_history(source, quarantine_result_conflicts=True):
+        """Audit-only fallback validator when merge_v2610_validation.py is absent."""
+        frame = source.copy() if isinstance(source, pd.DataFrame) else pd.DataFrame(source or [])
+        accepted_rows = []
+        quarantine_rows = []
+        seen = set()
+
+        for _, row_s in frame.iterrows():
+            row = row_s.to_dict()
+            side, line = _v2610_fb_pick_side_line(row)
+            actual = _v2610_fb_num(row, ("actual", "actual_k", "Actual_K", "Actual K"))
+            pitcher = str(row.get("pitcher") or row.get("Pitcher") or row.get("player") or "").strip()
+            date = str(row.get("date") or row.get("Date") or row.get("game_date") or "")[:10]
+
+            reasons = []
+            if side not in {"OVER", "UNDER"}:
+                reasons.append("INVALID_SIDE")
+            if line is None:
+                reasons.append("MISSING_LINE")
+            if actual is None:
+                reasons.append("MISSING_ACTUAL_K")
+            if not pitcher:
+                reasons.append("MISSING_PITCHER")
+
+            recomputed = None
+            if not reasons:
+                if actual == line:
+                    recomputed = "PUSH"
+                elif side == "OVER":
+                    recomputed = "WIN" if actual > line else "LOSS"
+                else:
+                    recomputed = "WIN" if actual < line else "LOSS"
+
+            supplied = str(
+                row.get("graded_result")
+                or row.get("Result")
+                or row.get("result")
+                or ""
+            ).upper().strip()
+
+            if quarantine_result_conflicts and supplied in {"WIN", "LOSS"} and recomputed in {"WIN", "LOSS"} and supplied != recomputed:
+                reasons.append("RESULT_CONFLICT")
+
+            dedupe_key = (date, pitcher.lower(), side, line, actual)
+            if dedupe_key in seen:
+                reasons.append("DUPLICATE")
+            else:
+                seen.add(dedupe_key)
+
+            row["_validated_side"] = side
+            row["_validated_line"] = line
+            row["_validated_actual_k"] = actual
+            row["_validated_result"] = recomputed
+
+            if reasons:
+                row["_quarantine_reason"] = " | ".join(reasons)
+                quarantine_rows.append(row)
+            else:
+                accepted_rows.append(row)
+
+        accepted = pd.DataFrame(accepted_rows)
+        quarantine = pd.DataFrame(quarantine_rows)
+        return {
+            "accepted": accepted,
+            "quarantine": quarantine,
+            "summary": {
+                "input_rows": int(len(frame)),
+                "accepted_rows": int(len(accepted)),
+                "quarantined_rows": int(len(quarantine)),
+            },
+            "compatibility_fallback": True,
+        }
+
+    def build_unified_post_grade_report(source):
+        """Audit-only basic post-grade report fallback."""
+        frame = source.copy() if isinstance(source, pd.DataFrame) else pd.DataFrame(source or [])
+        wins = losses = pushes = 0
+        over_w = over_l = under_w = under_l = 0
+        errors = []
+        signed = []
+
+        for _, row_s in frame.iterrows():
+            row = row_s.to_dict()
+            side = str(row.get("_validated_side") or "").upper()
+            result = str(row.get("_validated_result") or "").upper()
+            actual = _v2610_fb_num(row, ("_validated_actual_k", "actual", "actual_k", "Actual_K", "Actual K"))
+            proj = _v2610_fb_num(row, ("final_projection", "projection", "Projection", "K PROJ"))
+
+            if result == "WIN":
+                wins += 1
+            elif result == "LOSS":
+                losses += 1
+            elif result == "PUSH":
+                pushes += 1
+
+            if side == "OVER":
+                over_w += int(result == "WIN")
+                over_l += int(result == "LOSS")
+            elif side == "UNDER":
+                under_w += int(result == "WIN")
+                under_l += int(result == "LOSS")
+
+            if actual is not None and proj is not None:
+                err = actual - proj
+                signed.append(err)
+                errors.append(abs(err))
+
+        def rec(w, l):
+            n = w + l
+            return {"wins": w, "losses": l, "win_rate": None if n == 0 else w / n}
+
+        return {
+            "record": {"wins": wins, "losses": losses, "pushes": pushes, "win_rate": None if (wins + losses) == 0 else wins / (wins + losses)},
+            "over_record": rec(over_w, over_l),
+            "under_record": rec(under_w, under_l),
+            "projection": {
+                "mae": None if not errors else float(np.mean(errors)),
+                "signed_error": None if not signed else float(np.mean(signed)),
+                "samples": len(errors),
+            },
+            "confidence_buckets": {},
+            "workload_conversion_classes": {},
+            "model_disagreements": {},
+            "win_preservation": {},
+            "compatibility_fallback": True,
+        }
 
 APP_VERSION = "ONE WAY PICKZ MASTER PO MERGE V2.6.10 VERIFIED SAVANT DATA + SAFE SHADOW 2026-08-11"
 FULL_APP_UPDATE_MARKER = "FULL_APP_CANONICAL_K_PIPELINE_2026_07_30"
